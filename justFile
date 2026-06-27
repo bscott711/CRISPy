@@ -1,0 +1,16 @@
+# The default recipe run when you just type `just`
+default:
+    @just --list
+
+# Automatically fix linting and formatting errors with Ruff and mdformat
+fix:
+    @echo "Running ruff check and format..."
+    uv run ruff check --fix .
+    uv run ruff format .
+    @echo "Formatting markdown..."
+    uv run mdformat .
+
+# Launch the standalone UI demo harness
+demo:
+    @echo "Launching CRISPy Demo Mode..."
+    uv run python run_demo.py
