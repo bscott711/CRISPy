@@ -19,15 +19,19 @@ from contextlib import suppress
 from pymmcore_plus import CMMCorePlus
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
+    QCheckBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+_PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
 
 from .controller import CrispController
 
@@ -87,9 +91,15 @@ class CrispControlPanel(QWidget):
         self._read_and_update()
 
         self._timer = QTimer(self)
-        self._timer.setInterval(_POLL_INTERVAL_MS)
+        self._timer.setInterval(self.poll_interval.value())
         self._timer.timeout.connect(self._poll)
         self._timer.start()
+
+        # Pause polling automatically during an MDA so the Tiger serial port
+        # isn't loaded while acquiring (the lock itself is held by the card).
+        with suppress(Exception):
+            self.mmcore.mda.events.sequenceStarted.connect(self._on_mda_started)
+            self.mmcore.mda.events.sequenceFinished.connect(self._on_mda_finished)
 
     # ------------------------------------------------------------------ build
     def _build(self) -> None:
@@ -107,6 +117,27 @@ class CrispControlPanel(QWidget):
         header.addWidget(self.state_lbl)
         layout.addLayout(header)
 
+        # --- polling controls (pause/slow to avoid lag during acquisition) -
+        poll_row = QHBoxLayout()
+        self.poll_chk = QCheckBox("Poll")
+        self.poll_chk.setChecked(True)
+        self.poll_chk.setToolTip(
+            "Periodically read SNR / Dither / State from the controller.\n"
+            "Polling pauses automatically while an acquisition is running."
+        )
+        self.poll_chk.toggled.connect(self._on_poll_toggled)
+        self.poll_interval = QSpinBox()
+        self.poll_interval.setRange(100, 10000)
+        self.poll_interval.setSingleStep(50)
+        self.poll_interval.setValue(_POLL_INTERVAL_MS)
+        self.poll_interval.setSuffix(" ms")
+        self.poll_interval.setMaximumWidth(110)
+        self.poll_interval.valueChanged.connect(self._on_interval_changed)
+        poll_row.addWidget(self.poll_chk)
+        poll_row.addWidget(self.poll_interval)
+        poll_row.addStretch()
+        layout.addLayout(poll_row)
+
         # --- readouts -----------------------------------------------------
         ro_box = QGroupBox("Readouts")
         grid = QGridLayout(ro_box)
@@ -120,9 +151,9 @@ class CrispControlPanel(QWidget):
             self._readouts[prop] = val
         layout.addWidget(ro_box)
 
-        # --- operation ----------------------------------------------------
+        # --- operation (2x2 grid to stay compact) -------------------------
         op_box = QGroupBox("Operation")
-        op = QHBoxLayout(op_box)
+        op = QGridLayout(op_box)
         self.btn_idle_ready = QPushButton("Set Ready")
         self.btn_idle_ready.clicked.connect(self._on_idle_ready)
         self.btn_lock = QPushButton("Lock")
@@ -131,8 +162,10 @@ class CrispControlPanel(QWidget):
         self.btn_offset.clicked.connect(self._wrap(self.controller.set_reset_offset))
         self.btn_save = QPushButton("Save to Controller")
         self.btn_save.clicked.connect(self._wrap(self.controller.set_save))
-        for b in (self.btn_idle_ready, self.btn_lock, self.btn_offset, self.btn_save):
-            op.addWidget(b)
+        op.addWidget(self.btn_idle_ready, 0, 0)
+        op.addWidget(self.btn_lock, 0, 1)
+        op.addWidget(self.btn_offset, 1, 0)
+        op.addWidget(self.btn_save, 1, 1)
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
@@ -160,6 +193,12 @@ class CrispControlPanel(QWidget):
         # Imported lazily so the module still imports without a Qt app / in demos.
         from pymmcore_widgets import PropertyWidget
 
+        # Keep the value controls at their natural (compact) size instead of
+        # stretching the sliders across the whole panel, which would otherwise
+        # require a very wide dock and clip the value box on the right.
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
         label = self.controller.label
         for prop, friendly in _PARAMS:
             try:
@@ -168,6 +207,7 @@ class CrispControlPanel(QWidget):
                 wdg = PropertyWidget(label, prop, mmcore=self.mmcore)
             except Exception:
                 continue
+            wdg.setMaximumWidth(_PARAM_MAX_WIDTH)
             form.addRow(friendly, wdg)
 
     def _wrap(self, fn):
@@ -198,6 +238,26 @@ class CrispControlPanel(QWidget):
             with suppress(Exception):
                 self.controller.set_lock()
         self._read_and_update()
+
+    # --------------------------------------------------------- poll controls
+    def _on_poll_toggled(self, checked: bool) -> None:
+        if checked:
+            self._timer.start()
+            self._read_and_update()
+        else:
+            self._timer.stop()
+
+    def _on_interval_changed(self, value: int) -> None:
+        self._timer.setInterval(int(value))
+
+    def _on_mda_started(self, *_args) -> None:
+        with suppress(RuntimeError):
+            self._timer.stop()
+
+    def _on_mda_finished(self, *_args) -> None:
+        with suppress(RuntimeError):
+            if self.poll_chk.isChecked():
+                self._timer.start()
 
     # ------------------------------------------------------------- telemetry
     def _poll(self) -> None:
