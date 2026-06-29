@@ -8,7 +8,6 @@ dependencies = [
     "pymmcore-plus",
     "magicgui",
     "qtpy",
-    "PyQt6",
 ]
 
 [project.entry-points."pymmcore_gui.main_window_menu"]
