@@ -25,7 +25,7 @@ CRISPy is designed to be installed directly into the same Python environment whe
 **From a local clone (Development/Editable mode):**
 
 ```bash
-git clone https://github.com/your-org/CRISPy.git
+git clone https://github.com/bscott711/CRISPy.git
 cd CRISPy
 uv pip install -e .
 ```
@@ -33,7 +33,7 @@ uv pip install -e .
 **From GitHub (Direct install):**
 
 ```bash
-uv pip install git+https://github.com/your-org/CRISPy.git
+uv pip install git+https://github.com/bscott711/CRISPy.git
 ```
 
 Once installed, launch `pymmcore-gui`. CRISPy will automatically register itself and appear in the **Plugins** menu.
