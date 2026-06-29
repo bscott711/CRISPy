@@ -1,251 +1,259 @@
-from magicgui.widgets import Container, Label, PushButton, SpinBox
+"""Qt UI for a single ASI CRISP autofocus axis.
+
+Maps the ASI CRISP feature set (see https://asiimaging.com/docs/crisp_manual) onto
+the ASITiger device-adapter properties:
+
+* operation       -> the settable ``CRISP State`` values (Idle / Ready / Lock /
+                     Reset Focus Offset / Save to Controller)
+* calibration     -> ``loG_cal`` / ``Dither`` / ``gain_Cal``
+* live readouts   -> read-only ``Signal Noise Ratio`` / ``Dither Error`` / ``Sum`` /
+                     ``LogAmpAGC`` / ``Lock Offset`` (polled; the adapter does not
+                     emit ``propertyChanged`` for these sensor values)
+* parameters      -> reused ``pymmcore_widgets.PropertyWidget`` controls
+"""
+
+from __future__ import annotations
+
+from contextlib import suppress
+
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import QTimer
+from qtpy.QtCore import Qt, QTimer
+from qtpy.QtWidgets import (
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
 from .controller import CrispController
 
-# How often (ms) to poll read-only CRISP telemetry (SNR / Dither Error / State).
-# These are hardware sensor values that the device adapter does NOT emit
-# `propertyChanged` events for, so they must be polled explicitly.  Polling only
-# happens while the panel is visible to avoid loading the Tiger serial port.
 _POLL_INTERVAL_MS = 750
+_SNR_GOOD_DB = 4.0  # ASI manual target
+
+# Read-only telemetry props, in display order: (property, label).
+_READOUTS: list[tuple[str, str]] = [
+    ("Signal Noise Ratio", "SNR"),
+    ("Dither Error", "Dither Err"),
+    ("Sum", "Sum"),
+    ("LogAmpAGC", "AGC"),
+    ("Lock Offset", "Lock Offset"),
+]
+
+# Adjustable parameters exposed via pymmcore-widgets: (property, friendly label).
+_PARAMS: list[tuple[str, str]] = [
+    ("LED Intensity", "LED Intensity (%)"),
+    ("GainMultiplier", "Loop Gain"),
+    ("Objective NA", "Objective NA"),
+    ("Number of Averages", "Averages"),
+    ("Max Lock Range(mm)", "Lock Range (mm)"),
+    ("In Focus Range(um)", "In-Focus Range (µm)"),
+    ("Number of Skips", "Update Skips"),
+    ("Wait ms after Lock", "Wait after Lock (ms)"),
+]
+
+_LOCKED_STATES = {"Lock", "In Focus"}
+_BUSY_STATES = {"loG_cal": "Log Cal…", "Dither": "Dither…", "gain_Cal": "Gain Cal…"}
+_BAD_STATES = {"Error", "Inhibit", "Dim"}
+_GOOD_STATES = {"Lock", "In Focus", "Ready"}
 
 
-class CrispControlPanel(Container):
-    def __init__(self, controller: CrispController, mmcore: CMMCorePlus | None = None):
+class CrispControlPanel(QWidget):
+    """Control + telemetry panel for a single CRISP axis."""
+
+    def __init__(
+        self,
+        controller: CrispController,
+        mmcore: CMMCorePlus | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
         self.controller = controller
         self.mmcore = mmcore or CMMCorePlus.instance()
+        self._readouts: dict[str, QLabel] = {}
 
-        self._setup_widgets()
-        super().__init__(widgets=self._widgets, layout="vertical", labels=False)
-        self._apply_styles()
-        self._connect_signals()
-
-        # Populate telemetry immediately, then poll while visible.
-        self._read_and_update()
-        self._poll_timer = QTimer(self.native)
-        self._poll_timer.setInterval(_POLL_INTERVAL_MS)
-        self._poll_timer.timeout.connect(self._poll_telemetry)
-        self._poll_timer.start()
-
-    def _setup_widgets(self):
-        # --- Step 1 Card ---
-        self.card1 = Container(layout="vertical", labels=False)
-        self.title1 = Label(value="Step 1: Signal Check (Log Cal)")
-        self.btn_log_cal = PushButton(text="Run Log Cal")
-        self.btn_log_cal.clicked.connect(self.controller.set_log_cal)
-        self.btn_log_cal.clicked.connect(self._read_and_update)
-
-        self.snr_val = Label(value="SNR: -- dB")
-        self.snr_status = Label(value="⚪ Waiting")
-
-        # CRITICAL FIX: Added labels=False to the row container
-        row1 = Container(
-            layout="horizontal",
-            labels=False,
-            widgets=[self.btn_log_cal, self.snr_val, self.snr_status],
-        )
-        self.card1.extend([self.title1, row1])
-
-        # --- Step 2 Card ---
-        self.card2 = Container(layout="vertical", labels=False)
-        self.title2 = Label(value="Step 2: Dither Error Check")
-        self.btn_dither = PushButton(text="Run Dither")
-        self.btn_dither.clicked.connect(self.controller.set_dither)
-        self.btn_dither.clicked.connect(self._read_and_update)
-
-        self.error_val = Label(value="Error: --")
-        self.error_status = Label(value="⚪ Waiting")
-
-        row2 = Container(
-            layout="horizontal",
-            labels=False,
-            widgets=[self.btn_dither, self.error_val, self.error_status],
-        )
-        self.card2.extend([self.title2, row2])
-
-        # --- Step 3 Card ---
-        self.card3 = Container(layout="vertical", labels=False)
-        self.title3 = Label(value="Step 3: Set Gain")
-        self.btn_gain = PushButton(text="Run Gain Cal")
-        self.btn_gain.clicked.connect(self.controller.set_gain_cal)
-        self.btn_gain.clicked.connect(self._read_and_update)
-
-        self.gain_status = Label(value="⚪ Waiting")
-
-        row3 = Container(
-            layout="horizontal", labels=False, widgets=[self.btn_gain, self.gain_status]
-        )
-        self.card3.extend([self.title3, row3])
-
-        # --- Settings Card ---
-        self.card_settings = Container(layout="vertical", labels=False)
-        self.title_settings = Label(value="Hardware Settings")
-        try:
-            led_val = int(
-                float(self.mmcore.getProperty(self.controller.label, "LED Intensity"))
+        # The ASITiger adapter exposes "RefreshPropertyValues" to force a hardware
+        # re-read; check once so we don't spam errors on devices that lack it.
+        self._can_refresh = False
+        with suppress(Exception):
+            self._can_refresh = self.mmcore.hasProperty(
+                self.controller.label, "RefreshPropertyValues"
             )
-        except Exception:
-            led_val = 50
-        self.spin_led = SpinBox(value=led_val, min=0, max=100, label="LED Intensity (%)")
-        self.spin_led.changed.connect(self.controller.set_led_intensity)
-        self.card_settings.extend([self.title_settings, self.spin_led])
 
-        self._widgets = [self.card1, self.card2, self.card3, self.card_settings]
+        self._build()
+        self._read_and_update()
 
-    def _apply_styles(self):
-        # CSS for the "Cards"
-        card_css = """
-            background-color: rgba(128, 128, 128, 0.05);
-            border: 1px solid rgba(128, 128, 128, 0.2);
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 10px;
-        """
-        title_css = "font-size: 15px; font-weight: bold; background: transparent; border: none; margin-bottom: 8px;"
+        self._timer = QTimer(self)
+        self._timer.setInterval(_POLL_INTERVAL_MS)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start()
 
-        # Modern flat button CSS
-        btn_css = """
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                border: none;
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-weight: bold;
-                min-width: 100px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:pressed {
-                background-color: #0D47A1;
-            }
-        """
+    # ------------------------------------------------------------------ build
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
 
-        # Reset default magicgui/Qt Label borders to kill the "little squares"
-        label_css = "background: transparent; border: none; padding: 0px; margin: 0px;"
+        # --- header: device + current state -------------------------------
+        header = QHBoxLayout()
+        title = QLabel(self.controller.label)
+        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.state_lbl = QLabel("State: --")
+        self.state_lbl.setStyleSheet("font-weight: bold;")
+        self.state_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.state_lbl)
+        layout.addLayout(header)
 
-        for card in [self.card1, self.card2, self.card3, self.card_settings]:
-            card.native.setStyleSheet(card_css)
+        # --- readouts -----------------------------------------------------
+        ro_box = QGroupBox("Readouts")
+        grid = QGridLayout(ro_box)
+        for i, (prop, label) in enumerate(_READOUTS):
+            row, col = divmod(i, 2)
+            name = QLabel(f"{label}:")
+            val = QLabel("--")
+            val.setStyleSheet("font-weight: bold;")
+            grid.addWidget(name, row, col * 2)
+            grid.addWidget(val, row, col * 2 + 1)
+            self._readouts[prop] = val
+        layout.addWidget(ro_box)
 
-        for title in [self.title1, self.title2, self.title3, self.title_settings]:
-            title.native.setStyleSheet(title_css)
+        # --- operation ----------------------------------------------------
+        op_box = QGroupBox("Operation")
+        op = QHBoxLayout(op_box)
+        self.btn_idle_ready = QPushButton("Set Ready")
+        self.btn_idle_ready.clicked.connect(self._on_idle_ready)
+        self.btn_lock = QPushButton("Lock")
+        self.btn_lock.clicked.connect(self._on_lock)
+        self.btn_offset = QPushButton("Set Offset")
+        self.btn_offset.clicked.connect(self._wrap(self.controller.set_reset_offset))
+        self.btn_save = QPushButton("Save to Controller")
+        self.btn_save.clicked.connect(self._wrap(self.controller.set_save))
+        for b in (self.btn_idle_ready, self.btn_lock, self.btn_offset, self.btn_save):
+            op.addWidget(b)
+        layout.addWidget(op_box)
 
-        for btn in [self.btn_log_cal, self.btn_dither, self.btn_gain]:
-            btn.native.setStyleSheet(btn_css)
+        # --- calibration --------------------------------------------------
+        cal_box = QGroupBox("Calibration  (1. Log Cal → 2. Dither → 3. Set Gain)")
+        cal = QHBoxLayout(cal_box)
+        self.btn_log = QPushButton("1. Log Cal")
+        self.btn_log.clicked.connect(self._wrap(self.controller.set_log_cal))
+        self.btn_dither = QPushButton("2. Dither")
+        self.btn_dither.clicked.connect(self._wrap(self.controller.set_dither))
+        self.btn_gain = QPushButton("3. Set Gain")
+        self.btn_gain.clicked.connect(self._wrap(self.controller.set_gain_cal))
+        for b in (self.btn_log, self.btn_dither, self.btn_gain):
+            cal.addWidget(b)
+        layout.addWidget(cal_box)
 
-        for lbl in [
-            self.snr_val,
-            self.snr_status,
-            self.error_val,
-            self.error_status,
-            self.gain_status,
-        ]:
-            lbl.native.setStyleSheet(label_css)
+        # --- parameters (reused pymmcore-widgets property controls) -------
+        param_box = QGroupBox("Parameters")
+        form = QFormLayout(param_box)
+        self._add_parameter_widgets(form)
+        layout.addWidget(param_box)
 
-        # Add some breathing room to the main panel
-        self.native.setStyleSheet("background: transparent; border: none;")
+        layout.addStretch()
 
-    def _connect_signals(self):
-        def update_props(dev, prop, val):
-            if dev != self.controller.label:
-                return
+    def _add_parameter_widgets(self, form: QFormLayout) -> None:
+        # Imported lazily so the module still imports without a Qt app / in demos.
+        from pymmcore_widgets import PropertyWidget
 
-            if prop == "Signal Noise Ratio":
-                self._update_snr(val)
-            elif prop == "Dither Error":
-                self._update_error(val)
-            elif prop == "CRISP State":
-                self._update_state(val)
+        label = self.controller.label
+        for prop, friendly in _PARAMS:
+            try:
+                if not self.mmcore.hasProperty(label, prop):
+                    continue
+                wdg = PropertyWidget(label, prop, mmcore=self.mmcore)
+            except Exception:
+                continue
+            form.addRow(friendly, wdg)
 
-        self.mmcore.events.propertyChanged.connect(update_props)
+    def _wrap(self, fn):
+        """Return a slot that runs *fn* then refreshes telemetry."""
 
-    def _poll_telemetry(self):
-        """Periodic poll; only touches the serial port while the panel is visible."""
+        def _slot(*_args) -> None:
+            with suppress(Exception):
+                fn()
+            self._read_and_update()
+
+        return _slot
+
+    # -------------------------------------------------------------- handlers
+    def _on_idle_ready(self) -> None:
+        if self.controller.get_state() == "Idle":
+            with suppress(Exception):
+                self.controller.set_ready()
+        else:
+            with suppress(Exception):
+                self.controller.set_idle()
+        self._read_and_update()
+
+    def _on_lock(self) -> None:
+        if self.controller.get_state() in _LOCKED_STATES:
+            with suppress(Exception):
+                self.controller.set_unlock()
+        else:
+            with suppress(Exception):
+                self.controller.set_lock()
+        self._read_and_update()
+
+    # ------------------------------------------------------------- telemetry
+    def _poll(self) -> None:
         try:
-            visible = self.native.isVisible()
-        except RuntimeError:  # native widget already deleted
+            visible = self.isVisible()
+        except RuntimeError:
             return
         if visible:
             self._read_and_update()
 
-    def _read_and_update(self, *args):
-        """Force a hardware refresh and update SNR / Dither / State labels.
-
-        The ASI Tiger adapter caches read-only values and does not emit
-        ``propertyChanged`` for sensor readouts, so we explicitly request a refresh
-        and then read the current values.
-        """
+    def _read_and_update(self) -> None:
         label = self.controller.label
-        try:
-            # Ask the adapter to re-query the controller for fresh values.
-            self.mmcore.setProperty(label, "RefreshPropertyValues", "Yes")
-        except Exception:
-            pass
-        for prop, updater in (
-            ("Signal Noise Ratio", self._update_snr),
-            ("Dither Error", self._update_error),
-            ("CRISP State", self._update_state),
-        ):
+        # Force the adapter to re-query the controller for fresh sensor values.
+        if self._can_refresh:
+            with suppress(Exception):
+                self.mmcore.setProperty(label, "RefreshPropertyValues", "Yes")
+
+        state = ""
+        with suppress(Exception):
+            state = str(self.mmcore.getProperty(label, "CRISP State"))
+        self._update_state(state)
+
+        for prop, _ in _READOUTS:
+            with suppress(Exception):
+                self._update_readout(prop, self.mmcore.getProperty(label, prop))
+
+    def _update_readout(self, prop: str, value: str) -> None:
+        lbl = self._readouts.get(prop)
+        if lbl is None:
+            return
+        if prop == "Signal Noise Ratio":
             try:
-                updater(self.mmcore.getProperty(label, prop))
-            except Exception:
-                pass
-
-    def _update_snr(self, val):
-        try:
-            snr = float(val)
-            self.snr_val.value = f"SNR: {snr:.2f} dB"
-            if snr >= 2.0:
-                self.snr_status.value = "🟢 Good SNR"
-                self.snr_status.native.setStyleSheet(
-                    "color: #4caf50; font-weight: bold; background: transparent; border: none;"
-                )
-            else:
-                self.snr_status.value = "🔴 Low SNR"
-                self.snr_status.native.setStyleSheet(
-                    "color: #f44336; font-weight: bold; background: transparent; border: none;"
-                )
-        except ValueError:
-            self.snr_val.value = f"SNR: {val}"
-
-    def _update_error(self, val):
-        try:
-            err = float(val)
-            self.error_val.value = f"Error: {err:.0f}"
-            if err <= 100:
-                self.error_status.value = "🟢 Low Error"
-                self.error_status.native.setStyleSheet(
-                    "color: #4caf50; font-weight: bold; background: transparent; border: none;"
-                )
-            else:
-                self.error_status.value = "🔴 High Error"
-                self.error_status.native.setStyleSheet(
-                    "color: #f44336; font-weight: bold; background: transparent; border: none;"
-                )
-        except ValueError:
-            self.error_val.value = f"Error: {val}"
-
-    def _update_state(self, val):
-        base_css = "background: transparent; border: none; font-weight: bold;"
-        # Transient calibration states (orange), locked/good states (green),
-        # error states (red); anything else shown neutrally.
-        transient = {
-            "loG_cal": "⏳ Log Cal Running...",
-            "Dither": "⏳ Dither Running...",
-            "gain_Cal": "⏳ Gain Cal Running...",
-        }
-        good = {"In Focus", "Lock", "Ready", "Save to Controller"}
-        if val in transient:
-            self.gain_status.value = transient[val]
-            color = "#FF9800"
-        elif val in good:
-            self.gain_status.value = f"🟢 {val}"
-            color = "#4caf50"
-        elif val in ("Error", "Inhibit", "Dim"):
-            self.gain_status.value = f"🔴 {val}"
-            color = "#f44336"
+                snr = float(value)
+            except ValueError:
+                lbl.setText(str(value))
+                return
+            lbl.setText(f"{snr:.2f} dB")
+            color = "#4caf50" if snr >= _SNR_GOOD_DB else "#f44336"
+            lbl.setStyleSheet(f"font-weight: bold; color: {color};")
         else:
-            self.gain_status.value = f"State: {val}"
-            color = "#9e9e9e"
-        self.gain_status.native.setStyleSheet(f"{base_css} color: {color};")
+            lbl.setText(str(value))
+
+    def _update_state(self, state: str) -> None:
+        if state in _BUSY_STATES:
+            text, color = _BUSY_STATES[state], "#FF9800"
+        elif state in _GOOD_STATES:
+            text, color = state, "#4caf50"
+        elif state in _BAD_STATES:
+            text, color = state, "#f44336"
+        else:
+            text, color = (state or "--"), "#9e9e9e"
+        self.state_lbl.setText(f"State: {text}")
+        self.state_lbl.setStyleSheet(f"font-weight: bold; color: {color};")
+
+        # Reflect live state on the toggle buttons.
+        led_on = bool(state) and state != "Idle"
+        self.btn_idle_ready.setText("Set Idle (LED off)" if led_on else "Set Ready")
+        locked = state in _LOCKED_STATES
+        self.btn_lock.setText("Unlock" if locked else "Lock")
