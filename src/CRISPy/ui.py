@@ -1,6 +1,13 @@
 from magicgui.widgets import Container, Label, PushButton, SpinBox
 from pymmcore_plus import CMMCorePlus
+from qtpy.QtCore import QTimer
 from .controller import CrispController
+
+# How often (ms) to poll read-only CRISP telemetry (SNR / Dither Error / State).
+# These are hardware sensor values that the device adapter does NOT emit
+# `propertyChanged` events for, so they must be polled explicitly.  Polling only
+# happens while the panel is visible to avoid loading the Tiger serial port.
+_POLL_INTERVAL_MS = 750
 
 
 class CrispControlPanel(Container):
@@ -13,12 +20,20 @@ class CrispControlPanel(Container):
         self._apply_styles()
         self._connect_signals()
 
+        # Populate telemetry immediately, then poll while visible.
+        self._read_and_update()
+        self._poll_timer = QTimer(self.native)
+        self._poll_timer.setInterval(_POLL_INTERVAL_MS)
+        self._poll_timer.timeout.connect(self._poll_telemetry)
+        self._poll_timer.start()
+
     def _setup_widgets(self):
         # --- Step 1 Card ---
         self.card1 = Container(layout="vertical", labels=False)
         self.title1 = Label(value="Step 1: Signal Check (Log Cal)")
         self.btn_log_cal = PushButton(text="Run Log Cal")
         self.btn_log_cal.clicked.connect(self.controller.set_log_cal)
+        self.btn_log_cal.clicked.connect(self._read_and_update)
 
         self.snr_val = Label(value="SNR: -- dB")
         self.snr_status = Label(value="⚪ Waiting")
@@ -36,6 +51,7 @@ class CrispControlPanel(Container):
         self.title2 = Label(value="Step 2: Dither Error Check")
         self.btn_dither = PushButton(text="Run Dither")
         self.btn_dither.clicked.connect(self.controller.set_dither)
+        self.btn_dither.clicked.connect(self._read_and_update)
 
         self.error_val = Label(value="Error: --")
         self.error_status = Label(value="⚪ Waiting")
@@ -52,6 +68,7 @@ class CrispControlPanel(Container):
         self.title3 = Label(value="Step 3: Set Gain")
         self.btn_gain = PushButton(text="Run Gain Cal")
         self.btn_gain.clicked.connect(self.controller.set_gain_cal)
+        self.btn_gain.clicked.connect(self._read_and_update)
 
         self.gain_status = Label(value="⚪ Waiting")
 
@@ -63,7 +80,13 @@ class CrispControlPanel(Container):
         # --- Settings Card ---
         self.card_settings = Container(layout="vertical", labels=False)
         self.title_settings = Label(value="Hardware Settings")
-        self.spin_led = SpinBox(value=50, min=0, max=100, label="LED Intensity (%)")
+        try:
+            led_val = int(
+                float(self.mmcore.getProperty(self.controller.label, "LED Intensity"))
+            )
+        except Exception:
+            led_val = 50
+        self.spin_led = SpinBox(value=led_val, min=0, max=100, label="LED Intensity (%)")
         self.spin_led.changed.connect(self.controller.set_led_intensity)
         self.card_settings.extend([self.title_settings, self.spin_led])
 
@@ -137,6 +160,38 @@ class CrispControlPanel(Container):
 
         self.mmcore.events.propertyChanged.connect(update_props)
 
+    def _poll_telemetry(self):
+        """Periodic poll; only touches the serial port while the panel is visible."""
+        try:
+            visible = self.native.isVisible()
+        except RuntimeError:  # native widget already deleted
+            return
+        if visible:
+            self._read_and_update()
+
+    def _read_and_update(self, *args):
+        """Force a hardware refresh and update SNR / Dither / State labels.
+
+        The ASI Tiger adapter caches read-only values and does not emit
+        ``propertyChanged`` for sensor readouts, so we explicitly request a refresh
+        and then read the current values.
+        """
+        label = self.controller.label
+        try:
+            # Ask the adapter to re-query the controller for fresh values.
+            self.mmcore.setProperty(label, "RefreshPropertyValues", "Yes")
+        except Exception:
+            pass
+        for prop, updater in (
+            ("Signal Noise Ratio", self._update_snr),
+            ("Dither Error", self._update_error),
+            ("CRISP State", self._update_state),
+        ):
+            try:
+                updater(self.mmcore.getProperty(label, prop))
+            except Exception:
+                pass
+
     def _update_snr(self, val):
         try:
             snr = float(val)
@@ -173,12 +228,24 @@ class CrispControlPanel(Container):
 
     def _update_state(self, val):
         base_css = "background: transparent; border: none; font-weight: bold;"
-        if val == "loG_cal":
-            self.gain_status.value = "⏳ Log Cal Running..."
-            self.gain_status.native.setStyleSheet(f"{base_css} color: #FF9800;")
-        elif val == "Dither":
-            self.gain_status.value = "⏳ Dither Running..."
-            self.gain_status.native.setStyleSheet(f"{base_css} color: #FF9800;")
-        elif val == "gain_Cal":
-            self.gain_status.value = "🟢 Gain Set"
-            self.gain_status.native.setStyleSheet(f"{base_css} color: #4caf50;")
+        # Transient calibration states (orange), locked/good states (green),
+        # error states (red); anything else shown neutrally.
+        transient = {
+            "loG_cal": "⏳ Log Cal Running...",
+            "Dither": "⏳ Dither Running...",
+            "gain_Cal": "⏳ Gain Cal Running...",
+        }
+        good = {"In Focus", "Lock", "Ready", "Save to Controller"}
+        if val in transient:
+            self.gain_status.value = transient[val]
+            color = "#FF9800"
+        elif val in good:
+            self.gain_status.value = f"🟢 {val}"
+            color = "#4caf50"
+        elif val in ("Error", "Inhibit", "Dim"):
+            self.gain_status.value = f"🔴 {val}"
+            color = "#f44336"
+        else:
+            self.gain_status.value = f"State: {val}"
+            color = "#9e9e9e"
+        self.gain_status.native.setStyleSheet(f"{base_css} color: {color};")
