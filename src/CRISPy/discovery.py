@@ -1,9 +1,16 @@
+from __future__ import annotations
+
+from typing import Literal
+
 from pymmcore_plus import CMMCorePlus, DeviceType
 
 # ASI's Tiger controller exposes CRISP autofocus axes through this device adapter
 # library; its autofocus devices are named like ``CRISPAFocus:Z:32``.
 _ASI_LIBRARY = "ASITiger"
 _CRISP_TOKEN = "CRISP"
+
+#: Result of :func:`classify_focus_actuator`.
+ActuatorType = Literal["piezo", "stage", "unknown"]
 
 
 def discover_crisp_devices(mmcore: CMMCorePlus | None = None) -> list[str]:
@@ -27,9 +34,9 @@ def discover_crisp_devices(mmcore: CMMCorePlus | None = None) -> list[str]:
         except Exception:
             continue
 
-        name_matches = _CRISP_TOKEN in device.upper() or _CRISP_TOKEN in str(
-            name
-        ).upper()
+        name_matches = (
+            _CRISP_TOKEN in device.upper() or _CRISP_TOKEN in str(name).upper()
+        )
         asi_autofocus = (
             dev_type == DeviceType.AutoFocusDevice and library == _ASI_LIBRARY
         )
@@ -38,3 +45,58 @@ def discover_crisp_devices(mmcore: CMMCorePlus | None = None) -> list[str]:
             labels.append(device)
 
     return labels
+
+
+def classify_focus_actuator(
+    label: str, mmcore: CMMCorePlus | None = None
+) -> ActuatorType:
+    """Classify the physical focus actuator driven by a CRISP autofocus axis.
+
+    A CRISP axis (e.g. ``CRISPAFocus:P:34``) only servos an error signal; the
+    actual actuator is a separate ASITiger stage device that shares the same Tiger
+    axis letter and hex address (e.g. ``PiezoStage:P:34`` or ``ZStage:Z:32``).  We
+    locate that paired stage device and classify it by adapter name: a piezo stage
+    reports as ``PiezoStage`` whereas a motorized Z drive reports as ``ZStage``.
+
+    Matching on the ``:<AxisLetter>:<HexAddr>`` suffix (rather than assuming a
+    particular axis letter means "piezo") keeps this robust across rigs where axis
+    letters are assigned arbitrarily.
+
+    Parameters
+    ----------
+    label : str
+        Device label of the CRISP autofocus axis.
+    mmcore : CMMCorePlus | None
+        Core instance to query; defaults to the shared singleton.
+
+    Returns
+    -------
+    ActuatorType
+        ``"piezo"``, ``"stage"``, or ``"unknown"`` when no paired stage is found.
+    """
+    mmcore = mmcore or CMMCorePlus.instance()
+
+    axis = _read_prop(mmcore, label, "AxisLetter")
+    hex_addr = _read_prop(mmcore, label, "TigerHexAddress")
+    if not axis or not hex_addr:
+        return "unknown"
+    suffix = f":{axis}:{hex_addr}"
+
+    for device in mmcore.getLoadedDevicesOfType(DeviceType.StageDevice):
+        try:
+            if mmcore.getDeviceLibrary(device) != _ASI_LIBRARY:
+                continue
+            name = str(mmcore.getDeviceName(device))
+        except Exception:
+            continue
+        if device.endswith(suffix) or name.endswith(suffix):
+            return "piezo" if "PIEZO" in name.upper() else "stage"
+
+    return "unknown"
+
+
+def _read_prop(mmcore: CMMCorePlus, label: str, prop: str) -> str:
+    try:
+        return str(mmcore.getProperty(label, prop)).strip()
+    except Exception:
+        return ""
