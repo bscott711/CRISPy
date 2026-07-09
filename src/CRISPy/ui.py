@@ -21,9 +21,11 @@ from __future__ import annotations
 import statistics
 from collections import deque
 from contextlib import suppress
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QCheckBox,
     QFormLayout,
@@ -37,7 +39,10 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .controller import CrispController
+if TYPE_CHECKING:
+    from pymmcore_widgets.control._async_poller import AsyncPoller
+
+    from .controller import CrispController
 
 _PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
 
@@ -95,6 +100,20 @@ def _close(a: float | None, b: float | None, *, rtol: float = 1e-3) -> bool:
     return abs(a - b) <= rtol * max(abs(a), abs(b), 1.0)
 
 
+@dataclass(frozen=True)
+class CrispSnapshot:
+    """A plain snapshot of CRISP telemetry, read off the GUI thread.
+
+    Produced on a worker thread by :meth:`CrispControlPanel._read_device_values` and
+    consumed on the GUI thread by :meth:`CrispControlPanel._apply_values`, so it holds
+    only raw values (no Qt widgets).
+    """
+
+    state: str
+    sensitivity: float | None
+    readouts: dict[str, str]
+
+
 class CrispControlPanel(QWidget):
     """Control + telemetry panel for a single CRISP axis."""
 
@@ -121,12 +140,22 @@ class CrispControlPanel(QWidget):
             )
 
         self._build()
-        self._read_and_update()
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(self.poll_interval.value())
-        self._timer.timeout.connect(self._poll)
-        self._timer.start()
+        # Poll telemetry off the GUI thread so the ~10 blocking serial reads per
+        # tick never stall the event loop / live view. See AsyncPoller. Imported
+        # here (not at module scope) to keep ``import CRISPy.ui`` lightweight.
+        from pymmcore_widgets.control._async_poller import AsyncPoller
+
+        self._poller: AsyncPoller[CrispSnapshot] = AsyncPoller(
+            self._read_device_values,
+            self._apply_values,
+            interval_ms=self.poll_interval.value(),
+            parent=self,
+            active=self.isVisible,
+        )
+        # Populate immediately (ignoring the visibility gate), then poll periodically.
+        self._poller.poll_now(force=True)
+        self._poller.start()
 
         # Pause polling automatically during an MDA so the Tiger serial port
         # isn't loaded while acquiring (the lock itself is held by the card).
@@ -299,7 +328,7 @@ class CrispControlPanel(QWidget):
         def _slot(*_args) -> None:
             with suppress(Exception):
                 fn()
-            self._read_and_update()
+            self._poller.poll_now(force=True)
 
         return _slot
 
@@ -311,7 +340,7 @@ class CrispControlPanel(QWidget):
         else:
             with suppress(Exception):
                 self.controller.set_idle()
-        self._read_and_update()
+        self._poller.poll_now(force=True)
 
     def _on_lock(self) -> None:
         if self.controller.get_state() in _LOCKED_STATES:
@@ -320,46 +349,51 @@ class CrispControlPanel(QWidget):
         else:
             with suppress(Exception):
                 self.controller.set_lock()
-        self._read_and_update()
+        self._poller.poll_now(force=True)
 
     # --------------------------------------------------------- poll controls
     def _on_poll_toggled(self, checked: bool) -> None:
         if checked:
-            self._timer.start()
-            self._read_and_update()
+            self._poller.start()
+            self._poller.poll_now(force=True)
         else:
-            self._timer.stop()
+            self._poller.stop()
 
     def _on_interval_changed(self, value: int) -> None:
-        self._timer.setInterval(int(value))
+        self._poller.set_interval(int(value))
 
     def _on_mda_started(self, *_args) -> None:
         with suppress(RuntimeError):
-            self._timer.stop()
+            self._poller.stop()
 
     def _on_mda_finished(self, *_args) -> None:
         with suppress(RuntimeError):
             if self.poll_chk.isChecked():
-                self._timer.start()
+                self._poller.start()
 
     # ------------------------------------------------------------- telemetry
-    def _poll(self) -> None:
-        try:
-            visible = self.isVisible()
-        except RuntimeError:
-            return
-        if visible:
-            self._read_and_update()
-
     def _on_reset_offset(self) -> None:
         with suppress(Exception):
             self.controller.set_reset_offset()
         # The error datum just moved; drop stale fluctuation samples.
         self._error_history.clear()
-        self._read_and_update()
+        self._poller.poll_now(force=True)
 
-    def _read_and_update(self) -> None:
+    def _read_device_values(self) -> CrispSnapshot:
+        """Read CRISP telemetry from the controller (runs on a worker thread).
+
+        Performs only ``mmcore`` / ``controller`` access and returns a plain
+        snapshot; it must not touch any Qt widget or mutate GUI-owned state (that
+        is done in :meth:`_apply_values` on the GUI thread).
+        """
         label = self.controller.label
+        # The device can vanish out from under this worker thread: on app close
+        # the core unloads devices on another thread, and a config reload rebuilds
+        # the panels. Bail before any core access so we never setProperty/
+        # getProperty a missing label (pymmcore-plus logs "No device with label
+        # ..." warnings, which no suppress() around the call can catch).
+        if label not in self.mmcore.getLoadedDevices():
+            return CrispSnapshot(state="", sensitivity=None, readouts={})
         # Force the adapter to re-query the controller for fresh sensor values.
         if self._can_refresh:
             with suppress(Exception):
@@ -368,18 +402,26 @@ class CrispControlPanel(QWidget):
         state = ""
         with suppress(Exception):
             state = str(self.mmcore.getProperty(label, "CRISP State"))
-        self._update_state(state)
 
-        self._update_sensitivity()
+        sensitivity = self.controller.get_sensitivity_counts_per_um()
 
+        readouts: dict[str, str] = {}
         for prop, _ in _READOUTS:
             with suppress(Exception):
-                self._update_readout(prop, self.mmcore.getProperty(label, prop))
+                readouts[prop] = str(self.mmcore.getProperty(label, prop))
 
+        return CrispSnapshot(state=state, sensitivity=sensitivity, readouts=readouts)
+
+    def _apply_values(self, snap: CrispSnapshot) -> None:
+        """Apply a telemetry *snap* to the widgets (runs on the GUI thread)."""
+        self._update_state(snap.state)
+        self._update_sensitivity(snap.sensitivity)
+        for prop, _ in _READOUTS:
+            if prop in snap.readouts:
+                self._update_readout(prop, snap.readouts[prop])
         self._update_stability()
 
-    def _update_sensitivity(self) -> None:
-        new = self.controller.get_sensitivity_counts_per_um()
+    def _update_sensitivity(self, new: float | None) -> None:
         if not _close(new, self._sensitivity):
             # First read or a recalibration: prior samples are in a different
             # scale, so start the fluctuation window fresh.
