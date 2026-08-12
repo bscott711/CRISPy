@@ -130,6 +130,10 @@ class CrispControlPanel(QWidget):
         # Cached error->µm scaling and a rolling history for the fluctuation metric.
         self._sensitivity: float | None = None
         self._error_history: deque[float] = deque(maxlen=_STABILITY_WINDOW)
+        # Edge-detector for the auto joystick lockout: starts False so a state
+        # already locked when this panel first opens is treated as a lock edge
+        # (joystick gets disabled), matching the "always safe on lock" default.
+        self._was_locked = False
 
         # The ASITiger adapter exposes "RefreshPropertyValues" to force a hardware
         # re-read; check once so we don't spam errors on devices that lack it.
@@ -245,6 +249,17 @@ class CrispControlPanel(QWidget):
         op.addWidget(self.btn_lock, 0, 1)
         op.addWidget(self.btn_offset, 1, 0)
         op.addWidget(self.btn_save, 1, 1)
+        self.joystick_chk = QCheckBox("Joystick enabled")
+        self.joystick_chk.setChecked(True)
+        self.joystick_chk.setToolTip(
+            "Manual wheel/joystick input for this axis's actuator.\n"
+            "Auto-disabled the moment this axis locks (so it can't fight the\n"
+            "servo and drag focus, ASI 'J' command) and auto-re-enabled on\n"
+            "unlock. Toggle here to override at any time, including while"
+            " locked."
+        )
+        self.joystick_chk.toggled.connect(self._on_joystick_toggled)
+        op.addWidget(self.joystick_chk, 2, 0, 1, 2)
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
@@ -350,6 +365,11 @@ class CrispControlPanel(QWidget):
             with suppress(Exception):
                 self.controller.set_lock()
         self._poller.poll_now(force=True)
+
+    def _on_joystick_toggled(self, checked: bool) -> None:
+        """Manual joystick override; independent of the auto lock/unlock logic."""
+        with suppress(Exception):
+            self.controller.set_joystick_enabled(checked)
 
     # --------------------------------------------------------- poll controls
     def _on_poll_toggled(self, checked: bool) -> None:
@@ -497,3 +517,18 @@ class CrispControlPanel(QWidget):
         self.btn_idle_ready.setText("Set Idle (LED off)" if led_on else "Set Ready")
         locked = state in _LOCKED_STATES
         self.btn_lock.setText("Unlock" if locked else "Lock")
+
+        # Auto joystick lockout: only act on a lock/unlock *transition*, so a
+        # manual override via the checkbox isn't immediately fought while the
+        # lock state hasn't actually changed.
+        if locked != self._was_locked:
+            self._was_locked = locked
+            self._set_joystick_for_lock(locked)
+
+    def _set_joystick_for_lock(self, locked: bool) -> None:
+        enabled = not locked
+        with suppress(Exception):
+            self.controller.set_joystick_enabled(enabled)
+        self.joystick_chk.blockSignals(True)
+        self.joystick_chk.setChecked(enabled)
+        self.joystick_chk.blockSignals(False)

@@ -47,6 +47,25 @@ def discover_crisp_devices(mmcore: CMMCorePlus | None = None) -> list[str]:
     return labels
 
 
+def find_tiger_hub(mmcore: CMMCorePlus | None = None) -> str | None:
+    """Return the label of the loaded ASITiger comm-hub device, if any.
+
+    Raw Tiger serial commands that aren't scoped to a specific axis device
+    (e.g. the ``JOYSTICK (J)`` command; see
+    :meth:`CRISPy.controller.ASICrispController.set_joystick_enabled`) are sent
+    through this hub's ``SerialCommand``/``SerialResponse`` properties rather
+    than through an axis device, since Tiger routes them by axis letter itself.
+    """
+    mmcore = mmcore or CMMCorePlus.instance()
+    for device in mmcore.getLoadedDevicesOfType(DeviceType.HubDevice):
+        try:
+            if mmcore.getDeviceLibrary(device) == _ASI_LIBRARY:
+                return device
+        except Exception:
+            continue
+    return None
+
+
 def classify_focus_actuator(
     label: str, mmcore: CMMCorePlus | None = None
 ) -> ActuatorType:
