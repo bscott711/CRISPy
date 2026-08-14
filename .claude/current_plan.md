@@ -1,8 +1,47 @@
 # Software joystick lockout during CRISP lock
 
-**Status: implemented** (discovery/controller/ui changes done, ruff clean,
-verified against a throwaway fake-Core smoke test; not yet bench-verified
-against real hardware -- see "ASI command" below).
+**Status: implemented, corrected twice after bench feedback -- now driven
+entirely by Core device properties, no raw serial.**
+
+1. First pass used `J <axis>+`/`J <axis>-`. Bench test: disable worked,
+   re-enable did not restore the actual wheel binding.
+2. Second pass switched to explicit `J <axis>=<code>`, snapshotting the
+   live code at construction. Bench test: still wrong -- the user has TWO
+   independent physical wheels (left -> Z stage, right -> piezo, "by my
+   convention") and this didn't respect that; diagnostics run by the user
+   revealed why: the wheel binding is a real ASITiger device property,
+   `JoystickInput`, on the *paired stage* device (`PiezoStage:P:34`,
+   `ZStage:Z:32`), already encoded in their own Micro-Manager config
+   preset ("Z_P" in group "Joystick Wheels": Z -> `"23 - left wheel"`,
+   P -> `"22 - right wheel"`). Raw serial `J` commands change the hardware
+   but not the adapter's cached property, and a live snapshot could already
+   be wrong -- confirmed: at diagnosis time both axes actually read `J
+   Z=22`/`J P=22` on the real controller, i.e. Z was really mis-wired onto
+   P's wheel because of pass 2's snapshot-based restore.
+3. **Final fix**: stopped touching raw serial entirely. `ASICrispController`
+   now resolves the paired stage device
+   (`discovery.find_paired_actuator_label`, refactored out of the existing
+   `classify_focus_actuator`) and reads this axis's correct "on" value
+   straight out of the `Z_P` preset via `mmcore.getConfigData(...)` at
+   construction. `set_joystick_enabled` just writes the `JoystickInput`
+   property on that stage through the Core -- `"0 - none"` to disable, the
+   preset-sourced value to enable. Deriving "on" from the preset every time
+   (not a live snapshot) makes it self-healing: an axis that's currently
+   mis-wired corrects itself the next time it unlocks, and each axis only
+   ever touches its own stage device, so the two wheels can't cross-wire
+   each other regardless of lock/unlock order.
+
+Verified with an updated fake-Core smoke test that reproduces the exact
+bug (one axis starting mis-wired) and confirms self-healing plus no
+cross-axis interference across an out-of-order lock/unlock sequence. Ruff
+clean. `JOYSTICK_GROUP`/`JOYSTICK_PRESET` ("Joystick Wheels"/"Z_P") are
+hardcoded to this rig's actual config names -- the feature no-ops
+gracefully if they don't exist, but isn't portable to a differently-named
+config out of the box.
+
+**Bench-confirmed working (2026-08-14)** by the user across lock/unlock on
+both axes, left/right wheel distinction respected correctly. Committed and
+pushed.
 
 ## Context
 

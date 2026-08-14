@@ -4,14 +4,23 @@ from typing import Protocol
 
 from pymmcore_plus import CMMCorePlus
 
-from .discovery import ActuatorType, classify_focus_actuator, find_tiger_hub
+from .discovery import ActuatorType, classify_focus_actuator, find_paired_actuator_label
 
 # The ASITiger adapter's settable "CRISP State" values (exact strings matter).
 STATE_PROP = "CRISP State"
 LED_PROP = "LED Intensity"
-# Tiger axis letter for this CRISP axis's paired actuator (e.g. "P"), used to
-# address the JOYSTICK (J) command below.
-AXIS_LETTER_PROP = "AxisLetter"
+# The wheel/knob bound to an ASITiger stage's manual input is a regular device
+# property on the *stage* (not the CRISP device): e.g. PiezoStage:P:34's
+# "JoystickInput" = "22 - right wheel". This project's rig encodes the
+# correct per-axis binding in one Micro-Manager config preset (see
+# set_joystick_enabled), rather than a raw ASI "J" serial command -- a raw
+# "J <axis>=<code>" command changes the hardware but not the ASITiger
+# adapter's own cached property value, which is unreliable (confirmed on the
+# bench: it silently failed to restore a custom wheel binding on re-enable).
+JOYSTICK_PROP = "JoystickInput"
+JOYSTICK_OFF_VALUE = "0 - none"
+JOYSTICK_GROUP = "Joystick Wheels"
+JOYSTICK_PRESET = "Z_P"
 # Per-axis calibration read from the controller; these define the mapping between
 # the raw error signal (controller counts) and physical focus motion, and differ
 # between actuators (a piezo and a Z stage calibrate to very different gains).
@@ -35,7 +44,6 @@ class CrispController(Protocol):
     def set_reset_offset(self) -> None: ...
     def set_save(self) -> None: ...
     def set_led_intensity(self, value: int) -> None: ...
-    def get_axis_letter(self) -> str | None: ...
     def set_joystick_enabled(self, enabled: bool) -> None: ...
     def get_state(self) -> str: ...
     def get_calibration_gain(self) -> float | None: ...
@@ -49,10 +57,11 @@ class ASICrispController:
         self._mmcore = mmcore or CMMCorePlus.instance()
         # Resolve the paired actuator once; it does not change while loaded.
         self._actuator_type: ActuatorType = classify_focus_actuator(label, self._mmcore)
-        # Resolve the Tiger axis letter + comm hub once, for the JOYSTICK (J)
-        # command (see set_joystick_enabled); neither changes while loaded.
-        self._axis_letter = self._get_str(AXIS_LETTER_PROP)
-        self._hub_label = find_tiger_hub(self._mmcore)
+        # The stage device whose "JoystickInput" property this axis's wheel
+        # lives on (e.g. PiezoStage:P:34), and the correct "on" value for it
+        # per the user's own JOYSTICK_PRESET -- see set_joystick_enabled.
+        self._joystick_stage_label = find_paired_actuator_label(label, self._mmcore)
+        self._joystick_on_value = self._read_joystick_preset_value()
 
     @property
     def label(self) -> str:
@@ -112,33 +121,48 @@ class ASICrispController:
             return ""
 
     # --- joystick lockout ---
-    def get_axis_letter(self) -> str | None:
-        """Tiger axis letter (e.g. ``"P"``) for this axis's paired actuator."""
-        return self._axis_letter
+    def _read_joystick_preset_value(self) -> str | None:
+        """Look up this axis's correct ``JoystickInput`` value from JOYSTICK_PRESET.
 
-    def _send_serial(self, cmd: str) -> str | None:
-        """Send a raw command to the Tiger comm hub, if one was found."""
-        if self._hub_label is None:
+        Reading the "on" target from the user's own saved preset (rather than
+        snapshotting whatever the property currently reads) means a wheel that
+        is already mis-bound -- e.g. from a prior bug -- self-corrects the
+        next time this axis unlocks, instead of that wrong state being
+        preserved indefinitely.
+        """
+        if self._joystick_stage_label is None:
             return None
         try:
-            self._mmcore.setProperty(self._hub_label, "SerialCommand", cmd)
-            if self._mmcore.hasProperty(self._hub_label, "SerialResponse"):
-                return str(self._mmcore.getProperty(self._hub_label, "SerialResponse"))
+            settings = self._mmcore.getConfigData(JOYSTICK_GROUP, JOYSTICK_PRESET)
         except Exception:
-            pass
+            return None
+        for dev, prop, value in settings:
+            if dev == self._joystick_stage_label and prop == JOYSTICK_PROP:
+                return str(value)
         return None
 
     def set_joystick_enabled(self, enabled: bool) -> None:
         """Enable/disable manual joystick/wheel input on this axis's actuator.
 
-        Sends ASI's ``JOYSTICK (J)`` command (``J <axis>+``/``J <axis>-``) to
-        the Tiger comm hub. No-ops silently if the axis letter or comm hub
-        could not be resolved (e.g. no Tiger hub loaded on this rig).
+        Writes the ASITiger ``JoystickInput`` device property directly on the
+        paired stage (through the Core, like any other property), restoring
+        the exact value encoded in the user's ``JOYSTICK_PRESET`` config
+        preset -- which already correctly encodes their wheel layout (e.g.
+        left wheel -> Z stage, right wheel -> piezo) -- rather than a raw ASI
+        serial command. No-ops silently if the paired stage device or a
+        matching preset entry could not be resolved.
         """
-        if self._axis_letter is None:
+        if self._joystick_stage_label is None:
             return
-        sign = "+" if enabled else "-"
-        self._send_serial(f"J {self._axis_letter}{sign}")
+        if not enabled:
+            self._mmcore.setProperty(
+                self._joystick_stage_label, JOYSTICK_PROP, JOYSTICK_OFF_VALUE
+            )
+            return
+        if self._joystick_on_value is not None:
+            self._mmcore.setProperty(
+                self._joystick_stage_label, JOYSTICK_PROP, self._joystick_on_value
+            )
 
     # --- calibration / error scaling ---
     def _get_float(self, prop: str) -> float | None:
@@ -146,13 +170,6 @@ class ASICrispController:
             return float(self._mmcore.getProperty(self._label, prop))
         except Exception:
             return None
-
-    def _get_str(self, prop: str) -> str | None:
-        try:
-            value = str(self._mmcore.getProperty(self._label, prop)).strip()
-        except Exception:
-            return None
-        return value or None
 
     def get_calibration_gain(self) -> float | None:
         """Error-signal calibration gain (controller counts) for this axis."""

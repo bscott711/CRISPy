@@ -47,35 +47,14 @@ def discover_crisp_devices(mmcore: CMMCorePlus | None = None) -> list[str]:
     return labels
 
 
-def find_tiger_hub(mmcore: CMMCorePlus | None = None) -> str | None:
-    """Return the label of the loaded ASITiger comm-hub device, if any.
-
-    Raw Tiger serial commands that aren't scoped to a specific axis device
-    (e.g. the ``JOYSTICK (J)`` command; see
-    :meth:`CRISPy.controller.ASICrispController.set_joystick_enabled`) are sent
-    through this hub's ``SerialCommand``/``SerialResponse`` properties rather
-    than through an axis device, since Tiger routes them by axis letter itself.
-    """
-    mmcore = mmcore or CMMCorePlus.instance()
-    for device in mmcore.getLoadedDevicesOfType(DeviceType.HubDevice):
-        try:
-            if mmcore.getDeviceLibrary(device) == _ASI_LIBRARY:
-                return device
-        except Exception:
-            continue
-    return None
-
-
-def classify_focus_actuator(
+def find_paired_actuator_label(
     label: str, mmcore: CMMCorePlus | None = None
-) -> ActuatorType:
-    """Classify the physical focus actuator driven by a CRISP autofocus axis.
+) -> str | None:
+    """Return the device label of the ASITiger stage paired with a CRISP axis.
 
     A CRISP axis (e.g. ``CRISPAFocus:P:34``) only servos an error signal; the
     actual actuator is a separate ASITiger stage device that shares the same Tiger
-    axis letter and hex address (e.g. ``PiezoStage:P:34`` or ``ZStage:Z:32``).  We
-    locate that paired stage device and classify it by adapter name: a piezo stage
-    reports as ``PiezoStage`` whereas a motorized Z drive reports as ``ZStage``.
+    axis letter and hex address (e.g. ``PiezoStage:P:34`` or ``ZStage:Z:32``).
 
     Matching on the ``:<AxisLetter>:<HexAddr>`` suffix (rather than assuming a
     particular axis letter means "piezo") keeps this robust across rigs where axis
@@ -90,15 +69,15 @@ def classify_focus_actuator(
 
     Returns
     -------
-    ActuatorType
-        ``"piezo"``, ``"stage"``, or ``"unknown"`` when no paired stage is found.
+    str | None
+        The paired stage device's label, or ``None`` if none was found.
     """
     mmcore = mmcore or CMMCorePlus.instance()
 
     axis = _read_prop(mmcore, label, "AxisLetter")
     hex_addr = _read_prop(mmcore, label, "TigerHexAddress")
     if not axis or not hex_addr:
-        return "unknown"
+        return None
     suffix = f":{axis}:{hex_addr}"
 
     for device in mmcore.getLoadedDevicesOfType(DeviceType.StageDevice):
@@ -109,9 +88,31 @@ def classify_focus_actuator(
         except Exception:
             continue
         if device.endswith(suffix) or name.endswith(suffix):
-            return "piezo" if "PIEZO" in name.upper() else "stage"
+            return device
 
-    return "unknown"
+    return None
+
+
+def classify_focus_actuator(
+    label: str, mmcore: CMMCorePlus | None = None
+) -> ActuatorType:
+    """Classify the physical focus actuator driven by a CRISP autofocus axis.
+
+    Locates the paired stage device (see :func:`find_paired_actuator_label`) and
+    classifies it by adapter name: a piezo stage reports as ``PiezoStage``
+    whereas a motorized Z drive reports as ``ZStage``.
+    """
+    mmcore = mmcore or CMMCorePlus.instance()
+
+    stage_label = find_paired_actuator_label(label, mmcore)
+    if stage_label is None:
+        return "unknown"
+    try:
+        name = str(mmcore.getDeviceName(stage_label))
+    except Exception:
+        return "unknown"
+
+    return "piezo" if "PIEZO" in name.upper() else "stage"
 
 
 def _read_prop(mmcore: CMMCorePlus, label: str, prop: str) -> str:
