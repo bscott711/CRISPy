@@ -26,6 +26,13 @@ JOYSTICK_PRESET = "Z_P"
 # between actuators (a piezo and a Z stage calibrate to very different gains).
 CAL_GAIN_PROP = "Calibration Gain"
 CAL_RANGE_PROP = "Calibration Range(um)"
+# Lock-offset setpoint: shifting it makes the servo hold a deliberately
+# defocused plane while staying locked (e.g. a per-wavelength correction for
+# axial chromatic aberration). LOCK_OFFSET_PROP is the read-only offset the
+# servo is currently tracking; SET_LOCK_OFFSET_PROP is the writable target.
+# Both are in the same controller counts as the error signal.
+LOCK_OFFSET_PROP = "Lock Offset"
+SET_LOCK_OFFSET_PROP = "Set Lock Offset (Advanced Users Only)"
 
 
 class CrispController(Protocol):
@@ -49,6 +56,15 @@ class CrispController(Protocol):
     def get_calibration_gain(self) -> float | None: ...
     def get_calibration_range_um(self) -> float | None: ...
     def get_sensitivity_counts_per_um(self) -> float | None: ...
+    def get_lock_offset_counts(self) -> float | None: ...
+    def get_set_lock_offset_counts(self) -> float | None: ...
+    def set_lock_offset_counts(self, counts: int) -> None: ...
+    def set_lock_offset_um(
+        self, um: float, counts_per_um: float | None = None
+    ) -> None: ...
+    def get_lock_offset_um(
+        self, counts_per_um: float | None = None
+    ) -> float | None: ...
 
 
 class ASICrispController:
@@ -193,3 +209,87 @@ class ASICrispController:
         if gain is None or rng is None or rng <= 0:
             return None
         return abs(gain) / rng
+
+    # --- lock offset ---
+    def _resolve_counts_per_um(self, counts_per_um: float | None) -> float:
+        """Return an explicit *counts_per_um* or fall back to the device value.
+
+        Raises
+        ------
+        RuntimeError
+            If *counts_per_um* is ``None`` and the device's own
+            ``|Calibration Gain| / Calibration Range(um)`` is unavailable, so
+            no micron<->counts conversion is possible.
+        """
+        scale = counts_per_um or self.get_sensitivity_counts_per_um()
+        if not scale:
+            raise RuntimeError(
+                f"No counts-per-micron scale available for {self._label} "
+                "(Calibration Gain / Range could not be read) and none was "
+                "passed explicitly."
+            )
+        return scale
+
+    def get_lock_offset_counts(self) -> float | None:
+        """Read-only offset the servo is currently holding, in controller counts.
+
+        Near zero when locked and in focus; a non-zero steady value means the
+        servo is deliberately holding a shifted plane (see
+        :meth:`set_lock_offset_counts`). ``None`` if the property can't be read.
+        """
+        return self._get_float(LOCK_OFFSET_PROP)
+
+    def get_set_lock_offset_counts(self) -> float | None:
+        """Read back the *writable* lock-offset setpoint, in controller counts.
+
+        Distinct from :meth:`get_lock_offset_counts` (the read-only tracked
+        value): comparing the two detects an adapter that accepted a write into
+        its cache without the controller acting on it, or vice versa.
+        """
+        return self._get_float(SET_LOCK_OFFSET_PROP)
+
+    def set_lock_offset_counts(self, counts: int) -> None:
+        """Command an **absolute** lock-offset setpoint, in controller counts.
+
+        The Tiger card servos the focus actuator to hold this offset from the
+        calibrated in-focus error value while staying locked. Not a delta --
+        each call replaces the previous setpoint. The caller owns waiting for
+        the actuator to settle and verifying the result.
+
+        Parameters
+        ----------
+        counts : int
+            Target offset in controller counts (rounded to an int on write).
+        """
+        self._mmcore.setProperty(
+            self._label, SET_LOCK_OFFSET_PROP, str(int(round(counts)))
+        )
+
+    def set_lock_offset_um(self, um: float, counts_per_um: float | None = None) -> None:
+        """Command an absolute lock-offset setpoint expressed in microns.
+
+        Converts *um* to counts via *counts_per_um* (or the device's own
+        sensitivity) and calls :meth:`set_lock_offset_counts`.
+
+        Parameters
+        ----------
+        um : float
+            Target focus offset from the calibrated plane, in microns.
+        counts_per_um : float | None
+            Conversion scale to use; ``None`` falls back to
+            :meth:`get_sensitivity_counts_per_um`. Raises ``RuntimeError`` if
+            neither is available.
+        """
+        scale = self._resolve_counts_per_um(counts_per_um)
+        self.set_lock_offset_counts(round(um * scale))
+
+    def get_lock_offset_um(self, counts_per_um: float | None = None) -> float | None:
+        """The servo's currently-held lock offset in microns, or ``None``.
+
+        ``None`` if the offset can't be read; raises ``RuntimeError`` if no
+        micron<->counts scale is available (pass *counts_per_um* to avoid that).
+        """
+        counts = self.get_lock_offset_counts()
+        if counts is None:
+            return None
+        return counts / self._resolve_counts_per_um(counts_per_um)
