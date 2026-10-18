@@ -13,10 +13,10 @@ Causes found in `ui.py`:
 
 1. `_STABILITY_WINDOW = 20` polls at 750 ms is ~15 s of memory, so the fluctuation metric
    is a smear of everything the knob did in the last 15 s.
-2. Each slow poll tick did ~11 blocking operations on real hardware (a
+1. Each slow poll tick did ~11 blocking operations on real hardware (a
    `RefreshPropertyValues` write, the state, 2 sensitivity reads and 7 readout reads).
    Calibration Gain / Range were read twice per tick.
-3. Nothing held a peak, so the maximum had to be spotted by eye.
+1. Nothing held a peak, so the maximum had to be spotted by eye.
 
 ## What was built
 
@@ -69,14 +69,17 @@ These rates come from a mock with an *assumed* serial latency, not from the rig.
 ## Bench checklist
 
 1. Start Tune and read the achieved Hz.
-2. Check Dither Error changes between samples; if it looks frozen, see the
+1. Check Dither Error changes between samples; if it looks frozen, see the
    `RefreshPropertyValues` note above.
-3. Sweep the knob; confirm the peak-held SNR and the meter let you land on the maximum.
-4. If Hz is capped by the controller, try lowering Number of Averages / Update Skips.
+1. Sweep the knob; confirm the peak-held SNR and the meter let you land on the maximum.
+1. If Hz is capped by the controller, try lowering Number of Averages / Update Skips.
 
-## Noticed, not changed
+## Docs
 
-- A failed `CRISP State` read becomes `""`, which counts as unlocked and re-enables the
-  joystick wheel while the axis may still be locked.
-- The README still says "Zero Serial Polling" and mentions magicgui.
-- `CLAUDE.md`'s "update from `propertyChanged`" no longer matches the code.
+README and CLAUDE.md were rewritten to match the code (they still described magicgui,
+event-driven updates and description-prefix discovery). Both now document Tune mode,
+the polling rules, the `AsyncPoller` dependency and the joystick lockout.
+
+Decision recorded in both: a failed `CRISP State` read becomes `""`, which counts as
+unlocked and re-enables the joystick. That is intentional, so it is documented rather
+than changed.
