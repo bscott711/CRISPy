@@ -35,6 +35,18 @@ LOCK_OFFSET_PROP = "Lock Offset"
 SET_LOCK_OFFSET_PROP = "Set Lock Offset (Advanced Users Only)"
 
 
+def counts_per_um(gain: float | None, range_um: float | None) -> float | None:
+    """Error counts per micron of defocus: ``|gain| / range_um``.
+
+    ``None`` if either calibration value is unavailable or the range is
+    non-positive. Shared by :class:`ASICrispController` and the UI, which already
+    holds the gain/range values from its telemetry read and so needn't re-read them.
+    """
+    if gain is None or range_um is None or range_um <= 0:
+        return None
+    return abs(gain) / range_um
+
+
 class CrispController(Protocol):
     @property
     def label(self) -> str: ...
@@ -204,11 +216,9 @@ class ASICrispController:
         Returns ``None`` if either calibration value is unavailable or the range
         is non-positive.
         """
-        gain = self.get_calibration_gain()
-        rng = self.get_calibration_range_um()
-        if gain is None or rng is None or rng <= 0:
-            return None
-        return abs(gain) / rng
+        return counts_per_um(
+            self.get_calibration_gain(), self.get_calibration_range_um()
+        )
 
     # --- lock offset ---
     def _resolve_counts_per_um(self, counts_per_um: float | None) -> float:

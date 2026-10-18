@@ -13,31 +13,41 @@ the ASITiger device-adapter properties:
 * derived metrics -> actuator-type badge, error *sensitivity* (counts/µm) from the
                      calibration, the focus error expressed in microns, and a
                      rolling *fluctuation* (std-dev / peak-to-peak) of the error
+* fast tune       -> a separate high-rate sampler (SNR / Sum / Dither Error only) with
+                     a short rolling window and peak-hold, for turning the CRISP
+                     detector knob (see :mod:`CRISPy.tuning`)
 * parameters      -> reused ``pymmcore_widgets.PropertyWidget`` controls
 """
 
 from __future__ import annotations
 
 import statistics
+import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+from .controller import CAL_GAIN_PROP, CAL_RANGE_PROP, counts_per_um
+from .tuning import DEFAULT_WINDOW_S, TuneSample, TuneSampler, TuneTracker
 
 if TYPE_CHECKING:
     from pymmcore_widgets.control._async_poller import AsyncPoller
@@ -54,6 +64,18 @@ _SNR_GOOD_DB = 4.0  # ASI manual target
 _ERROR_PROP = "Dither Error"
 # Rolling window for the fluctuation metric (~15 s at the default 750 ms poll).
 _STABILITY_WINDOW = 20
+
+# Fast tune mode: repaint the labels/meter at ~20 Hz however fast samples arrive.
+_TUNE_PAINT_S = 0.05
+# Tune shows "no data" if no sample has arrived for this long (link down, sampler
+# ended), instead of leaving the last values on screen looking live.
+_TUNE_STALE_S = 1.0
+_TUNE_WATCHDOG_MS = 500
+# The normal readouts hold their last values while the slow poller is paused for Tune.
+_READOUTS_TITLE = "Readouts"
+_READOUTS_PAUSED_TITLE = "Readouts  (paused while tuning)"
+# Tuning meter colour bands, as (minimum fraction of the peak, colour).
+_METER_BANDS = ((0.95, "#4caf50"), (0.80, "#ff9800"), (0.0, "#f44336"))
 
 # Read-only telemetry props, in display order: (property, label). "Calibration
 # Gain"/"Range" are the per-axis error->motion scaling (differs piezo vs stage);
@@ -100,6 +122,14 @@ def _close(a: float | None, b: float | None, *, rtol: float = 1e-3) -> bool:
     return abs(a - b) <= rtol * max(abs(a), abs(b), 1.0)
 
 
+def _to_float(text: str | None) -> float | None:
+    """Parse a property string, ``None`` if it is missing or not a number."""
+    try:
+        return float(text)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class CrispSnapshot:
     """A plain snapshot of CRISP telemetry, read off the GUI thread.
@@ -116,6 +146,10 @@ class CrispSnapshot:
 
 class CrispControlPanel(QWidget):
     """Control + telemetry panel for a single CRISP axis."""
+
+    # Carries each fast-tune sample from the sampler's worker thread to the GUI thread
+    # (emitting from a non-GUI thread makes Qt queue the delivery).
+    _tune_sample = Signal(object)
 
     def __init__(
         self,
@@ -135,6 +169,18 @@ class CrispControlPanel(QWidget):
         # (joystick gets disabled), matching the "always safe on lock" default.
         self._was_locked = False
 
+        # Fast tune mode (see CRISPy.tuning). While tuning, the slow poller is paused
+        # so that only one reader uses the Tiger serial port.
+        self._tracker = TuneTracker(DEFAULT_WINDOW_S)
+        self._tune_sampler: TuneSampler | None = None
+        self._tuning = False
+        self._last_tune_paint = 0.0
+        self._last_tune_sample = 0.0
+        self._tune_meter_color = ""
+        self._tune_watchdog = QTimer(self)
+        self._tune_watchdog.setInterval(_TUNE_WATCHDOG_MS)
+        self._tune_watchdog.timeout.connect(self._check_tune_stale)
+
         # The ASITiger adapter exposes "RefreshPropertyValues" to force a hardware
         # re-read; check once so we don't spam errors on devices that lack it.
         self._can_refresh = False
@@ -144,6 +190,7 @@ class CrispControlPanel(QWidget):
             )
 
         self._build()
+        self._tune_sample.connect(self._on_tune_sample)
 
         # Poll telemetry off the GUI thread so the ~10 blocking serial reads per
         # tick never stall the event loop / live view. See AsyncPoller. Imported
@@ -206,7 +253,7 @@ class CrispControlPanel(QWidget):
         layout.addLayout(poll_row)
 
         # --- readouts -----------------------------------------------------
-        ro_box = QGroupBox("Readouts")
+        ro_box = self.readouts_box = QGroupBox(_READOUTS_TITLE)
         grid = QGridLayout(ro_box)
         for i, (prop, label) in enumerate(_READOUTS):
             row, col = divmod(i, 2)
@@ -233,6 +280,8 @@ class CrispControlPanel(QWidget):
         )
         grid.addWidget(self.stability_lbl, next_row + 1, 0, 1, 4)
         layout.addWidget(ro_box)
+
+        layout.addWidget(self._build_tune_box())
 
         # --- operation (2x2 grid to stay compact) -------------------------
         op_box = QGroupBox("Operation")
@@ -282,6 +331,80 @@ class CrispControlPanel(QWidget):
         layout.addWidget(param_box)
 
         layout.addStretch()
+
+    def _build_tune_box(self) -> QGroupBox:
+        """Fast sampling + peak-hold, for turning the CRISP detector knob."""
+        box = QGroupBox("Tune  (fast, for the detector knob)")
+        grid = QGridLayout(box)
+
+        self.tune_btn = QPushButton("Start Tune")
+        self.tune_btn.setCheckable(True)
+        self.tune_btn.setToolTip(
+            "Sample SNR / Sum / Dither Error as fast as the controller allows and\n"
+            "hold the best value seen. Sweep the knob, note the peak, then back up\n"
+            "until the live value matches it. Needs the LED on (Ready or Lock).\n\n"
+            "Normal polling is paused while tuning. Tune stops when this panel is\n"
+            "hidden or an acquisition starts.\n\n"
+            "The controller's own Number of Averages / Update Skips limit how often\n"
+            "these values can change; lower them if the rate is still too slow."
+        )
+        self.tune_btn.toggled.connect(self._on_tune_toggled)
+        self.tune_reset_btn = QPushButton("Reset peak")
+        self.tune_reset_btn.setToolTip(
+            "Forget the best values and start a fresh sweep."
+        )
+        self.tune_reset_btn.clicked.connect(self._on_tune_reset)
+        grid.addWidget(self.tune_btn, 0, 0)
+        grid.addWidget(self.tune_reset_btn, 0, 1)
+
+        opts = QHBoxLayout()
+        self.tune_window = QDoubleSpinBox()
+        self.tune_window.setRange(0.1, 5.0)
+        self.tune_window.setSingleStep(0.1)
+        self.tune_window.setDecimals(1)
+        self.tune_window.setValue(DEFAULT_WINDOW_S)
+        self.tune_window.setSuffix(" s")
+        self.tune_window.setToolTip(
+            "Averaging window for SNR / Sum / fluctuation. Shorter follows a fast\n"
+            "knob turn more closely but is noisier; the lag is about half of it."
+        )
+        self.tune_window.valueChanged.connect(self._on_tune_window_changed)
+        self.tune_metric = QComboBox()
+        for text, key in (("SNR", "snr"), ("Sum", "sum"), ("Stability", "stability")):
+            self.tune_metric.addItem(text, key)
+        self.tune_metric.setToolTip("Which metric the meter follows.")
+        self.tune_metric.currentIndexChanged.connect(lambda _i: self._paint_tune(True))
+        opts.addWidget(QLabel("Window:"))
+        opts.addWidget(self.tune_window)
+        opts.addWidget(QLabel("Meter:"))
+        opts.addWidget(self.tune_metric)
+        opts.addStretch()
+        grid.addLayout(opts, 1, 0, 1, 2)
+
+        self.tune_meter = QProgressBar()
+        self.tune_meter.setRange(0, 100)
+        self.tune_meter.setToolTip(
+            "Live value as a fraction of the best seen (100% = at the peak)."
+        )
+        grid.addWidget(self.tune_meter, 2, 0, 1, 2)
+
+        self.tune_snr_lbl = QLabel()
+        self.tune_sum_lbl = QLabel()
+        self.tune_fluct_lbl = QLabel()
+        self.tune_rate_lbl = QLabel()
+        for row, lbl in enumerate(
+            (
+                self.tune_snr_lbl,
+                self.tune_sum_lbl,
+                self.tune_fluct_lbl,
+                self.tune_rate_lbl,
+            ),
+            start=3,
+        ):
+            lbl.setStyleSheet("font-weight: bold;")
+            grid.addWidget(lbl, row, 0, 1, 2)
+        self._paint_tune(force=True)
+        return box
 
     def _make_actuator_badge(self) -> QLabel:
         actuator = self.controller.actuator_type
@@ -374,8 +497,10 @@ class CrispControlPanel(QWidget):
     # --------------------------------------------------------- poll controls
     def _on_poll_toggled(self, checked: bool) -> None:
         if checked:
-            self._poller.start()
-            self._poller.poll_now(force=True)
+            # While tuning, the slow poller stays paused; it resumes when Tune stops.
+            if not self._tuning:
+                self._poller.start()
+                self._poller.poll_now(force=True)
         else:
             self._poller.stop()
 
@@ -383,13 +508,126 @@ class CrispControlPanel(QWidget):
         self._poller.set_interval(int(value))
 
     def _on_mda_started(self, *_args) -> None:
+        self._stop_tune(resume_poll=False)
         with suppress(RuntimeError):
             self._poller.stop()
 
     def _on_mda_finished(self, *_args) -> None:
         with suppress(RuntimeError):
-            if self.poll_chk.isChecked():
+            if self.poll_chk.isChecked() and not self._tuning:
                 self._poller.start()
+
+    # ------------------------------------------------------------------ tune
+    def _on_tune_toggled(self, checked: bool) -> None:
+        if checked:
+            self._start_tune()
+        else:
+            self._stop_tune()
+
+    def _start_tune(self) -> None:
+        if self._tuning:
+            return
+        self._tuning = True
+        self.readouts_box.setTitle(_READOUTS_PAUSED_TITLE)
+        with suppress(RuntimeError):
+            self._poller.stop()  # one reader on the serial port at a time
+        self._tracker.reset()
+        self._paint_tune(force=True)
+        self._last_tune_sample = time.monotonic()
+        self._tune_watchdog.start()
+        self._tune_sampler = TuneSampler(
+            self.mmcore,
+            self.controller.label,
+            self._tune_sample.emit,
+            refresh=self._can_refresh,
+        )
+        self._tune_sampler.start()
+        self.tune_btn.setText("Stop Tune")
+
+    def _stop_tune(self, *, resume_poll: bool = True) -> None:
+        if not self._tuning:
+            return
+        self._tuning = False
+        self._tune_watchdog.stop()
+        self.readouts_box.setTitle(_READOUTS_TITLE)
+        if self._tune_sampler is not None:
+            self._tune_sampler.stop()
+            self._tune_sampler = None
+        # Sync the button when we were stopped from elsewhere (hide, MDA start).
+        self.tune_btn.blockSignals(True)
+        self.tune_btn.setChecked(False)
+        self.tune_btn.blockSignals(False)
+        self.tune_btn.setText("Start Tune")
+        if resume_poll and self.poll_chk.isChecked():
+            with suppress(RuntimeError):
+                self._poller.start()
+                if self.isVisible():
+                    self._poller.poll_now(force=True)
+
+    def _on_tune_sample(self, sample: TuneSample) -> None:
+        """Take one sample from the sampler thread (runs on the GUI thread)."""
+        if not self._tuning:  # a straggler queued before Tune was stopped
+            return
+        self._last_tune_sample = time.monotonic()
+        self._tracker.add(sample)
+        self._paint_tune()
+
+    def _check_tune_stale(self) -> None:
+        if self._tuning and time.monotonic() - self._last_tune_sample > _TUNE_STALE_S:
+            self.tune_rate_lbl.setText("Rate: no data from the controller")
+
+    def _on_tune_reset(self) -> None:
+        self._tracker.reset()
+        self._paint_tune(force=True)
+
+    def _on_tune_window_changed(self, seconds: float) -> None:
+        self._tracker.set_window(float(seconds))
+
+    def _paint_tune(self, force: bool = False) -> None:
+        """Refresh the Tune labels and meter, at most ~20 Hz unless *force*."""
+        now = time.monotonic()
+        if not force and now - self._last_tune_paint < _TUNE_PAINT_S:
+            return
+        self._last_tune_paint = now
+        s = self._tracker.stats
+
+        def val(v: float | None, spec: str) -> str:
+            return "--" if v is None else format(v, spec)
+
+        self.tune_snr_lbl.setText(
+            f"SNR: {val(s.snr, '.2f')} dB    peak {val(s.best_snr, '.2f')}"
+        )
+        self.tune_sum_lbl.setText(
+            f"Sum: {val(s.signal_sum, '.1f')}    peak {val(s.best_signal_sum, '.1f')}"
+        )
+        fluct = f"Fluctuation: ± {val(s.error_std, '.1f')} cts"
+        std_um = None if s.error_std is None else self._to_um(s.error_std)
+        if std_um is not None:
+            fluct += f" ({abs(std_um):.3f} µm)"
+        self.tune_fluct_lbl.setText(f"{fluct}    best {val(s.best_error_std, '.1f')}")
+        self.tune_rate_lbl.setText(f"Rate: {val(s.rate_hz, '.0f')} Hz")
+
+        frac = self._tracker.fraction(self.tune_metric.currentData())
+        self.tune_meter.setValue(0 if frac is None else round(frac * 100))
+        self.tune_meter.setFormat("--" if frac is None else "%p%")
+        color = "#9e9e9e"
+        if frac is not None:
+            color = next(c for floor, c in _METER_BANDS if frac >= floor)
+        if color != self._tune_meter_color:  # restyle only when the band changes
+            self._tune_meter_color = color
+            self.tune_meter.setStyleSheet(
+                f"QProgressBar::chunk {{ background: {color}; }}"
+                " QProgressBar { text-align: center; }"
+            )
+
+    def hideEvent(self, event) -> None:
+        # Don't keep hammering the serial port for a panel nobody is looking at.
+        self._stop_tune()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self._stop_tune(resume_poll=False)
+        super().closeEvent(event)
 
     # ------------------------------------------------------------- telemetry
     def _on_reset_offset(self) -> None:
@@ -397,6 +635,8 @@ class CrispControlPanel(QWidget):
             self.controller.set_reset_offset()
         # The error datum just moved; drop stale fluctuation samples.
         self._error_history.clear()
+        self._tracker.clear_error()
+        self._paint_tune(force=True)
         self._poller.poll_now(force=True)
 
     def _read_device_values(self) -> CrispSnapshot:
@@ -423,12 +663,17 @@ class CrispControlPanel(QWidget):
         with suppress(Exception):
             state = str(self.mmcore.getProperty(label, "CRISP State"))
 
-        sensitivity = self.controller.get_sensitivity_counts_per_um()
-
         readouts: dict[str, str] = {}
         for prop, _ in _READOUTS:
             with suppress(Exception):
                 readouts[prop] = str(self.mmcore.getProperty(label, prop))
+
+        # Calibration Gain / Range are already among the readouts, so derive the
+        # sensitivity from them rather than reading both again every tick.
+        sensitivity = counts_per_um(
+            _to_float(readouts.get(CAL_GAIN_PROP)),
+            _to_float(readouts.get(CAL_RANGE_PROP)),
+        )
 
         return CrispSnapshot(state=state, sensitivity=sensitivity, readouts=readouts)
 

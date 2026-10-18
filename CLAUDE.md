@@ -16,6 +16,8 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
 - `discovery.py`  — `discover_crisp_devices()`: find ASITiger AutoFocus axes
 - `controller.py` — `ASICrispController`: per-device property read/write + lock ops
 - `ui.py`         — `CrispControlPanel`: Qt-native control/calibration panel
+- `tuning.py`     — Qt-free fast sampling + peak-hold for turning the CRISP
+                    detector knob (`TuneSampler`, `TuneTracker`)
 - `plugin.py`     — `launch_crisp_plugin()`: layout orchestration
                     (1=panel, 2=horizontal splitter, 3+=tabs)
 
@@ -29,6 +31,9 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
   (SNR, Dither Error) need explicit polling — gate it on
   `hasProperty("RefreshPropertyValues")`, run only while the panel is visible, and
   auto-pause during MDA (`mda.events.sequenceStarted/Finished`).
+  Fast Tune mode is the one exception: its own sampler thread reads only SNR / Sum /
+  Dither Error at high rate, pauses the slow poll while running (one reader on the
+  serial port) and stops on hide, close and MDA start.
 - **Qt via `qtpy`.** Use the `qtpy` abstraction (not a hard PyQt6 import) and reuse
   `pymmcore-widgets` `PropertyWidget` for parameter fields.
 - **Stay a plugin.** CRISPy is host-agnostic; don't import pymmcore-gui internals.
