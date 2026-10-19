@@ -104,11 +104,15 @@ micro-manager/mmCoreAndDevices).
   test (actuator position) measures it. `controller.set_lock_offset_um` (used by
   pymmcore-gui's per-channel focus offset) uses the Cal Gain figure, which may be right
   for Lock Offset's internal scale but is unverified.
-- **The rig's Z focus curve had no peaks within ±10 µm** (a broad S, +50 .. -55 counts),
-  much broader than ASI's table for NA 1.25-1.4 objectives (focus range ~±2.5-3 µm).
-  Unexplained as of 2026-10-19; candidates are a scan that moved less than commanded
-  or a signal dominated by a broad reflection. The analysis reports the scan ends as
-  "no peak within the scan", not as peaks.
+- **The rig's Z focus curve (2026-10-19, ±30 µm) shows two features.** The lock point
+  sits on a broad, weak one (crossing −0.8 µm, ~12 counts/µm, error levels off at
+  ~+130 all the way to −30 µm, turns over +8.3 µm above). A second, sharper one with the
+  opposite slope crosses zero at about +15.5 µm (~6× steeper, rising to ~+300 by
+  +26 µm): most likely another reflecting surface coming into CRISP's focus, and the
+  edge of the capture range on that side. Why the lock sits on the weak feature is open
+  (see the manual's "Offset the locking plane from the imaging plane"). The analysis
+  reports a peak only if the curve turns over (falls ≥ `PEAK_DROP` beyond it), and lists
+  other zero crossings at least a quarter as steep as the lock point.
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

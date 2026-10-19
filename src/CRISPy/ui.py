@@ -1354,6 +1354,9 @@ class CrispControlPanel(QWidget):
         markers: list[tuple[float, float, str]] = []
         if a is not None and a.crossing_um is not None:
             vlines.append(RefLine(a.crossing_um, _BLUE, "lock point", dashed=False))
+            vlines.extend(
+                RefLine(z, _ORANGE, "other crossing") for z, _ in a.other_crossings
+            )
             for pk in (a.peak_low, a.peak_high):
                 if pk is not None:
                     markers.append((pk[0], pk[1], _ORANGE))
@@ -1394,24 +1397,47 @@ class CrispControlPanel(QWidget):
         lo, hi = a.margin_low_um, a.margin_high_um
         z_lo = min(p.z_um for p in self._curve_points) if self._curve_points else None
         z_hi = max(p.z_um for p in self._curve_points) if self._curve_points else None
-        if lo is not None and hi is not None:
+        found = [
+            f"{m:.2f} µm {side}"
+            for m, side in ((lo, "below"), (hi, "above"))
+            if m is not None
+        ]
+        if found:
             lines.append(
-                f"<b>Peaks</b> {lo:.2f} µm below and {hi:.2f} µm above the lock point "
-                "(a lock point close to a peak is hard to hold)."
+                f"<b>Peak{'s' if len(found) > 1 else ''}</b> {' and '.join(found)} the "
+                "lock point (a lock point close to a peak is hard to hold)."
             )
-        else:
-            missing = [
-                side
-                for side, pk in (("below", a.peak_low), ("above", a.peak_high))
-                if pk is None
-            ]
+        missing = [
+            side
+            for side, pk in (("below", a.peak_low), ("above", a.peak_high))
+            if pk is None
+        ]
+        if missing:
             span = ""
             if z_lo is not None and z_hi is not None:
                 span = f" ({z_lo:+.1f} … {z_hi:+.1f} µm)"
+            text = (
+                f"<b>No turnover {' or '.join(missing)} the lock point within the "
+                f"scan</b>{span}: the error levels off or keeps growing to the end."
+            )
+            if not found:
+                text += " Scan wider (if safe) to find the peaks."
+            lines.append(text)
+        for z, s in a.other_crossings:
+            if s is None or not a.slope:
+                continue
+            steep = abs(s) / abs(a.slope)
+            if (s > 0) != (a.slope > 0):
+                meaning = (
+                    "opposite sign: probably another reflecting surface coming into "
+                    "focus. Past it the error pushes the wrong way, so the capture "
+                    "range ends there"
+                )
+            else:
+                meaning = "same sign: a second point the lock could settle on"
             lines.append(
-                f"<b>No peak {' or '.join(missing)} the lock point within the scan"
-                f"</b>{span}: the error is still growing at the end, so the curve is "
-                "broader than the scan. Scan wider (if safe) to find the peaks."
+                f"<b>Another zero crossing</b> at {z:+.1f} µm, slope {s:+.0f} counts/µm "
+                f"({steep:.1f}× as steep as the lock point; {meaning})."
             )
         cap_lo = _fmt(a.capture_low_um, "+.2f")
         cap_hi = _fmt(a.capture_high_um, "+.2f")

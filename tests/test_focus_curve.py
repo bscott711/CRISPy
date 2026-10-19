@@ -206,6 +206,39 @@ def test_a_curve_broader_than_the_scan_has_no_peaks_not_the_scan_ends() -> None:
     assert a.resolution_nm == pytest.approx(1000 / (60.0 / 7.0), rel=0.1)
 
 
+def test_a_plateau_with_a_one_count_bump_near_the_end_is_not_a_peak() -> None:
+    # The rig's Z scan at ±30 µm: below the lock point the error levels off at ~+130
+    # and one reading near the end is a count higher than the rest.
+    def err(z: float) -> float:
+        base = round(130.0 * math.tanh(-(z + 0.8) / 4.0))
+        return base + (1 if abs(z + 29.5) < 1e-9 else 0)
+
+    pts = [CurvePoint(z, err(z), None, 1) for z in scan_offsets(30.0, 0.25)]
+    a = analyze_focus_curve(pts)
+    assert a.peak_low is None
+    assert a.capture_low_open
+
+
+def test_a_second_surface_is_reported_as_another_crossing() -> None:
+    # A weak, broad lock curve at 0 and a strong, sharp surface at +16 µm with the
+    # opposite slope (like the rig's Z scan at ±30 µm).
+    def err(z: float) -> float:
+        return s_curve(z, slope=-12.0, width=6.0) + s_curve(z - 16.0, 120.0, 1.5)
+
+    pts = [CurvePoint(z, err(z), None, 1) for z in scan_offsets(30.0, 0.25)]
+    a = analyze_focus_curve(pts)
+    assert a.crossing_um == pytest.approx(0.0, abs=0.1)
+    assert len(a.other_crossings) == 1
+    z2, slope2 = a.other_crossings[0]
+    assert 14.5 < z2 < 16.5
+    assert slope2 is not None and slope2 > 0 > a.slope
+    assert abs(slope2) > 5 * abs(a.slope)
+    # Past the second surface the error has the wrong sign: the capture range ends.
+    assert not a.capture_high_open
+    assert a.capture_high_um is not None and a.capture_high_um < z2
+    assert a.peak_high is not None  # the lock curve turns over before it
+
+
 def test_a_peak_on_one_side_only() -> None:
     # Peaks 2 µm below; above, the error keeps growing to the end of the scan.
     def err(z: float) -> float:

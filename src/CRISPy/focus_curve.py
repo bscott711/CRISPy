@@ -47,6 +47,13 @@ DEFAULT_HALF_RANGE_UM = 10.0
 DEFAULT_STEP_UM = 0.25
 DEFAULT_SETTLE_S = 0.05
 DEFAULT_READS = 3
+# A peak must turn over: beyond it (before the scan ends) the error has to fall by at
+# least this fraction. A curve that levels off or keeps growing has no peak in the scan.
+PEAK_DROP = 0.15
+# Distance over which the slope at another zero crossing is fitted, µm (each side).
+_OTHER_SLOPE_HALF_WIDTH_UM = 1.0
+# Other crossings are reported only if at least this steep relative to the lock point.
+_OTHER_MIN_STEEPNESS = 0.25
 
 
 class FocusCurveError(RuntimeError):
@@ -87,6 +94,10 @@ class CurveAnalysis:
     capture_high_open: bool
     noise_counts: float | None  # typical per-step error std-dev near the crossing
     noise_floor_nm: float | None  # noise_counts / |slope|
+    # Every other zero crossing in the scan, as (z, slope there). Another reflecting
+    # surface coming into focus shows up as one; with the opposite slope sign it is
+    # also where the capture range ends on that side.
+    other_crossings: tuple[tuple[float, float | None], ...] = ()
 
     @property
     def resolution_nm(self) -> float | None:
@@ -243,26 +254,30 @@ def _walk_side(
     """Walk outward from *start* while the error has *want_sign*.
 
     Returns the peak on that side, the last z with the correct sign, and whether the
-    correct sign continued to the end of the scan. If the largest error is the last
-    point of the scan, the curve is still rising there: that's not a peak, so the
-    peak is ``None`` (it lies beyond the scan).
+    correct sign continued to the end of the scan. A peak must turn over: if the
+    error doesn't fall by :data:`PEAK_DROP` beyond its largest value before the scan
+    ends (it levels off or keeps growing), the peak is ``None``. If the sign changes
+    first, the error has gone through zero, so the turnover is certain.
     """
-    peak: tuple[float, float] | None = None
-    last: CurvePoint | None = None
+    walked: list[CurvePoint] = []
     i = start
+    open_end = True
     while 0 <= i < len(pts):
         p = pts[i]
         if _sign(p.error) != want_sign:
-            return peak, (last.z_um if last else None), False
-        last = p
-        if peak is None or abs(p.error) > abs(peak[1]):
-            peak = (p.z_um, p.error)
+            open_end = False
+            break
+        walked.append(p)
         i += step
-    # The end of the scan reaches the largest error (whole-count readings often tie
-    # there): the curve hasn't turned over inside the scan, so there's no peak in it.
-    if peak is not None and last is not None and abs(last.error) >= abs(peak[1]):
-        peak = None
-    return peak, (last.z_um if last else None), True
+    if not walked:
+        return None, None, open_end
+    k = max(range(len(walked)), key=lambda j: (abs(walked[j].error), -j))
+    peak: tuple[float, float] | None = (walked[k].z_um, walked[k].error)
+    if open_end:
+        beyond = [abs(p.error) for p in walked[k + 1 :]]
+        if not beyond or min(beyond) > (1 - PEAK_DROP) * abs(walked[k].error):
+            peak = None  # levels off or still growing at the end of the scan
+    return peak, walked[-1].z_um, open_end
 
 
 def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
@@ -272,8 +287,11 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     if len(pts) < 2:
         return empty
 
-    # The zero crossing nearest the starting position (z = 0).
-    best: tuple[float, int] | None = None  # (z of crossing, index of the lower point)
+    step = statistics.median(b.z_um - a.z_um for a, b in pairwise(pts))
+
+    # Every zero crossing, as (z, index of the lower point). Crossings within two
+    # steps of each other are one crossing seen through noise; keep the first.
+    crossings: list[tuple[float, int]] = []
     for i in range(len(pts) - 1):
         a, b = pts[i], pts[i + 1]
         if a.error == 0:
@@ -282,11 +300,13 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
             z = a.z_um + (b.z_um - a.z_um) * (-a.error) / (b.error - a.error)
         else:
             continue
-        if best is None or abs(z) < abs(best[0]):
-            best = (z, i)
-    if best is None:
+        if crossings and z - crossings[-1][0] <= 2 * step:
+            continue
+        crossings.append((z, i))
+    if not crossings:
         return empty
-    z_c, i = best
+    # The lock point is the crossing nearest the starting position (z = 0).
+    z_c, i = min(crossings, key=lambda c: abs(c[0]))
     rising = _sign(pts[i + 1].error - pts[i].error) or 1
 
     # Below the crossing the error has the opposite sign to above it.
@@ -297,7 +317,6 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     # Fit the slope over the central third of the region between the peaks (at least
     # the two points that bracket the crossing). With no peak inside the scan the
     # curve is broad, so fit over a quarter of the way to the nearer scan end.
-    step = statistics.median(b.z_um - a.z_um for a, b in pairwise(pts))
     margins = [abs(z_c - pk[0]) for pk in (peak_low, peak_high) if pk is not None]
     if margins:
         half_width = max(1.5 * step, min(margins) / 3)
@@ -315,6 +334,18 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     if noise is not None and slope:
         floor_nm = noise / abs(slope) * 1000.0
 
+    # Other crossings, if they are at least a quarter as steep as the lock point: a
+    # shallower one is noise or tails wandering across zero, not another surface.
+    others: list[tuple[float, float | None]] = []
+    for z, _ in crossings:
+        if z == z_c:
+            continue
+        local = [p for p in pts if abs(p.z_um - z) <= _OTHER_SLOPE_HALF_WIDTH_UM]
+        s = _fit_slope([p.z_um for p in local], [p.error for p in local])
+        if s is not None and slope and abs(s) < _OTHER_MIN_STEEPNESS * abs(slope):
+            continue
+        others.append((z, s))
+
     return CurveAnalysis(
         crossing_um=z_c,
         slope=slope,
@@ -326,6 +357,7 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
         capture_high_open=high_open,
         noise_counts=noise,
         noise_floor_nm=floor_nm,
+        other_crossings=tuple(others),
     )
 
 

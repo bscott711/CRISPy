@@ -72,6 +72,21 @@ The panel's summary was misleading, so:
 Open question for the bench: why the curve is so much broader than ASI's table suggests
 for an NA ~1.4-1.49 objective (scan moved less than commanded? broad reflection?).
 
+## Addendum 2: Z focus curve at ±30 µm
+
+Lock point −0.82 µm, slope −12.2 counts/µm, error levelling off at ~+130 down to −30 µm,
+turning over at +8.3 µm above, then a second, ~6× steeper crossing with the opposite slope
+at about +15.5 µm, rising to ~+300 by +26 µm. The summary called the plateau's one-count
+bump near −29.5 µm a "peak" and didn't mention the second crossing. Now:
+
+- A peak must turn over: beyond it the error must fall by ≥ 15% (`PEAK_DROP`) before
+  the scan ends, or change sign. Otherwise "no turnover within the scan".
+- Other zero crossings at least a quarter as steep as the lock point are listed with
+  their slope and marked on the plot; an opposite-sign one is flagged as the likely
+  edge of the capture range / another surface.
+- Checked by rendering a curve traced from the screenshot through the real panel: lock
+  −0.81, slope −11.8, peak +8.31 above, no false peak below, other crossing +15.5 µm.
+
 ## Bench (user)
 
 - Set Objective NA: piezo 1.0, Z 1.49 (Parameters box), then Log Cal → Dither → Set Gain.
