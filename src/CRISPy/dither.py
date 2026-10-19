@@ -82,6 +82,9 @@ class DitherStats:
     sign: int  # sign of the window's median Err (+1 / -1 / 0)
     # (p90 - p10) / 2 of |Err| in the window, as a fraction of level
     spread: float | None
+    # Scatter of |Err| in the window in counts: a robust std-dev, (p90 - p10) / 2.56.
+    # Unlike spread it doesn't depend on the level, so axes can be compared directly.
+    noise: float | None
     steady: bool  # no trend across the window (see STEADY_TREND)
     peak: float | None  # best steady level seen since the last reset
     peak_t: float | None
@@ -89,7 +92,9 @@ class DitherStats:
     sum_status: SumStatus | None
 
 
-_EMPTY = DitherStats(None, None, None, 0, None, False, None, None, None, None)
+_EMPTY = DitherStats(None, None, None, 0, None, None, False, None, None, None, None)
+# p90 - p10 of a normal distribution, in standard deviations.
+_P90_P10_SIGMAS = 2.563
 
 
 def read_dither_sample(
@@ -168,6 +173,8 @@ class DitherTracker:
         self._min_samples = min_samples
         self._min_fill = min_fill
         self._win: deque[tuple[float, float]] = deque()  # (t, signed err)
+        # Every reading for the last trace_s, so discard_after() can rebuild the window.
+        self._raw: deque[tuple[float, float]] = deque()
         self._times: deque[float] = deque()  # for the rate estimate
         self._trace: deque[tuple[float, float, float | None]] = deque()
         self._peak: float | None = None
@@ -197,9 +204,31 @@ class DitherTracker:
         self._peak = self._peak_t = None
         self._stats = self._compute(self._stats_time())
 
+    def discard_after(self, t: float) -> None:
+        """Drop readings taken after time *t* (e.g. once the dither has ended).
+
+        The state is only read every so often, so the first readings after the dither
+        stops arrive before the tracker knows; this removes them from the window and
+        the trace. A peak is never set by them (they fall towards 0).
+        """
+        while self._raw and self._raw[-1][0] > t:
+            self._raw.pop()
+        while self._trace and self._trace[-1][0] > t:
+            self._trace.pop()
+        while self._times and self._times[-1] > t:
+            self._times.pop()
+        # Rebuild the window from the kept readings: the newer ones it held are gone,
+        # and older ones it had already let go of belong in it again.
+        end = self._raw[-1][0] if self._raw else t
+        self._win = deque(e for e in self._raw if e[0] >= end - self._window_s)
+        if self._raw:
+            self._last_err = self._raw[-1][1]
+        self._stats = self._compute(self._stats_time())
+
     def reset(self) -> None:
         """Forget everything."""
         self._win.clear()
+        self._raw.clear()
         self._times.clear()
         self._trace.clear()
         self._peak = self._peak_t = None
@@ -217,6 +246,9 @@ class DitherTracker:
         if sample.err is not None:
             self._last_err = sample.err
             self._win.append((t, sample.err))
+            self._raw.append((t, sample.err))
+            while self._raw and self._raw[0][0] < t - self._trace_s:
+                self._raw.popleft()
         cutoff = t - self._window_s
         while self._win and self._win[0][0] < cutoff:
             self._win.popleft()
@@ -262,7 +294,7 @@ class DitherTracker:
         return max(medians) - min(medians) <= STEADY_TREND * level
 
     def _compute(self, now: float) -> DitherStats:
-        level = spread = None
+        level = spread = noise = None
         sign = 0
         steady = False
         if self._ready():
@@ -271,8 +303,10 @@ class DitherTracker:
             level = _median(mags)
             med = _median(signed)
             sign = (med > 0) - (med < 0)
+            p10_p90 = _quantile(mags, 0.9) - _quantile(mags, 0.1)
+            noise = p10_p90 / _P90_P10_SIGMAS
             if level > 0:
-                spread = (_quantile(mags, 0.9) - _quantile(mags, 0.1)) / 2 / level
+                spread = p10_p90 / 2 / level
             steady = self._steady(level)
             if steady and (self._peak is None or level > self._peak):
                 self._peak, self._peak_t = level, now
@@ -282,6 +316,7 @@ class DitherTracker:
             level=level,
             sign=sign,
             spread=spread,
+            noise=noise,
             steady=steady,
             peak=self._peak,
             peak_t=self._peak_t,

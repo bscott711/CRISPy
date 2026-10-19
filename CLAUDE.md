@@ -92,9 +92,22 @@ micro-manager/mmCoreAndDevices).
   the adapter source): it makes reads of the cached properties (Lock Offset,
   Calibration Gain/Range, parameters) query the controller. It is written once.
   State, SNR, Sum, Dither Error and AGC are always read from the controller.
-- **Sensitivity = |Calibration Gain| / Calibration Range** assumes Cal Gain is the
-  error change over the calibration move. The Focus curve measures the slope directly
-  and says when the two disagree.
+- **Sensitivity = |Calibration Gain| / Calibration Range is unverified, and likely not
+  counts/µm of the operating error.** On the rig (2026-10-19) |Cal Gain| was 10-13× the
+  dither |Err| on both axes, and the manual says the dither Err "is actually different
+  from the Err signal computed during operation". Only the Focus curve measures the
+  slope; after one, the panel uses it for µm figures until Log Cal / Dither.
+  `controller.set_lock_offset_um` (used by pymmcore-gui's per-channel focus offset)
+  still uses the Cal Gain figure; don't trust its µm scale without a focus curve.
+- **Objective NA must be the objective each axis moves**: it sets the dither move
+  (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
+  "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and
+  1.45 (Cal Range 0.887 / 0.714 µm), so the piezo dithered under half the right
+  distance. The Cal Range readout shows the implied NA.
+- **Parameter widgets ignore the wheel unless focused** (`_WheelGuard`): sliders in a
+  scrolling panel otherwise change controller settings when the user scrolls past.
+- **The Hold test also runs unlocked** (Ready / Idle): the actuator's own noise and the
+  sensor noise, without CRISP driving. An unlocked run ends if CRISP starts driving.
 - **`AsyncPoller` lives in `pymmcore_widgets.control._async_poller`**, which is not in
   the latest PyPI release (0.12.1, which `uv.lock` pins); the user's
   `pymmcore-widgets` checkout has it. `CrispControlPanel` only constructs where it is

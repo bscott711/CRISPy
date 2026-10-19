@@ -4,8 +4,14 @@ The CRISP error signal is measured *inside* the feedback loop, so it can look qu
 while the actuator moves: on this rig's 2026-08-14 log the locked piezo's error stayed
 within ±9 counts while the piezo itself moved ~100 nm between samples. The actuator's
 own position readback is what the servo does to the focus, so this test records it
-(plus the error and the state) at a steady rate while the axis sits locked, then
-separates:
+(plus the error and the state) at a steady rate while the axis sits locked.
+
+It can also run **unlocked** (Ready or Idle), with CRISP not driving the actuator. The
+position then shows the actuator's own noise (the piezo and its drive), and in Ready the
+error shows the sensor's noise. Comparing an unlocked and a locked run separates what
+the actuator does by itself from what the lock adds.
+
+Either way the record is split into:
 
 * **drift**: the straight-line trend, in nm/min. Part of it is CRISP doing its job,
   following thermal drift of the sample; a drift together with a changing lock offset
@@ -46,6 +52,14 @@ ERROR_PROP = "Dither Error"
 STATE_PROP = "CRISP State"
 LOCK_OFFSET_PROP = "Lock Offset"
 LOCKED_STATES = frozenset({"Lock", "In Focus"})
+# States in which CRISP drives the actuator; an unlocked run ends if one appears.
+DRIVEN_STATES = LOCKED_STATES | {
+    "Dither",
+    "Calibrating",
+    "loG_cal",
+    "gain_Cal",
+    "Curve",
+}
 
 # Lock settings recorded with each run: (property, short name).
 SETTINGS_PROPS: list[tuple[str, str]] = [
@@ -62,8 +76,9 @@ DEFAULT_RATE_HZ = 10.0
 DEFAULT_BIN_S = 1.0
 # Read the state about this often (not every sample) to see a lost lock.
 _STATE_EVERY_S = 1.0
-# Stop after this many consecutive state reads that aren't locked.
-_UNLOCKED_READS_TO_STOP = 2
+# Stop after this many consecutive state reads in the wrong mode (a single odd read
+# is tolerated).
+_WRONG_STATE_READS_TO_STOP = 2
 
 
 @dataclass(frozen=True)
@@ -104,9 +119,10 @@ class HoldResult:
     lock_offset_end: float | None
     stats: HoldStats
     samples: list[HoldSample] = field(default_factory=list)
-    completed: bool = True  # False if stopped or the lock was lost
-    lock_lost_at_s: float | None = None
+    completed: bool = True  # False if stopped, or the state left the run's mode
+    interrupted_at_s: float | None = None  # when the state left the run's mode
     note: str = ""
+    locked: bool = True  # a locked run (CRISP driving) or an unlocked one
 
     @property
     def lock_offset_change(self) -> float | None:
@@ -184,13 +200,18 @@ class HoldTest:
     mmcore
         The shared core.
     label
-        The CRISP autofocus device; it should be locked.
+        The CRISP autofocus device.
     actuator
         The stage device CRISP drives; its position is recorded.
     duration_s
         How long to record.
     rate_hz
         Target sample rate. Each sample is two reads (position, error).
+    locked
+        ``True`` (default) for a run with the lock engaged; it ends if the lock is
+        lost. ``False`` for a run with CRISP *not* driving the actuator (Ready or
+        Idle): the position then shows the actuator's own noise and the error the
+        sensor's noise. It ends if the state moves into Lock, Dither or calibration.
     on_sample
         Called on the worker thread with each sample.
     on_done
@@ -206,12 +227,14 @@ class HoldTest:
         *,
         duration_s: float = DEFAULT_DURATION_S,
         rate_hz: float = DEFAULT_RATE_HZ,
+        locked: bool = True,
         on_sample: Callable[[HoldSample], None] | None = None,
         on_done: Callable[[HoldResult], None] | None = None,
     ) -> None:
         self._mmcore = mmcore
         self._label = label
         self._actuator = actuator
+        self._locked = locked
         self._duration_s = duration_s
         self._interval = 1.0 / rate_hz
         self._on_sample = on_sample
@@ -243,6 +266,12 @@ class HoldTest:
         if self._thread is not None:
             self._thread.join(timeout)
 
+    def _state_ok(self, state: str) -> bool:
+        """Whether *state* matches the run's mode (locked, or not driven)."""
+        if self._locked:
+            return state in LOCKED_STATES
+        return state not in DRIVEN_STATES
+
     def _read_position(self) -> float | None:
         with suppress(Exception):
             return float(self._mmcore.getPosition(self._actuator))
@@ -259,8 +288,8 @@ class HoldTest:
         offset_start = read_float(core, label, LOCK_OFFSET_PROP)
 
         samples: list[HoldSample] = []
-        lock_lost_at: float | None = None
-        unlocked_reads = 0
+        interrupted_at: float | None = None
+        wrong_reads = 0
         t0 = time.monotonic()
         next_state = t0
         note = ""
@@ -289,10 +318,14 @@ class HoldTest:
                     note = "stopped: display closed"
                     break
             if state is not None:
-                unlocked_reads = 0 if state in LOCKED_STATES else unlocked_reads + 1
-                if unlocked_reads >= _UNLOCKED_READS_TO_STOP:
-                    lock_lost_at = sample.t
-                    note = f"lock lost ({state})"
+                wrong_reads = 0 if self._state_ok(state) else wrong_reads + 1
+                if wrong_reads >= _WRONG_STATE_READS_TO_STOP:
+                    interrupted_at = sample.t
+                    note = (
+                        f"lock lost ({state})"
+                        if self._locked
+                        else f"CRISP started driving the actuator ({state})"
+                    )
                     break
             wait = self._interval - (time.monotonic() - now)
             if wait > 0:
@@ -311,8 +344,9 @@ class HoldTest:
             stats=analyze_hold(samples),
             samples=samples,
             completed=not stopped_early,
-            lock_lost_at_s=lock_lost_at,
+            interrupted_at_s=interrupted_at,
             note=note,
+            locked=self._locked,
         )
         if self._on_done is not None:
             self._on_done(result)
@@ -324,6 +358,7 @@ def write_hold_csv(path: Path | str, result: HoldResult) -> None:
     meta = {
         "crisp": result.label,
         "actuator": result.actuator,
+        "mode": "locked" if result.locked else "unlocked",
         "started": result.started.isoformat(timespec="seconds"),
         **{f"setting {k}": v for k, v in result.settings.items()},
         "lock_offset_start": result.lock_offset_start,

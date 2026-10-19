@@ -48,6 +48,7 @@ Once installed, launch `pymmcore-gui`. CRISPy will automatically register itself
 1. Open `pymmcore-gui` and load your Hardware Configuration.
 1. Navigate to **Plugins -> CRISPy**.
 1. The plugin will automatically discover all loaded ASI CRISP devices.
+1. In each axis's **Parameters** box, set **Objective NA** to the NA of the objective *that axis moves*. It sets the dither move (1.5 µm / NA²); the Cal Range readout shows the NA it corresponds to. Too high an NA gives too short a dither move and a small, noisy dither Err.
 1. Focus on your sample, then follow the 3-step calibration in each axis's **Calibration** box:
    - **Step 1:** Log Cal. Aim for SNR > 4 dB (at least 2); if it is low, raise LED Intensity and repeat.
    - **Step 2:** Dither. Turn the detector lateral adjustment screw for the largest |Err| (see [Aligning the detector](#-aligning-the-detector-dither)).
@@ -65,6 +66,7 @@ Pressing **2. Dither** opens the **Dither** tab and starts the assistant (or pre
 - It reads only Dither Error and Sum, as fast as the link allows, and shows the rate.
 - The big number is the median of |Err| over a short window (default 1 s), so brief spikes are ignored.
 - The **peak** is the best value seen while the readings were steady (the window's thirds agree within 10%), so a temporary value from moving the detector can't become the peak, however long it takes to decay. "settling…" means it hasn't settled yet.
+- The **scatter** is the standard deviation of the readings over the window, in counts and as % of |Err|. Compare axes by the counts; a large % means the readings (and the peak) move that much from noise alone, so raise **Smoothing** to 2-3 s and pause longer.
 - The trace shows the last 30 s with the 100 and 200 marks; the raw readings are the grey dots.
 - Sum is checked against 50-80; 0 or 100 means a detector half is saturated.
 
@@ -76,18 +78,19 @@ The locked error number is measured *inside* the feedback loop, so it can look q
 
 1. **Check the calibration.** SNR > 4 dB, Sum 50-80, and a dither |Err| of at least 100. A Sum of 0 or 100 means the detector is saturated; redo Log Cal.
 1. **Run a Focus curve** (in Ready, after Set Offset). It steps the focus actuator through ±10 µm around its position (adjustable), reads the error at each step and returns it to the start. It reports:
-   - the **slope** at the lock point in counts/µm, next to the calibration's own figure (if they differ a lot, the calibration may predate the last alignment);
+   - the **slope** at the lock point in counts/µm, next to the calibration's own figure (if they differ a lot, the calibration may predate the last alignment). After a focus curve the panel uses the measured slope for its µm figures, until the next Log Cal or Dither;
    - how far the lock point is from the curve's **peaks** (a lock point close to a peak is hard to hold);
    - the **capture range**;
    - the **noise floor**: error noise ÷ slope, i.e. how much focus motion the sensor noise alone implies.
-1. **Run a Hold test** (locked, sitting still). It records the actuator's own position for 60 s (adjustable) and splits it into **drift** (the trend, nm/min), **wander** (how much the 1 s averages move) and **jitter** (the spread within each second). It also reports the error rms and whether the lock offset changed. The lock settings are recorded with each run, and the last runs sit side by side in a table.
+1. **Run a Hold test unlocked** (Ready, sitting still). CRISP isn't driving the actuator, so the position shows the actuator's *own* noise (the piezo and its drive), and the error rms is the sensor noise. If the actuator already wanders by itself, the lock can't hold it stiller than that.
+1. **Run a Hold test locked.** It records the actuator's own position for 60 s (adjustable) and splits it into **drift** (the trend, nm/min), **wander** (how much the 1 s averages move) and **jitter** (the spread within each second). It also reports the error rms and whether the lock offset changed. Compared with the unlocked run, it shows what the lock adds or removes. The lock settings and the mode are recorded with each run, and the last runs sit side by side in a table.
 1. **Change one setting** in the Parameters box and run the Hold test again. ASI's levers for a still sample:
    - **Averages (2^N)**: "N of 5 to 8 with reduced loop gain (LR T=1 to 5) can … hold the focus very still". Too much averaging adds delay and can oscillate.
    - **Update rate (ms)**: "Increase Update_Rate to improve stability when using piezo Z-axis drive systems" (piezo default 5 ms); raise Loop Gain as you do.
    - **Loop Gain**: reduce it if the lock jitters or oscillates.
 1. To see whether polling itself disturbs the lock, run the Hold test once at a low rate and once at a high rate.
 
-CRISPy never changes these settings for you; it only measures. Both tools pause the normal poll, stop when the panel is hidden or an acquisition starts, and can save their data as CSV.
+CRISPy never changes these settings for you; it only measures. The parameter sliders also ignore the mouse wheel unless you click them first, so scrolling the panel can't change a setting by accident. Both tools pause the normal poll, stop when the panel is hidden or an acquisition starts, and can save their data as CSV.
 
 ## 🕹️ Joystick lockout
 

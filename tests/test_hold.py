@@ -181,8 +181,40 @@ def test_worker_stops_when_the_lock_is_lost() -> None:
     core = FakeCore(states=["In Focus", "Ready", "Ready"])
     r = _run(core, duration_s=10.0)
     assert not r.completed
-    assert r.lock_lost_at_s is not None
+    assert r.interrupted_at_s is not None
+    assert r.locked
     assert "lock lost" in r.note
+
+
+def test_unlocked_run_records_while_ready_and_is_marked_unlocked() -> None:
+    core = FakeCore(states=["Ready"])
+    r = _run(core, duration_s=1.2, locked=False)
+    assert r.completed
+    assert not r.locked
+    assert r.note == ""
+    assert r.stats.rms_nm is not None
+    assert core.writes == []
+
+
+def test_unlocked_run_ends_when_crisp_starts_driving_the_actuator() -> None:
+    for driving in ("In Focus", "Calibrating", "Dither"):
+        core = FakeCore(states=["Ready", driving, driving])
+        r = _run(core, duration_s=10.0, locked=False)
+        assert not r.completed, driving
+        assert r.interrupted_at_s is not None
+        assert "driving" in r.note
+
+
+def test_unlocked_run_accepts_idle() -> None:
+    r = _run(FakeCore(states=["Idle"]), duration_s=1.2, locked=False)
+    assert r.completed
+
+
+def test_csv_records_the_mode(tmp_path: Path) -> None:
+    r = _run(FakeCore(states=["Ready"]), locked=False)
+    out = tmp_path / "hold.csv"
+    write_hold_csv(out, r)
+    assert "# mode: unlocked" in out.read_text(encoding="utf-8").splitlines()
 
 
 def test_one_unlocked_read_alone_does_not_stop_the_run() -> None:
