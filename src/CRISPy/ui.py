@@ -1,6 +1,6 @@
 """Qt UI for a single ASI CRISP autofocus axis.
 
-Maps the ASI CRISP feature set (see https://asiimaging.com/docs/crisp_manual) onto
+Maps the ASI CRISP feature set (see https://docs.asiimaging.com/crisp_manual) onto
 the ASITiger device-adapter properties:
 
 * operation       -> the settable ``CRISP State`` values (Idle / Ready / Lock /
@@ -11,84 +11,175 @@ the ASITiger device-adapter properties:
                      ``Calibration Range(um)`` (polled; the adapter does not emit
                      ``propertyChanged`` for these sensor values)
 * derived metrics -> actuator-type badge, error *sensitivity* (counts/µm) from the
-                     calibration, the focus error expressed in microns, and a
-                     rolling *fluctuation* (std-dev / peak-to-peak) of the error
-* fast tune       -> a separate high-rate sampler (SNR / Sum / Dither Error only) with
-                     a short rolling window and peak-hold, for turning the CRISP
-                     detector knob (see :mod:`CRISPy.tuning`)
+                     calibration, the focus error expressed in microns, and the
+                     in-loop error fluctuation while locked
+* diagnostics     -> the Dither assistant (:mod:`CRISPy.dither`), the focus curve
+                     (:mod:`CRISPy.focus_curve`) and the hold test (:mod:`CRISPy.hold`)
 * parameters      -> reused ``pymmcore_widgets.PropertyWidget`` controls
 """
 
 from __future__ import annotations
 
+import re
 import statistics
+import threading
 import time
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import Qt, QTimer, Signal
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QProgressBar,
+    QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .controller import CAL_GAIN_PROP, CAL_RANGE_PROP, counts_per_um
-from .tuning import DEFAULT_WINDOW_S, TuneSample, TuneSampler, TuneTracker
+from .dither import (
+    DEFAULT_WINDOW_S,
+    DITHER_STATES,
+    ERR_MANUAL_MIN,
+    ERR_PLENTY,
+    ERR_TARGET,
+    SUM_HIGH,
+    SUM_LOW,
+    DitherSample,
+    DitherTracker,
+    read_dither_sample,
+    sum_status,
+)
+from .focus_curve import (
+    DEFAULT_HALF_RANGE_UM,
+    DEFAULT_READS,
+    DEFAULT_SETTLE_S,
+    DEFAULT_STEP_UM,
+    CurveAnalysis,
+    CurvePoint,
+    CurveScan,
+    analyze_focus_curve,
+    run_focus_curve,
+    scan_offsets,
+    write_curve_csv,
+)
+from .hold import (
+    DEFAULT_DURATION_S,
+    DEFAULT_RATE_HZ,
+    HoldResult,
+    HoldSample,
+    HoldTest,
+    write_hold_csv,
+)
+from .plot import LinePlot, RefLine, Series
+from .sampling import Sampler, device_present, read_str
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from pymmcore_widgets.control._async_poller import AsyncPoller
+    from qtpy.QtGui import QCloseEvent, QHideEvent
 
     from .controller import CrispController
 
 _PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
 
 _POLL_INTERVAL_MS = 750
+# The slow poll reads the fast-changing values every tick and the rest (SNR is fixed
+# at Log Cal; calibration values change only on recalibration) this often, plus right
+# after a button press and whenever the state changes.
+_FULL_READ_EVERY_S = 10.0
 _SNR_GOOD_DB = 4.0  # ASI manual target
 
 # The live focus-error readout we express in physical units and track for
 # fluctuation. It is raw controller counts; ``sensitivity`` (counts/µm) converts it.
 _ERROR_PROP = "Dither Error"
-# Rolling window for the fluctuation metric (~15 s at the default 750 ms poll).
+_SUM_PROP = "Sum"
+_LOCK_OFFSET_PROP = "Lock Offset"
+# Rolling window for the in-loop fluctuation readout (~15 s at the default poll).
 _STABILITY_WINDOW = 20
 
-# Fast tune mode: repaint the labels/meter at ~20 Hz however fast samples arrive.
-_TUNE_PAINT_S = 0.05
-# Tune shows "no data" if no sample has arrived for this long (link down, sampler
-# ended), instead of leaving the last values on screen looking live.
-_TUNE_STALE_S = 1.0
-_TUNE_WATCHDOG_MS = 500
-# The normal readouts hold their last values while the slow poller is paused for Tune.
-_READOUTS_TITLE = "Readouts"
-_READOUTS_PAUSED_TITLE = "Readouts  (paused while tuning)"
-# Tuning meter colour bands, as (minimum fraction of the peak, colour).
-_METER_BANDS = ((0.95, "#4caf50"), (0.80, "#ff9800"), (0.0, "#f44336"))
-
-# Read-only telemetry props, in display order: (property, label). "Calibration
-# Gain"/"Range" are the per-axis error->motion scaling (differs piezo vs stage);
-# surfacing them answers "is the piezo error properly scaled?".
-_READOUTS: list[tuple[str, str]] = [
-    ("Signal Noise Ratio", "SNR"),
-    ("Dither Error", "Dither Err"),
-    ("Sum", "Sum"),
-    ("LogAmpAGC", "AGC"),
-    ("Lock Offset", "Lock Offset"),
-    ("Calibration Gain", "Cal Gain"),
-    ("Calibration Range(um)", "Cal Range (µm)"),
+# Read-only telemetry props, in display order: (property, label, tooltip).
+_READOUTS: list[tuple[str, str, str]] = [
+    (
+        "Signal Noise Ratio",
+        "SNR",
+        (
+            "Measured during Log Cal (signal with the LED on vs off) and stored;\n"
+            "it does not change afterwards. ASI: aim for > 4 dB (at least 2 dB).\n"
+            "If it is low, raise LED Intensity and redo Log Cal."
+        ),
+    ),
+    (
+        "Dither Error",
+        "Dither Err",
+        (
+            "In the Dither state: the change in focus error across the dither move.\n"
+            "Turn the detector lateral adjustment screw for the largest absolute\n"
+            "value (ASI: at least ±100; > 200 is plenty). See the Dither tab.\n"
+            "In other states: the focus error, measured inside the feedback loop."
+        ),
+    ),
+    (
+        "Sum",
+        "Sum",
+        (
+            "Light on the detector. ASI target 50-80. 0 or 100 means a detector\n"
+            "half is saturated: redo Log Cal."
+        ),
+    ),
+    (
+        "LogAmpAGC",
+        "AGC",
+        (
+            "Log-amp gain set by Log Cal; higher with more LED or a more reflective\n"
+            "sample. ASI: a minimum of ~20 is acceptable for average samples."
+        ),
+    ),
+    (
+        "Lock Offset",
+        "Lock Offset",
+        (
+            "The error value the lock holds (set at calibration, by Set Offset,\n"
+            "and by the focus wheel while locked). ASI: CRISP performs best when\n"
+            "the detector halves are roughly balanced, i.e. the offset is not too\n"
+            "large. A large value suggests redoing the Dither alignment."
+        ),
+    ),
+    (
+        "Calibration Gain",
+        "Cal Gain",
+        (
+            "Set by calibration (LR X). ASI: higher numbers mean less overall loop\n"
+            "gain."
+        ),
+    ),
+    (
+        "Calibration Range(um)",
+        "Cal Range (µm)",
+        "The calibration / dither move distance: 1.5 µm / NA².",
+    ),
 ]
+_READOUT_PROPS = [prop for prop, _, _ in _READOUTS]
+# Read on every slow-poll tick; the rest of _READOUTS only on a full read.
+_FAST_PROPS = [_ERROR_PROP, _SUM_PROP]
 
 # Actuator badge styling: (background, foreground).
 _ACTUATOR_BADGE: dict[str, tuple[str, str]] = {
@@ -97,22 +188,104 @@ _ACTUATOR_BADGE: dict[str, tuple[str, str]] = {
     "unknown": ("#616161", "#ffffff"),
 }
 
-# Adjustable parameters exposed via pymmcore-widgets: (property, friendly label).
-_PARAMS: list[tuple[str, str]] = [
-    ("LED Intensity", "LED Intensity (%)"),
-    ("GainMultiplier", "Loop Gain"),
-    ("Objective NA", "Objective NA"),
-    ("Number of Averages", "Averages"),
-    ("Max Lock Range(mm)", "Lock Range (mm)"),
-    ("In Focus Range(um)", "In-Focus Range (µm)"),
-    ("Number of Skips", "Update Skips"),
-    ("Wait ms after Lock", "Wait after Lock (ms)"),
+# Adjustable parameters exposed via pymmcore-widgets: (property, label, tooltip).
+_PARAMS: list[tuple[str, str, str]] = [
+    (
+        "LED Intensity",
+        "LED Intensity (%)",
+        (
+            "UL X. More light improves signal-to-noise (ASI default 50%).\n"
+            "Redo Log Cal after changing it."
+        ),
+    ),
+    (
+        "GainMultiplier",
+        "Loop Gain",
+        (
+            "LR T. Higher responds faster but can oscillate; reduce it if the lock\n"
+            "jitters. Raise it when you raise Update rate. ASI: with Averages 5-8,\n"
+            "Loop Gain 1-5 can hold the focus very still."
+        ),
+    ),
+    (
+        "Objective NA",
+        "Objective NA",
+        "LR Y. Sets the calibration move (1.5 µm / NA²) and the In-Focus Range.",
+    ),
+    (
+        "Number of Averages",
+        "Averages (2^N)",
+        (
+            "RT F = N: rolling average of 2^N error samples. ASI: N of 5-8 with\n"
+            "Loop Gain 1-5 can significantly smooth marginal focus and hold it very\n"
+            "still on a stationary sample. Too much averaging adds delay, which can\n"
+            "cause oscillation; then reduce N or Loop Gain."
+        ),
+    ),
+    (
+        "Max Lock Range(mm)",
+        "Lock Range (mm)",
+        (
+            "LR Z. Maximum travel from the lock point before CRISP unlocks\n"
+            "(runaway protection)."
+        ),
+    ),
+    (
+        "In Focus Range(um)",
+        "In-Focus Range (µm)",
+        (
+            "AL Z. Only decides when the state reads In Focus rather than Lock; it\n"
+            "does not change the servo."
+        ),
+    ),
+    (
+        "Number of Skips",
+        "Update rate (ms)",
+        (
+            'UL Y ("Number of Skips" on older firmware; milliseconds on Tiger 3.38+).\n'
+            "ASI: increase it to improve stability with a piezo (piezo default 5 ms)\n"
+            "and raise Loop Gain as you do."
+        ),
+    ),
+    (
+        "Wait ms after Lock",
+        "Wait after Lock (ms)",
+        (
+            "Adapter setting only: how long Micro-Manager's autofocus call waits\n"
+            "after locking."
+        ),
+    ),
 ]
 
 _LOCKED_STATES = {"Lock", "In Focus"}
-_BUSY_STATES = {"loG_cal": "Log Cal…", "Dither": "Dither…", "gain_Cal": "Gain Cal…"}
+_BUSY_STATES = {
+    "loG_cal": "Log Cal…",
+    "Dither": "Dither…",
+    "gain_Cal": "Gain Cal…",
+    "Calibrating": "Calibrating…",
+}
 _BAD_STATES = {"Error", "Inhibit", "Dim"}
 _GOOD_STATES = {"Lock", "In Focus", "Ready"}
+
+# Diagnostic tools; one runs at a time, and the slow poll is paused while it does.
+_DITHER, _CURVE, _HOLD = "dither", "curve", "hold"
+_TOOL_TITLES = {_DITHER: "Dither", _CURVE: "Focus curve", _HOLD: "Hold test"}
+# The Dither assistant re-reads the state this often, and stops after this many reads
+# in a row outside the dither states.
+_DITHER_STATE_EVERY_S = 0.5
+_DITHER_OUTSIDE_TO_STOP = 2
+_DITHER_PAINT_S = 0.1
+_HOLD_PAINT_S = 0.2
+_HOLD_RESULTS_KEPT = 6
+
+_GREEN, _DARK_GREEN, _ORANGE, _RED, _GREY = (
+    "#4caf50",
+    "#2e7d32",
+    "#ff9800",
+    "#f44336",
+    "#9e9e9e",
+)
+_BLUE = "#1e88e5"
 
 
 def _close(a: float | None, b: float | None, *, rtol: float = 1e-3) -> bool:
@@ -130,26 +303,43 @@ def _to_float(text: str | None) -> float | None:
         return None
 
 
+def _fmt(value: float | None, spec: str, missing: str = "--") -> str:
+    return missing if value is None else format(value, spec)
+
+
+def _err_color(level: float | None) -> str:
+    if level is None:
+        return _GREY
+    if level >= ERR_PLENTY:
+        return _DARK_GREEN
+    if level >= ERR_TARGET:
+        return _GREEN
+    if level >= ERR_MANUAL_MIN:
+        return _ORANGE
+    return _RED
+
+
 @dataclass(frozen=True)
 class CrispSnapshot:
     """A plain snapshot of CRISP telemetry, read off the GUI thread.
 
     Produced on a worker thread by :meth:`CrispControlPanel._read_device_values` and
     consumed on the GUI thread by :meth:`CrispControlPanel._apply_values`, so it holds
-    only raw values (no Qt widgets).
+    only raw values (no Qt widgets). ``full`` is ``True`` when every readout was read;
+    otherwise only the fast-changing ones are present.
     """
 
     state: str
-    sensitivity: float | None
     readouts: dict[str, str]
+    full: bool = False
 
 
 class CrispControlPanel(QWidget):
     """Control + telemetry panel for a single CRISP axis."""
 
-    # Carries each fast-tune sample from the sampler's worker thread to the GUI thread
-    # (emitting from a non-GUI thread makes Qt queue the delivery).
-    _tune_sample = Signal(object)
+    # Carries tool events from worker threads to the GUI thread as (kind, payload).
+    # Emitting from a non-GUI thread makes Qt queue the delivery.
+    _tool_event = Signal(str, object)
 
     def __init__(
         self,
@@ -161,40 +351,59 @@ class CrispControlPanel(QWidget):
         self.controller = controller
         self.mmcore = mmcore or CMMCorePlus.instance()
         self._readouts: dict[str, QLabel] = {}
+        self._last_readouts: dict[str, str] = {}
         # Cached error->µm scaling and a rolling history for the fluctuation metric.
         self._sensitivity: float | None = None
         self._error_history: deque[float] = deque(maxlen=_STABILITY_WINDOW)
+        self._last_state = ""
         # Edge-detector for the auto joystick lockout: starts False so a state
         # already locked when this panel first opens is treated as a lock edge
         # (joystick gets disabled), matching the "always safe on lock" default.
         self._was_locked = False
 
-        # Fast tune mode (see CRISPy.tuning). While tuning, the slow poller is paused
-        # so that only one reader uses the Tiger serial port.
-        self._tracker = TuneTracker(DEFAULT_WINDOW_S)
-        self._tune_sampler: TuneSampler | None = None
-        self._tuning = False
-        self._last_tune_paint = 0.0
-        self._last_tune_sample = 0.0
-        self._tune_meter_color = ""
-        self._tune_watchdog = QTimer(self)
-        self._tune_watchdog.setInterval(_TUNE_WATCHDOG_MS)
-        self._tune_watchdog.timeout.connect(self._check_tune_stale)
+        # Slow-poll bookkeeping. _poll_* is only touched by the poll's worker (reads
+        # run one at a time); _full_read_due is set by the GUI to ask for a full read.
+        self._poll_last_state: str | None = None
+        self._poll_last_full = float("-inf")
+        self._full_read_due = True
+        self._mda_running = False
 
-        # The ASITiger adapter exposes "RefreshPropertyValues" to force a hardware
-        # re-read; check once so we don't spam errors on devices that lack it.
+        # Diagnostic tools.
+        self._active_tool: str | None = None
+        self._dither_tracker = DitherTracker(DEFAULT_WINDOW_S)
+        self._dither_sampler: Sampler[DitherSample] | None = None
+        self._dither_next_state = 0.0  # worker-only
+        self._dither_outside = 0
+        self._last_dither_paint = 0.0
+        self._curve_stop = threading.Event()
+        self._curve_points: list[CurvePoint] = []
+        self._curve_scan: CurveScan | None = None
+        self._curve_analysis: CurveAnalysis | None = None
+        self._hold: HoldTest | None = None
+        self._hold_samples: list[HoldSample] = []
+        self._hold_results: list[HoldResult] = []
+        self._last_hold_paint = 0.0
+
+        # The ASITiger adapter's "RefreshPropertyValues" is a software-only flag that
+        # makes later reads of the cached properties (Lock Offset, Calibration
+        # Gain/Range, the parameters) query the controller; it stays set once set.
         self._can_refresh = False
         with suppress(Exception):
             self._can_refresh = self.mmcore.hasProperty(
                 self.controller.label, "RefreshPropertyValues"
             )
+        if self._can_refresh:
+            with suppress(Exception):
+                self.mmcore.setProperty(
+                    self.controller.label, "RefreshPropertyValues", "Yes"
+                )
 
         self._build()
-        self._tune_sample.connect(self._on_tune_sample)
+        self._tool_event.connect(self._on_tool_event)
 
-        # Poll telemetry off the GUI thread so the ~10 blocking serial reads per
-        # tick never stall the event loop / live view. See AsyncPoller. Imported
-        # here (not at module scope) to keep ``import CRISPy.ui`` lightweight.
+        # Poll telemetry off the GUI thread so the blocking serial reads never stall
+        # the event loop / live view. See AsyncPoller. Imported here (not at module
+        # scope) to keep ``import CRISPy.ui`` lightweight.
         from pymmcore_widgets.control._async_poller import AsyncPoller
 
         self._poller: AsyncPoller[CrispSnapshot] = AsyncPoller(
@@ -236,8 +445,11 @@ class CrispControlPanel(QWidget):
         self.poll_chk = QCheckBox("Poll")
         self.poll_chk.setChecked(True)
         self.poll_chk.setToolTip(
-            "Periodically read SNR / Dither / State from the controller.\n"
-            "Polling pauses automatically while an acquisition is running."
+            "Periodically read the state, Dither Error and Sum (the other readouts\n"
+            "every 10 s, after a button press and when the state changes).\n"
+            "Polling pauses automatically while an acquisition or a diagnostic\n"
+            "tool is running. ASI's own plugin suggests turning polling off once\n"
+            "calibration is done."
         )
         self.poll_chk.toggled.connect(self._on_poll_toggled)
         self.poll_interval = QSpinBox()
@@ -253,13 +465,15 @@ class CrispControlPanel(QWidget):
         layout.addLayout(poll_row)
 
         # --- readouts -----------------------------------------------------
-        ro_box = self.readouts_box = QGroupBox(_READOUTS_TITLE)
+        ro_box = self.readouts_box = QGroupBox("Readouts")
         grid = QGridLayout(ro_box)
-        for i, (prop, label) in enumerate(_READOUTS):
+        for i, (prop, label, tip) in enumerate(_READOUTS):
             row, col = divmod(i, 2)
             name = QLabel(f"{label}:")
             val = QLabel("--")
             val.setStyleSheet("font-weight: bold;")
+            name.setToolTip(tip)
+            val.setToolTip(tip)
             grid.addWidget(name, row, col * 2)
             grid.addWidget(val, row, col * 2 + 1)
             self._readouts[prop] = val
@@ -268,20 +482,20 @@ class CrispControlPanel(QWidget):
         next_row = (len(_READOUTS) + 1) // 2
         self.sensitivity_lbl = QLabel("Sensitivity: --")
         self.sensitivity_lbl.setToolTip(
-            "Error counts per micron of defocus (|Calibration Gain| / range).\n"
-            "This is the actuator-specific scaling; piezo and stage differ, so raw\n"
-            "error numbers are only comparable once converted to microns."
+            "|Calibration Gain| / Calibration Range, in error counts per µm. This\n"
+            "assumes Calibration Gain is the error change over the calibration\n"
+            "move; the Focus curve tab measures the real slope."
         )
         grid.addWidget(self.sensitivity_lbl, next_row, 0, 1, 4)
-        self.stability_lbl = QLabel("Fluctuation: collecting…")
+        self.stability_lbl = QLabel("In-loop error: --")
         self.stability_lbl.setToolTip(
-            f"Rolling std-dev / peak-to-peak of {_ERROR_PROP} over the last "
-            f"{_STABILITY_WINDOW} polls."
+            f"Std-dev / peak-to-peak of {_ERROR_PROP} over the last "
+            f"{_STABILITY_WINDOW} polls while locked.\n"
+            "This is the error inside the feedback loop: it can look quiet while\n"
+            "the actuator moves. Use the Hold test to measure the focus motion."
         )
         grid.addWidget(self.stability_lbl, next_row + 1, 0, 1, 4)
         layout.addWidget(ro_box)
-
-        layout.addWidget(self._build_tune_box())
 
         # --- operation (2x2 grid to stay compact) -------------------------
         op_box = QGroupBox("Operation")
@@ -293,7 +507,7 @@ class CrispControlPanel(QWidget):
         self.btn_offset = QPushButton("Set Offset")
         self.btn_offset.clicked.connect(self._on_reset_offset)
         self.btn_save = QPushButton("Save to Controller")
-        self.btn_save.clicked.connect(self._wrap(self.controller.set_save))
+        self.btn_save.clicked.connect(lambda: self._do(self.controller.set_save))
         op.addWidget(self.btn_idle_ready, 0, 0)
         op.addWidget(self.btn_lock, 0, 1)
         op.addWidget(self.btn_offset, 1, 0)
@@ -315,14 +529,24 @@ class CrispControlPanel(QWidget):
         cal_box = QGroupBox("Calibration  (1. Log Cal → 2. Dither → 3. Set Gain)")
         cal = QHBoxLayout(cal_box)
         self.btn_log = QPushButton("1. Log Cal")
-        self.btn_log.clicked.connect(self._wrap(self.controller.set_log_cal))
+        self.btn_log.clicked.connect(lambda: self._do(self.controller.set_log_cal))
         self.btn_dither = QPushButton("2. Dither")
-        self.btn_dither.clicked.connect(self._wrap(self.controller.set_dither))
+        self.btn_dither.clicked.connect(self._on_dither_clicked)
         self.btn_gain = QPushButton("3. Set Gain")
-        self.btn_gain.clicked.connect(self._wrap(self.controller.set_gain_cal))
+        self.btn_gain.clicked.connect(lambda: self._do(self.controller.set_gain_cal))
         for b in (self.btn_log, self.btn_dither, self.btn_gain):
             cal.addWidget(b)
         layout.addWidget(cal_box)
+
+        # --- diagnostics --------------------------------------------------
+        self.tools_tabs = QTabWidget()
+        self._dither_tab = self._build_dither_tab()
+        self._curve_tab = self._build_curve_tab()
+        self._hold_tab = self._build_hold_tab()
+        self.tools_tabs.addTab(self._dither_tab, "Dither")
+        self.tools_tabs.addTab(self._curve_tab, "Focus curve")
+        self.tools_tabs.addTab(self._hold_tab, "Hold test")
+        layout.addWidget(self.tools_tabs)
 
         # --- parameters (reused pymmcore-widgets property controls) -------
         param_box = QGroupBox("Parameters")
@@ -331,80 +555,213 @@ class CrispControlPanel(QWidget):
         layout.addWidget(param_box)
 
         layout.addStretch()
+        self._sync_tool_controls()
 
-    def _build_tune_box(self) -> QGroupBox:
-        """Fast sampling + peak-hold, for turning the CRISP detector knob."""
-        box = QGroupBox("Tune  (fast, for the detector knob)")
-        grid = QGridLayout(box)
+    def _build_dither_tab(self) -> QWidget:
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        self.dither_status = QLabel()
+        self.dither_status.setWordWrap(True)
+        v.addWidget(self.dither_status)
 
-        self.tune_btn = QPushButton("Start Tune")
-        self.tune_btn.setCheckable(True)
-        self.tune_btn.setToolTip(
-            "Sample SNR / Sum / Dither Error as fast as the controller allows and\n"
-            "hold the best value seen. Sweep the knob, note the peak, then back up\n"
-            "until the live value matches it. Needs the LED on (Ready or Lock).\n\n"
-            "Normal polling is paused while tuning. Tune stops when this panel is\n"
-            "hidden or an acquisition starts.\n\n"
-            "The controller's own Number of Averages / Update Skips limit how often\n"
-            "these values can change; lower them if the rate is still too slow."
+        row = QHBoxLayout()
+        self.dither_level_lbl = QLabel("|Err| --")
+        self.dither_level_lbl.setStyleSheet("font-weight: bold; font-size: 22px;")
+        self.dither_level_lbl.setToolTip(
+            "Median of |Dither Err| over the smoothing window, so the brief jumps\n"
+            "from moving the detector are ignored."
         )
-        self.tune_btn.toggled.connect(self._on_tune_toggled)
-        self.tune_reset_btn = QPushButton("Reset peak")
-        self.tune_reset_btn.setToolTip(
-            "Forget the best values and start a fresh sweep."
+        self.dither_peak_lbl = QLabel("peak --")
+        self.dither_peak_lbl.setStyleSheet("font-weight: bold;")
+        row.addWidget(self.dither_level_lbl)
+        row.addStretch()
+        row.addWidget(self.dither_peak_lbl)
+        v.addLayout(row)
+
+        self.dither_sum_lbl = QLabel("Sum --")
+        self.dither_detail_lbl = QLabel()
+        v.addWidget(self.dither_sum_lbl)
+        v.addWidget(self.dither_detail_lbl)
+
+        self.dither_plot = LinePlot(x_label="seconds ago", y_label="|Err|")
+        v.addWidget(self.dither_plot)
+
+        ctl = QHBoxLayout()
+        self.dither_watch_btn = QPushButton("Watch")
+        self.dither_watch_btn.setCheckable(True)
+        self.dither_watch_btn.setToolTip(
+            "Start reading the dither Err fast. It starts by itself when you press\n"
+            "2. Dither and stops when the state leaves Dither."
         )
-        self.tune_reset_btn.clicked.connect(self._on_tune_reset)
-        grid.addWidget(self.tune_btn, 0, 0)
-        grid.addWidget(self.tune_reset_btn, 0, 1)
+        self.dither_watch_btn.toggled.connect(self._on_dither_watch_toggled)
+        self.dither_reset_btn = QPushButton("Reset peak")
+        self.dither_reset_btn.clicked.connect(self._on_dither_reset)
+        self.dither_window = QDoubleSpinBox()
+        self.dither_window.setRange(0.3, 5.0)
+        self.dither_window.setSingleStep(0.1)
+        self.dither_window.setDecimals(1)
+        self.dither_window.setValue(DEFAULT_WINDOW_S)
+        self.dither_window.setSuffix(" s")
+        self.dither_window.setToolTip(
+            "Smoothing window. Longer ignores longer-lasting jumps from moving the\n"
+            "detector, but lags the screw more."
+        )
+        self.dither_window.valueChanged.connect(
+            lambda s: self._dither_tracker.set_window(float(s))
+        )
+        ctl.addWidget(self.dither_watch_btn)
+        ctl.addWidget(self.dither_reset_btn)
+        ctl.addStretch()
+        ctl.addWidget(QLabel("Smoothing:"))
+        ctl.addWidget(self.dither_window)
+        v.addLayout(ctl)
+        self._paint_dither(force=True)
+        return tab
+
+    def _build_curve_tab(self) -> QWidget:
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        intro = QLabel(
+            "Steps the focus actuator around its current position with CRISP in "
+            "Ready (unlocked), reads the error at each step, then returns it to "
+            "the start. Shows the slope at the lock point, how far the lock point "
+            "is from the curve's peaks, the capture range and the noise floor."
+        )
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+
+        opts = QGridLayout()
+        self.curve_range = QDoubleSpinBox()
+        self.curve_range.setRange(0.5, 50.0)
+        self.curve_range.setDecimals(1)
+        self.curve_range.setValue(DEFAULT_HALF_RANGE_UM)
+        self.curve_range.setPrefix("± ")
+        self.curve_range.setSuffix(" µm")
+        self.curve_step = QDoubleSpinBox()
+        self.curve_step.setRange(0.02, 5.0)
+        self.curve_step.setDecimals(2)
+        self.curve_step.setSingleStep(0.05)
+        self.curve_step.setValue(DEFAULT_STEP_UM)
+        self.curve_step.setSuffix(" µm")
+        self.curve_settle = QSpinBox()
+        self.curve_settle.setRange(0, 2000)
+        self.curve_settle.setSingleStep(10)
+        self.curve_settle.setValue(round(DEFAULT_SETTLE_S * 1000))
+        self.curve_settle.setSuffix(" ms")
+        self.curve_settle.setToolTip("Wait after each move before reading.")
+        self.curve_reads = QSpinBox()
+        self.curve_reads.setRange(1, 20)
+        self.curve_reads.setValue(DEFAULT_READS)
+        self.curve_reads.setToolTip(
+            "Error reads per position. Their spread gives the noise estimate\n"
+            "(needs at least 2)."
+        )
+        for col, (text, w) in enumerate(
+            (
+                ("Range", self.curve_range),
+                ("Step", self.curve_step),
+                ("Settle", self.curve_settle),
+                ("Reads", self.curve_reads),
+            )
+        ):
+            opts.addWidget(QLabel(text), 0, col)
+            opts.addWidget(w, 1, col)
+        v.addLayout(opts)
+
+        btns = QHBoxLayout()
+        self.curve_run_btn = QPushButton("Run focus curve")
+        self.curve_run_btn.clicked.connect(self._on_curve_run)
+        self.curve_save_btn = QPushButton("Save CSV…")
+        self.curve_save_btn.clicked.connect(self._on_curve_save)
+        btns.addWidget(self.curve_run_btn)
+        btns.addWidget(self.curve_save_btn)
+        btns.addStretch()
+        v.addLayout(btns)
+
+        self.curve_status = QLabel("Needs the Ready state (LED on, unlocked).")
+        self.curve_status.setWordWrap(True)
+        v.addWidget(self.curve_status)
+        self.curve_plot = LinePlot(x_label="z from start (µm)", y_label="error")
+        v.addWidget(self.curve_plot)
+        self.curve_result_lbl = QLabel()
+        self.curve_result_lbl.setWordWrap(True)
+        self.curve_result_lbl.setTextFormat(Qt.TextFormat.RichText)
+        v.addWidget(self.curve_result_lbl)
+        return tab
+
+    def _build_hold_tab(self) -> QWidget:
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        intro = QLabel(
+            "Records the actuator's own position while locked and splits it into "
+            "drift (the trend), wander (how much the 1 s averages move) and jitter "
+            "(the spread within each second). It changes no settings: change one "
+            "Parameter at a time and run it again to compare."
+        )
+        intro.setWordWrap(True)
+        v.addWidget(intro)
 
         opts = QHBoxLayout()
-        self.tune_window = QDoubleSpinBox()
-        self.tune_window.setRange(0.1, 5.0)
-        self.tune_window.setSingleStep(0.1)
-        self.tune_window.setDecimals(1)
-        self.tune_window.setValue(DEFAULT_WINDOW_S)
-        self.tune_window.setSuffix(" s")
-        self.tune_window.setToolTip(
-            "Averaging window for SNR / Sum / fluctuation. Shorter follows a fast\n"
-            "knob turn more closely but is noisier; the lag is about half of it."
+        self.hold_duration = QSpinBox()
+        self.hold_duration.setRange(5, 3600)
+        self.hold_duration.setValue(round(DEFAULT_DURATION_S))
+        self.hold_duration.setSuffix(" s")
+        self.hold_rate = QDoubleSpinBox()
+        self.hold_rate.setRange(1.0, 50.0)
+        self.hold_rate.setDecimals(0)
+        self.hold_rate.setValue(DEFAULT_RATE_HZ)
+        self.hold_rate.setSuffix(" Hz")
+        self.hold_rate.setToolTip(
+            "Samples per second (each is 2 reads). Run once at a low and once at a\n"
+            "high rate to see whether the polling itself disturbs the lock."
         )
-        self.tune_window.valueChanged.connect(self._on_tune_window_changed)
-        self.tune_metric = QComboBox()
-        for text, key in (("SNR", "snr"), ("Sum", "sum"), ("Stability", "stability")):
-            self.tune_metric.addItem(text, key)
-        self.tune_metric.setToolTip("Which metric the meter follows.")
-        self.tune_metric.currentIndexChanged.connect(lambda _i: self._paint_tune(True))
-        opts.addWidget(QLabel("Window:"))
-        opts.addWidget(self.tune_window)
-        opts.addWidget(QLabel("Meter:"))
-        opts.addWidget(self.tune_metric)
+        self.hold_start_btn = QPushButton("Start hold test")
+        self.hold_start_btn.clicked.connect(self._on_hold_start)
+        self.hold_save_btn = QPushButton("Save CSV…")
+        self.hold_save_btn.clicked.connect(self._on_hold_save)
+        opts.addWidget(QLabel("Duration"))
+        opts.addWidget(self.hold_duration)
+        opts.addWidget(QLabel("Rate"))
+        opts.addWidget(self.hold_rate)
         opts.addStretch()
-        grid.addLayout(opts, 1, 0, 1, 2)
+        v.addLayout(opts)
+        btns = QHBoxLayout()
+        btns.addWidget(self.hold_start_btn)
+        btns.addWidget(self.hold_save_btn)
+        btns.addStretch()
+        v.addLayout(btns)
 
-        self.tune_meter = QProgressBar()
-        self.tune_meter.setRange(0, 100)
-        self.tune_meter.setToolTip(
-            "Live value as a fraction of the best seen (100% = at the peak)."
+        self.hold_status = QLabel("Needs the lock engaged (Lock / In Focus).")
+        self.hold_status.setWordWrap(True)
+        v.addWidget(self.hold_status)
+        self.hold_plot = LinePlot(x_label="seconds", y_label="position (nm)")
+        v.addWidget(self.hold_plot)
+
+        cols = [
+            "Started",
+            "Averages",
+            "Loop Gain",
+            "Update (ms)",
+            "LED %",
+            "Drift nm/min",
+            "Jitter nm",
+            "Wander nm",
+            "pk-pk nm",
+            "Err rms",
+            "Note",
+        ]
+        self.hold_table = QTableWidget(0, len(cols))
+        self.hold_table.setHorizontalHeaderLabels(cols)
+        self.hold_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.hold_table.verticalHeader().setVisible(False)
+        self.hold_table.setMinimumHeight(120)
+        self.hold_table.setToolTip(
+            "Newest first. All after removing the drift (the straight-line trend).\n"
+            "Jitter: rms spread within each second. Wander: rms of the 1 s averages.\n"
+            "pk-pk: largest minus smallest position."
         )
-        grid.addWidget(self.tune_meter, 2, 0, 1, 2)
-
-        self.tune_snr_lbl = QLabel()
-        self.tune_sum_lbl = QLabel()
-        self.tune_fluct_lbl = QLabel()
-        self.tune_rate_lbl = QLabel()
-        for row, lbl in enumerate(
-            (
-                self.tune_snr_lbl,
-                self.tune_sum_lbl,
-                self.tune_fluct_lbl,
-                self.tune_rate_lbl,
-            ),
-            start=3,
-        ):
-            lbl.setStyleSheet("font-weight: bold;")
-            grid.addWidget(lbl, row, 0, 1, 2)
-        self._paint_tune(force=True)
-        return box
+        v.addWidget(self.hold_table)
+        return tab
 
     def _make_actuator_badge(self) -> QLabel:
         actuator = self.controller.actuator_type
@@ -415,7 +772,7 @@ class CrispControlPanel(QWidget):
             f"background: {bg}; color: {fg}; border-radius: 6px;"
             " padding: 1px 6px; font-weight: bold; font-size: 11px;"
         )
-        tip = f"Paired focus actuator: {text}."
+        tip = f"Paired focus actuator: {self.controller.actuator_label or text}."
         if actuator == "piezo":
             rng = self._read_float_prop("Max Lock Range(mm)")
             if rng is not None and rng > 1.0:
@@ -450,7 +807,7 @@ class CrispControlPanel(QWidget):
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         label = self.controller.label
-        for prop, friendly in _PARAMS:
+        for prop, friendly, tip in _PARAMS:
             try:
                 if not self.mmcore.hasProperty(label, prop):
                     continue
@@ -458,47 +815,55 @@ class CrispControlPanel(QWidget):
             except Exception:
                 continue
             wdg.setMaximumWidth(_PARAM_MAX_WIDTH)
-            form.addRow(friendly, wdg)
-
-    def _wrap(self, fn):
-        """Return a slot that runs *fn* then refreshes telemetry."""
-
-        def _slot(*_args) -> None:
-            with suppress(Exception):
-                fn()
-            self._poller.poll_now(force=True)
-
-        return _slot
+            wdg.setToolTip(tip)
+            name = QLabel(friendly)
+            name.setToolTip(tip)
+            form.addRow(name, wdg)
 
     # -------------------------------------------------------------- handlers
+    def _do(self, fn: Callable[[], None], *, refresh: bool = True) -> None:
+        """Run a state-changing command, then (if *refresh*) refresh the readouts."""
+        self._stop_hold()  # changing the state ends a hold test
+        with suppress(Exception):
+            fn()
+        self._full_read_due = True
+        if refresh and self._active_tool is None:
+            self._poller.poll_now(force=True)
+
     def _on_idle_ready(self) -> None:
         if self.controller.get_state() == "Idle":
-            with suppress(Exception):
-                self.controller.set_ready()
+            self._do(self.controller.set_ready)
         else:
-            with suppress(Exception):
-                self.controller.set_idle()
-        self._poller.poll_now(force=True)
+            self._do(self.controller.set_idle)
 
     def _on_lock(self) -> None:
         if self.controller.get_state() in _LOCKED_STATES:
-            with suppress(Exception):
-                self.controller.set_unlock()
+            self._do(self.controller.set_unlock)
         else:
-            with suppress(Exception):
-                self.controller.set_lock()
-        self._poller.poll_now(force=True)
+            self._do(self.controller.set_lock)
+
+    def _on_dither_clicked(self) -> None:
+        # The assistant takes over the serial port straight away, so skip the
+        # slow poll's refresh.
+        self._do(self.controller.set_dither, refresh=False)
+        self._start_dither()
 
     def _on_joystick_toggled(self, checked: bool) -> None:
         """Manual joystick override; independent of the auto lock/unlock logic."""
         with suppress(Exception):
             self.controller.set_joystick_enabled(checked)
 
+    def _on_reset_offset(self) -> None:
+        self._do(self.controller.set_reset_offset)
+        # The error datum just moved; drop stale fluctuation samples.
+        self._error_history.clear()
+
     # --------------------------------------------------------- poll controls
     def _on_poll_toggled(self, checked: bool) -> None:
         if checked:
-            # While tuning, the slow poller stays paused; it resumes when Tune stops.
-            if not self._tuning:
+            # While a tool runs, the slow poller stays paused; it resumes after.
+            if self._active_tool is None and not self._mda_running:
+                self._full_read_due = True
                 self._poller.start()
                 self._poller.poll_now(force=True)
         else:
@@ -508,137 +873,601 @@ class CrispControlPanel(QWidget):
         self._poller.set_interval(int(value))
 
     def _on_mda_started(self, *_args) -> None:
-        self._stop_tune(resume_poll=False)
+        self._mda_running = True
+        self._stop_tools()
         with suppress(RuntimeError):
             self._poller.stop()
 
     def _on_mda_finished(self, *_args) -> None:
+        self._mda_running = False
         with suppress(RuntimeError):
-            if self.poll_chk.isChecked() and not self._tuning:
+            if self.poll_chk.isChecked() and self._active_tool is None:
+                self._full_read_due = True
                 self._poller.start()
 
-    # ------------------------------------------------------------------ tune
-    def _on_tune_toggled(self, checked: bool) -> None:
-        if checked:
-            self._start_tune()
-        else:
-            self._stop_tune()
+    def hideEvent(self, event: QHideEvent) -> None:
+        # Don't keep hammering the serial port for a panel nobody is looking at.
+        self._stop_tools()
+        super().hideEvent(event)
 
-    def _start_tune(self) -> None:
-        if self._tuning:
-            return
-        self._tuning = True
-        self.readouts_box.setTitle(_READOUTS_PAUSED_TITLE)
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._stop_tools()
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------- tool core
+    def _begin_tool(self, name: str) -> bool:
+        """Claim the serial port for tool *name*; ``False`` if another one has it."""
+        if self._active_tool is not None:
+            return False
+        self._active_tool = name
+        self.readouts_box.setTitle(f"Readouts  (paused: {_TOOL_TITLES[name]})")
         with suppress(RuntimeError):
             self._poller.stop()  # one reader on the serial port at a time
-        self._tracker.reset()
-        self._paint_tune(force=True)
-        self._last_tune_sample = time.monotonic()
-        self._tune_watchdog.start()
-        self._tune_sampler = TuneSampler(
-            self.mmcore,
-            self.controller.label,
-            self._tune_sample.emit,
-            refresh=self._can_refresh,
-        )
-        self._tune_sampler.start()
-        self.tune_btn.setText("Stop Tune")
+        self._sync_tool_controls()
+        return True
 
-    def _stop_tune(self, *, resume_poll: bool = True) -> None:
-        if not self._tuning:
+    def _end_tool(self, name: str) -> None:
+        if self._active_tool != name:
             return
-        self._tuning = False
-        self._tune_watchdog.stop()
-        self.readouts_box.setTitle(_READOUTS_TITLE)
-        if self._tune_sampler is not None:
-            self._tune_sampler.stop()
-            self._tune_sampler = None
-        # Sync the button when we were stopped from elsewhere (hide, MDA start).
-        self.tune_btn.blockSignals(True)
-        self.tune_btn.setChecked(False)
-        self.tune_btn.blockSignals(False)
-        self.tune_btn.setText("Start Tune")
-        if resume_poll and self.poll_chk.isChecked():
+        self._active_tool = None
+        self.readouts_box.setTitle("Readouts")
+        self._sync_tool_controls()
+        if self.poll_chk.isChecked() and not self._mda_running:
+            self._full_read_due = True
             with suppress(RuntimeError):
                 self._poller.start()
                 if self.isVisible():
                     self._poller.poll_now(force=True)
 
-    def _on_tune_sample(self, sample: TuneSample) -> None:
-        """Take one sample from the sampler thread (runs on the GUI thread)."""
-        if not self._tuning:  # a straggler queued before Tune was stopped
+    def _stop_tools(self) -> None:
+        self._stop_dither()
+        self._stop_hold()
+        if self._active_tool == _CURVE:
+            # The worker returns the actuator to its start, then reports back.
+            self._curve_stop.set()
+
+    def _sync_tool_controls(self) -> None:
+        tool = self._active_tool
+        curve = tool == _CURVE
+        # The focus curve moves the actuator; nothing else may change state meanwhile.
+        for b in (
+            self.btn_idle_ready,
+            self.btn_lock,
+            self.btn_offset,
+            self.btn_save,
+            self.btn_log,
+            self.btn_dither,
+            self.btn_gain,
+        ):
+            b.setEnabled(not curve)
+        self.dither_watch_btn.blockSignals(True)
+        self.dither_watch_btn.setChecked(tool == _DITHER)
+        self.dither_watch_btn.blockSignals(False)
+        self.dither_watch_btn.setEnabled(tool in (None, _DITHER))
+        self.curve_run_btn.setText("Cancel" if curve else "Run focus curve")
+        self.curve_run_btn.setEnabled(tool in (None, _CURVE))
+        self.hold_start_btn.setText("Stop" if tool == _HOLD else "Start hold test")
+        self.hold_start_btn.setEnabled(tool in (None, _HOLD))
+        self.curve_save_btn.setEnabled(self._curve_scan is not None and not curve)
+        self.hold_save_btn.setEnabled(bool(self._hold_results) and tool != _HOLD)
+
+    def _emit(self, kind: str, payload: object) -> None:
+        """Hand a worker-thread event to the GUI thread (a no-op once destroyed)."""
+        with suppress(RuntimeError):
+            self._tool_event.emit(kind, payload)
+
+    def _on_tool_event(self, kind: str, payload: object) -> None:
+        if kind == "dither_sample":
+            self._on_dither_sample(payload)  # type: ignore[arg-type]
+        elif kind == "curve_point":
+            self._on_curve_point(payload)  # type: ignore[arg-type]
+        elif kind == "curve_done":
+            self._on_curve_done(payload)  # type: ignore[arg-type]
+        elif kind == "curve_error":
+            self._on_curve_error(str(payload))
+        elif kind == "hold_sample":
+            self._on_hold_sample(payload)  # type: ignore[arg-type]
+        elif kind == "hold_done":
+            self._on_hold_done(payload)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------- dither assistant
+    def _on_dither_watch_toggled(self, checked: bool) -> None:
+        if checked:
+            self._start_dither()
+        else:
+            self._stop_dither()
+
+    def _start_dither(self) -> None:
+        if self._active_tool == _DITHER:
             return
-        self._last_tune_sample = time.monotonic()
-        self._tracker.add(sample)
-        self._paint_tune()
+        if not self._begin_tool(_DITHER):
+            return
+        self._dither_tracker.reset()
+        self._dither_outside = 0
+        self._dither_next_state = 0.0
+        self.tools_tabs.setCurrentWidget(self._dither_tab)
+        label = self.controller.label
+        self._dither_sampler = Sampler(
+            self._read_dither,
+            lambda s: self._emit("dither_sample", s),
+            present=lambda: device_present(self.mmcore, label),
+            name=f"CRISPy-dither-{label}",
+        )
+        self._dither_sampler.start()
+        self._paint_dither(force=True)
 
-    def _check_tune_stale(self) -> None:
-        if self._tuning and time.monotonic() - self._last_tune_sample > _TUNE_STALE_S:
-            self.tune_rate_lbl.setText("Rate: no data from the controller")
-
-    def _on_tune_reset(self) -> None:
-        self._tracker.reset()
-        self._paint_tune(force=True)
-
-    def _on_tune_window_changed(self, seconds: float) -> None:
-        self._tracker.set_window(float(seconds))
-
-    def _paint_tune(self, force: bool = False) -> None:
-        """Refresh the Tune labels and meter, at most ~20 Hz unless *force*."""
+    def _read_dither(self) -> DitherSample | None:
+        """One fast read for the Dither assistant (runs on its worker thread)."""
         now = time.monotonic()
-        if not force and now - self._last_tune_paint < _TUNE_PAINT_S:
+        with_state = now >= self._dither_next_state
+        if with_state:
+            self._dither_next_state = now + _DITHER_STATE_EVERY_S
+        return read_dither_sample(
+            self.mmcore, self.controller.label, with_state=with_state
+        )
+
+    def _stop_dither(self) -> None:
+        if self._active_tool != _DITHER:
             return
-        self._last_tune_paint = now
-        s = self._tracker.stats
+        if self._dither_sampler is not None:
+            self._dither_sampler.stop()
+            self._dither_sampler = None
+        self._end_tool(_DITHER)
+        self._paint_dither(force=True)
 
-        def val(v: float | None, spec: str) -> str:
-            return "--" if v is None else format(v, spec)
+    def _on_dither_sample(self, sample: DitherSample) -> None:
+        if self._active_tool != _DITHER:  # a straggler queued before it stopped
+            return
+        self._dither_tracker.add(sample)
+        if sample.state is not None:
+            self._update_state(sample.state)
+            if sample.state in DITHER_STATES:
+                self._dither_outside = 0
+            else:
+                self._dither_outside += 1
+                if self._dither_outside >= _DITHER_OUTSIDE_TO_STOP:
+                    self._stop_dither()
+                    return
+        self._paint_dither()
 
-        self.tune_snr_lbl.setText(
-            f"SNR: {val(s.snr, '.2f')} dB    peak {val(s.best_snr, '.2f')}"
-        )
-        self.tune_sum_lbl.setText(
-            f"Sum: {val(s.signal_sum, '.1f')}    peak {val(s.best_signal_sum, '.1f')}"
-        )
-        fluct = f"Fluctuation: ± {val(s.error_std, '.1f')} cts"
-        std_um = None if s.error_std is None else self._to_um(s.error_std)
-        if std_um is not None:
-            fluct += f" ({abs(std_um):.3f} µm)"
-        self.tune_fluct_lbl.setText(f"{fluct}    best {val(s.best_error_std, '.1f')}")
-        self.tune_rate_lbl.setText(f"Rate: {val(s.rate_hz, '.0f')} Hz")
+    def _on_dither_reset(self) -> None:
+        self._dither_tracker.reset_peak()
+        self._paint_dither(force=True)
 
-        frac = self._tracker.fraction(self.tune_metric.currentData())
-        self.tune_meter.setValue(0 if frac is None else round(frac * 100))
-        self.tune_meter.setFormat("--" if frac is None else "%p%")
-        color = "#9e9e9e"
-        if frac is not None:
-            color = next(c for floor, c in _METER_BANDS if frac >= floor)
-        if color != self._tune_meter_color:  # restyle only when the band changes
-            self._tune_meter_color = color
-            self.tune_meter.setStyleSheet(
-                f"QProgressBar::chunk {{ background: {color}; }}"
-                " QProgressBar { text-align: center; }"
+    def _paint_dither(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_dither_paint < _DITHER_PAINT_S:
+            return
+        self._last_dither_paint = now
+        active = self._active_tool == _DITHER
+        if active:
+            self.dither_status.setText(
+                "Dithering. Turn the detector lateral adjustment screw slowly and "
+                "pause after each turn. Aim for |Err| ≥ 100 (> 200 is plenty) with "
+                "Sum in 50-80, then press 3. Set Gain."
             )
+        else:
+            self.dither_status.setText(
+                "Not dithering. After 1. Log Cal, press 2. Dither (or Watch if it "
+                "is already dithering)."
+            )
+        s = self._dither_tracker.stats
+        color = _err_color(s.level)
+        sign = " (negative)" if s.sign < 0 else ""
+        settling = "  settling…" if s.level is not None and not s.steady else ""
+        self.dither_level_lbl.setText(f"|Err| {_fmt(s.level, '.0f')}{sign}{settling}")
+        self.dither_level_lbl.setStyleSheet(
+            f"font-weight: bold; font-size: 22px; color: {color};"
+        )
+        peak = f"peak {_fmt(s.peak, '.0f')}"
+        if s.peak_t is not None and active:
+            peak += f"  ({max(0.0, now - s.peak_t):.0f} s ago)"
+        self.dither_peak_lbl.setText(peak)
 
-    def hideEvent(self, event) -> None:
-        # Don't keep hammering the serial port for a panel nobody is looking at.
-        self._stop_tune()
-        super().hideEvent(event)
+        status = s.sum_status
+        sum_text = f"Sum {_fmt(s.signal_sum, '.0f')}"
+        sum_color = _GREY
+        if status == "ok":
+            sum_text += f"  (in the {SUM_LOW:.0f}-{SUM_HIGH:.0f} target)"
+            sum_color = _GREEN
+        elif status == "saturated":
+            sum_text += "  — a detector half is saturated: redo Log Cal"
+            sum_color = _RED
+        elif status in ("low", "high"):
+            sum_text += (
+                f"  — outside {SUM_LOW:.0f}-{SUM_HIGH:.0f}: redo Log Cal once aligned"
+            )
+            sum_color = _ORANGE
+        self.dither_sum_lbl.setText(sum_text)
+        self.dither_sum_lbl.setStyleSheet(f"color: {sum_color};")
+        spread = None if s.spread is None else s.spread * 100
+        self.dither_detail_lbl.setText(
+            f"raw {_fmt(s.raw_err, '+.0f')}  ·  spread ±{_fmt(spread, '.0f')}%  ·  "
+            f"{_fmt(s.rate_hz, '.0f')} reads/s"
+        )
 
-    def closeEvent(self, event) -> None:
-        self._stop_tune(resume_poll=False)
-        super().closeEvent(event)
+        hlines = [
+            RefLine(ERR_TARGET, _GREEN, f"{ERR_TARGET:.0f}"),
+            RefLine(ERR_PLENTY, _DARK_GREEN, f"{ERR_PLENTY:.0f}"),
+        ]
+        trace = self._dither_tracker.trace()
+        if not trace:
+            self.dither_plot.set_data(
+                hlines=hlines, x_range=(-30.0, 0.0), y_range=(0.0, 250.0)
+            )
+            return
+        t_end = trace[-1][0]
+        xs = [t - t_end for t, _, _ in trace]
+        if s.peak is not None:
+            hlines.append(
+                RefLine(
+                    s.peak, _BLUE, f"peak {s.peak:.0f}", dashed=False, label_left=True
+                )
+            )
+        filtered = [(x, lv) for x, (_, _, lv) in zip(xs, trace) if lv is not None]
+        span = max(10.0, min(30.0, -xs[0]))  # grow to 30 s, then scroll
+        self.dither_plot.set_data(
+            [
+                Series(xs, [raw for _, raw, _ in trace], "#90a4ae", dots=True),
+                Series(
+                    [x for x, _ in filtered], [lv for _, lv in filtered], color, 2.0
+                ),
+            ],
+            hlines=hlines,
+            x_range=(-span, 0.0),
+        )
+
+    # ------------------------------------------------------------ focus curve
+    def _confirm_move(self, text: str) -> bool:
+        """Ask before moving the actuator (replaced in tests)."""
+        answer = QMessageBox.question(
+            self,
+            "Run focus curve",
+            text,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Ok
+
+    def _on_curve_run(self) -> None:
+        if self._active_tool == _CURVE:
+            self._curve_stop.set()
+            self.curve_status.setText("Cancelling — returning to the start position…")
+            return
+        actuator = self.controller.actuator_label
+        if actuator is None:
+            self.curve_status.setText(
+                "No paired focus actuator was found for this CRISP axis."
+            )
+            return
+        state = self.controller.get_state()
+        if state != "Ready":
+            self.curve_status.setText(
+                f"The focus curve needs the Ready state (LED on, unlocked); the "
+                f"state is {state or 'unknown'}."
+            )
+            return
+        half, step = self.curve_range.value(), self.curve_step.value()
+        n = len(scan_offsets(half, step))
+        if not self._confirm_move(
+            f"Move {actuator} from {-half:g} to +{half:g} µm around its current "
+            f"position in {step:g} µm steps ({n} positions), then return it to the "
+            "start?\n\nDon't touch the focus wheel while it runs."
+        ):
+            return
+        if not self._begin_tool(_CURVE):
+            return
+        self._curve_stop.clear()
+        self._curve_points = []
+        self._curve_analysis = None
+        self.tools_tabs.setCurrentWidget(self._curve_tab)
+        self.curve_status.setStyleSheet("")
+        self.curve_status.setText(f"Scanning {n} positions…")
+        self.curve_result_lbl.setText("")
+        self._paint_curve()
+        threading.Thread(
+            target=self._curve_worker,
+            args=(
+                actuator,
+                half,
+                step,
+                self.curve_settle.value() / 1000.0,
+                self.curve_reads.value(),
+            ),
+            name=f"CRISPy-curve-{self.controller.label}",
+            daemon=True,
+        ).start()
+
+    def _curve_worker(
+        self, actuator: str, half: float, step: float, settle: float, reads: int
+    ) -> None:
+        try:
+            scan = run_focus_curve(
+                self.mmcore,
+                self.controller.label,
+                actuator,
+                half_range_um=half,
+                step_um=step,
+                settle_s=settle,
+                reads_per_point=reads,
+                should_stop=self._curve_stop.is_set,
+                on_point=lambda p: self._emit("curve_point", p),
+            )
+        except Exception as e:  # noqa: BLE001 - reported in the panel
+            self._emit("curve_error", str(e))
+            return
+        self._emit("curve_done", scan)
+
+    def _on_curve_point(self, point: CurvePoint) -> None:
+        if self._active_tool != _CURVE:
+            return
+        self._curve_points.append(point)
+        self.curve_status.setText(
+            f"Scanning… {len(self._curve_points)} positions, at {point.z_um:+.2f} µm"
+        )
+        self._paint_curve()
+
+    def _on_curve_done(self, scan: CurveScan) -> None:
+        self._curve_scan = scan
+        self._curve_points = list(scan.points)
+        self._curve_analysis = analyze_focus_curve(scan.points)
+        done = "Done" if scan.completed else "Cancelled"
+        self.curve_status.setText(
+            f"{done}: {len(scan.points)} positions. {scan.actuator} is back at "
+            f"{scan.z0_um:.3f} µm."
+        )
+        self._end_tool(_CURVE)
+        self._paint_curve()
+        self.curve_result_lbl.setText(self._curve_summary(self._curve_analysis))
+
+    def _on_curve_error(self, message: str) -> None:
+        self.curve_status.setText(message)
+        self.curve_status.setStyleSheet(f"color: {_RED};")
+        self._end_tool(_CURVE)
+
+    def _paint_curve(self) -> None:
+        pts = sorted(self._curve_points, key=lambda p: p.z_um)
+        if not pts:
+            self.curve_plot.clear()
+            return
+        a = self._curve_analysis
+        vlines = [RefLine(0.0, _GREY, "start")]
+        markers: list[tuple[float, float, str]] = []
+        if a is not None and a.crossing_um is not None:
+            vlines.append(RefLine(a.crossing_um, _BLUE, "lock point", dashed=False))
+            for pk in (a.peak_low, a.peak_high):
+                if pk is not None:
+                    markers.append((pk[0], pk[1], _ORANGE))
+        self.curve_plot.set_data(
+            [Series([p.z_um for p in pts], [p.error for p in pts], _BLUE, 1.8)],
+            hlines=[RefLine(0.0, _GREY)],
+            vlines=vlines,
+            markers=markers,
+        )
+
+    def _curve_summary(self, a: CurveAnalysis) -> str:
+        if a.crossing_um is None:
+            return (
+                "No zero crossing in the scanned range: the lock point is outside it, "
+                "or there is no usable signal. Check Sum and the Dither alignment."
+            )
+        lines = []
+        cal = self._sensitivity
+        slope = f"{_fmt(a.slope, '+.0f')} counts/µm"
+        if cal is not None:
+            slope += f" (the calibration readout says {cal:.0f})"
+        lines.append(f"<b>Lock point</b> at {a.crossing_um:+.2f} µm, slope {slope}.")
+        if cal and a.slope and not 0.7 <= abs(a.slope) / cal <= 1.0 / 0.7:
+            lines.append(
+                f"The two differ by {max(abs(a.slope) / cal, cal / abs(a.slope)):.1f}×: "
+                "either the calibration predates the last alignment (redo "
+                "3. Set Gain), or Calibration Gain isn't the slope the Sensitivity "
+                "readout assumes."
+            )
+        lo, hi = a.margin_low_um, a.margin_high_um
+        if lo is not None and hi is not None:
+            lines.append(
+                f"<b>Peaks</b> {lo:.2f} µm below and {hi:.2f} µm above the lock point "
+                "(a lock point close to a peak is hard to hold)."
+            )
+        cap_lo = _fmt(a.capture_low_um, "+.2f")
+        cap_hi = _fmt(a.capture_high_um, "+.2f")
+        lines.append(
+            f"<b>Capture range</b> {'≤ ' if a.capture_low_open else ''}{cap_lo} … "
+            f"{'≥ ' if a.capture_high_open else ''}{cap_hi} µm."
+        )
+        if a.noise_floor_nm is not None:
+            lines.append(
+                f"<b>Error noise</b> ±{a.noise_counts:.1f} counts → focus noise floor "
+                f"≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)."
+            )
+        else:
+            lines.append(
+                "Use 2 or more reads per position to estimate the noise floor."
+            )
+        return "<br>".join(lines)
+
+    def _on_curve_save(self) -> None:
+        if self._curve_scan is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save focus curve",
+            str(self._default_csv_path("curve")),
+            "CSV (*.csv)",
+        )
+        if path:
+            self.save_curve_csv(path)
+
+    def save_curve_csv(self, path: str | Path) -> None:
+        """Write the last focus curve to *path*."""
+        if self._curve_scan is None:
+            return
+        meta = {
+            "crisp": self.controller.label,
+            "saved": datetime.now().astimezone().isoformat(),
+        }
+        a = self._curve_analysis
+        if a is not None:
+            meta.update(
+                crossing_um=_fmt(a.crossing_um, ".4f", ""),
+                slope_counts_per_um=_fmt(a.slope, ".2f", ""),
+                noise_floor_nm=_fmt(a.noise_floor_nm, ".1f", ""),
+            )
+        meta.update({k: v for k, v in self._last_readouts.items()})
+        write_curve_csv(path, self._curve_scan, meta)
+        self.curve_status.setText(f"Saved {Path(path).name}")
+        self.curve_status.setToolTip(str(path))
+
+    def _default_csv_path(self, kind: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", self.controller.label)
+        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+        return Path.home() / f"crisp_{kind}_{safe}_{stamp}.csv"
+
+    # -------------------------------------------------------------- hold test
+    def _on_hold_start(self) -> None:
+        if self._active_tool == _HOLD:
+            self._stop_hold()
+            return
+        actuator = self.controller.actuator_label
+        if actuator is None:
+            self.hold_status.setText(
+                "No paired focus actuator was found for this CRISP axis."
+            )
+            return
+        state = self.controller.get_state()
+        if state not in _LOCKED_STATES:
+            self.hold_status.setText(
+                f"The hold test needs the lock engaged; the state is "
+                f"{state or 'unknown'}."
+            )
+            return
+        if not self._begin_tool(_HOLD):
+            return
+        self._hold_samples = []
+        self.tools_tabs.setCurrentWidget(self._hold_tab)
+        duration = float(self.hold_duration.value())
+        self.hold_status.setText(f"Recording for {duration:.0f} s…")
+        self.hold_plot.clear()
+        self._hold = HoldTest(
+            self.mmcore,
+            self.controller.label,
+            actuator,
+            duration_s=duration,
+            rate_hz=self.hold_rate.value(),
+            on_sample=lambda s: self._emit("hold_sample", s),
+            on_done=lambda r: self._emit("hold_done", r),
+        )
+        self._hold.start()
+
+    def _stop_hold(self) -> None:
+        if self._active_tool != _HOLD or self._hold is None:
+            return
+        # stop() waits for the worker (one read at most); the partial result still
+        # arrives as "hold_done". Free the port now, so a command that stopped the
+        # test (e.g. 2. Dither) can start its own tool straight away.
+        self._hold.stop()
+        self._end_tool(_HOLD)
+
+    def _on_hold_sample(self, sample: HoldSample) -> None:
+        if self._active_tool != _HOLD:
+            return
+        self._hold_samples.append(sample)
+        if sample.state is not None:
+            self._update_state(sample.state)
+        now = time.monotonic()
+        if now - self._last_hold_paint >= _HOLD_PAINT_S:
+            self._last_hold_paint = now
+            self.hold_status.setText(
+                f"Recording… {sample.t:.0f} / {self.hold_duration.value()} s"
+            )
+            self._paint_hold(self._hold_samples)
+
+    def _paint_hold(self, samples: list[HoldSample]) -> None:
+        pos = [(s.t, s.position_um) for s in samples if s.position_um is not None]
+        if not pos:
+            self.hold_plot.clear()
+            return
+        z_first = pos[0][1]
+        self.hold_plot.set_data(
+            [
+                Series(
+                    [t for t, _ in pos],
+                    [(z - z_first) * 1000.0 for _, z in pos],  # type: ignore[operator]
+                    _BLUE,
+                    1.4,
+                )
+            ],
+            hlines=[RefLine(0.0, _GREY)],
+        )
+
+    def _on_hold_done(self, result: HoldResult) -> None:
+        self._hold = None
+        self._hold_results.insert(0, result)
+        del self._hold_results[_HOLD_RESULTS_KEPT:]
+        self._end_tool(_HOLD)
+        self._paint_hold(result.samples)
+        self._fill_hold_table()
+        s = result.stats
+        summary = (
+            f"{'Done' if result.completed else result.note.capitalize()}: "
+            f"{s.duration_s:.0f} s, {_fmt(s.rate_hz, '.0f')} samples/s. "
+            f"Drift {_fmt(s.drift_nm_per_min, '+.1f')} nm/min, jitter "
+            f"{_fmt(s.jitter_nm, '.0f')} nm, wander {_fmt(s.wander_nm, '.0f')} nm rms, "
+            f"pk-pk {_fmt(s.pkpk_nm, '.0f')} nm."
+        )
+        if s.rms_nm is None:
+            summary += f" No position readings from {result.actuator}."
+        change = result.lock_offset_change
+        if change:
+            summary += (
+                f" The lock offset changed by {change:+.0f} during the run (the focus "
+                "wheel moves it while locked)."
+            )
+        self.hold_status.setText(summary)
+
+    def _fill_hold_table(self) -> None:
+        self.hold_table.setRowCount(len(self._hold_results))
+        for row, r in enumerate(self._hold_results):
+            s = r.stats
+            note = r.note
+            change = r.lock_offset_change
+            if change:
+                note = f"{note + '; ' if note else ''}offset {change:+.0f}"
+            cells = [
+                r.started.strftime("%H:%M:%S"),
+                r.settings.get("Averages", ""),
+                r.settings.get("Loop Gain", ""),
+                r.settings.get("Update rate (ms)", ""),
+                r.settings.get("LED (%)", ""),
+                _fmt(s.drift_nm_per_min, "+.1f", ""),
+                _fmt(s.jitter_nm, ".0f", ""),
+                _fmt(s.wander_nm, ".0f", ""),
+                _fmt(s.pkpk_nm, ".0f", ""),
+                _fmt(s.error_rms, ".1f", ""),
+                note,
+            ]
+            for col, text in enumerate(cells):
+                self.hold_table.setItem(row, col, QTableWidgetItem(text))
+        self.hold_table.resizeColumnsToContents()
+        self._sync_tool_controls()
+
+    def _on_hold_save(self) -> None:
+        if not self._hold_results:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save hold test", str(self._default_csv_path("hold")), "CSV (*.csv)"
+        )
+        if path:
+            self.save_hold_csv(path)
+
+    def save_hold_csv(self, path: str | Path) -> None:
+        """Write the newest hold test to *path*."""
+        if self._hold_results:
+            write_hold_csv(path, self._hold_results[0])
+            self.hold_status.setText(f"Saved {Path(path).name}")
+            self.hold_status.setToolTip(str(path))
 
     # ------------------------------------------------------------- telemetry
-    def _on_reset_offset(self) -> None:
-        with suppress(Exception):
-            self.controller.set_reset_offset()
-        # The error datum just moved; drop stale fluctuation samples.
-        self._error_history.clear()
-        self._tracker.clear_error()
-        self._paint_tune(force=True)
-        self._poller.poll_now(force=True)
-
     def _read_device_values(self) -> CrispSnapshot:
         """Read CRISP telemetry from the controller (runs on a worker thread).
 
@@ -653,38 +1482,49 @@ class CrispControlPanel(QWidget):
         # getProperty a missing label (pymmcore-plus logs "No device with label
         # ..." warnings, which no suppress() around the call can catch).
         if label not in self.mmcore.getLoadedDevices():
-            return CrispSnapshot(state="", sensitivity=None, readouts={})
-        # Force the adapter to re-query the controller for fresh sensor values.
-        if self._can_refresh:
-            with suppress(Exception):
-                self.mmcore.setProperty(label, "RefreshPropertyValues", "Yes")
+            return CrispSnapshot(state="", readouts={})
 
-        state = ""
-        with suppress(Exception):
-            state = str(self.mmcore.getProperty(label, "CRISP State"))
+        state = read_str(self.mmcore, label, "CRISP State") or ""
+        now = time.monotonic()
+        full = (
+            self._full_read_due
+            or state != self._poll_last_state
+            or now - self._poll_last_full >= _FULL_READ_EVERY_S
+        )
+        if full:
+            # Cleared before reading, so a request made during the read isn't lost.
+            self._full_read_due = False
+            self._poll_last_full = now
+        self._poll_last_state = state
 
         readouts: dict[str, str] = {}
-        for prop, _ in _READOUTS:
-            with suppress(Exception):
-                readouts[prop] = str(self.mmcore.getProperty(label, prop))
-
-        # Calibration Gain / Range are already among the readouts, so derive the
-        # sensitivity from them rather than reading both again every tick.
-        sensitivity = counts_per_um(
-            _to_float(readouts.get(CAL_GAIN_PROP)),
-            _to_float(readouts.get(CAL_RANGE_PROP)),
-        )
-
-        return CrispSnapshot(state=state, sensitivity=sensitivity, readouts=readouts)
+        for prop in _READOUT_PROPS if full else _FAST_PROPS:
+            value = read_str(self.mmcore, label, prop)
+            if value is not None:
+                readouts[prop] = value
+        return CrispSnapshot(state=state, readouts=readouts, full=full)
 
     def _apply_values(self, snap: CrispSnapshot) -> None:
         """Apply a telemetry *snap* to the widgets (runs on the GUI thread)."""
+        if self._active_tool is not None:
+            return  # a read that was in flight when a tool took over
         self._update_state(snap.state)
-        self._update_sensitivity(snap.sensitivity)
-        for prop, _ in _READOUTS:
+        if snap.full:
+            # Calibration Gain / Range are among the full readouts, so derive the
+            # sensitivity from them rather than reading both again.
+            self._update_sensitivity(
+                counts_per_um(
+                    _to_float(snap.readouts.get(CAL_GAIN_PROP)),
+                    _to_float(snap.readouts.get(CAL_RANGE_PROP)),
+                )
+            )
+        self._last_readouts.update(snap.readouts)
+        for prop in _READOUT_PROPS:
             if prop in snap.readouts:
                 self._update_readout(prop, snap.readouts[prop])
         self._update_stability()
+        if snap.state == "Dither" and self.isVisible() and not self._mda_running:
+            self._start_dither()
 
     def _update_sensitivity(self, new: float | None) -> None:
         if not _close(new, self._sensitivity):
@@ -702,58 +1542,68 @@ class CrispControlPanel(QWidget):
         if lbl is None:
             return
         if prop == "Signal Noise Ratio":
-            try:
-                snr = float(value)
-            except ValueError:
+            snr = _to_float(value)
+            if snr is None:
                 lbl.setText(str(value))
                 return
             lbl.setText(f"{snr:.2f} dB")
-            color = "#4caf50" if snr >= _SNR_GOOD_DB else "#f44336"
+            color = _GREEN if snr >= _SNR_GOOD_DB else _RED
             lbl.setStyleSheet(f"font-weight: bold; color: {color};")
+        elif prop == _SUM_PROP:
+            lbl.setText(str(value))
+            status = sum_status(_to_float(value))
+            color = {"ok": _GREEN, "saturated": _RED, "low": _ORANGE, "high": _ORANGE}
+            lbl.setStyleSheet(
+                f"font-weight: bold; color: {color.get(status or '', _GREY)};"
+            )
         elif prop == _ERROR_PROP:
             self._update_error_readout(lbl, value)
         else:
             lbl.setText(str(value))
 
     def _update_error_readout(self, lbl: QLabel, value: str) -> None:
-        try:
-            counts = float(value)
-        except (TypeError, ValueError):
+        counts = _to_float(value)
+        if counts is None:
             lbl.setText(str(value))
             return
-        self._error_history.append(counts)
+        # Only the locked error is a focus error; in Dither it is the dither swing.
+        if self._last_state in _LOCKED_STATES:
+            self._error_history.append(counts)
         text = f"{counts:g}"
         um = self._to_um(counts)
-        if um is not None:
+        if um is not None and self._last_state not in DITHER_STATES:
             text += f"  ({um:+.3f} µm)"
         lbl.setText(text)
 
     def _update_stability(self) -> None:
+        if self._last_state not in _LOCKED_STATES:
+            self.stability_lbl.setText("In-loop error: -- (lock to measure)")
+            return
         if len(self._error_history) < 2:
-            self.stability_lbl.setText("Fluctuation: collecting…")
+            self.stability_lbl.setText("In-loop error: collecting…")
             return
         std = statistics.pstdev(self._error_history)
         ptp = max(self._error_history) - min(self._error_history)
         std_um = self._to_um(std)
-        if std_um is None:
-            self.stability_lbl.setText(
-                f"Fluctuation: ± {std:.0f} cts rms · pk-pk {ptp:.0f} cts"
-            )
-        else:
-            self.stability_lbl.setText(
-                f"Fluctuation: ± {std:.0f} cts ({abs(std_um):.3f} µm) rms · "
-                f"pk-pk {ptp:.0f} cts"
-            )
+        text = f"In-loop error: ± {std:.1f} cts"
+        if std_um is not None:
+            nm = abs(std_um) * 1000
+            text += f" ({nm:.1f} nm)" if nm < 10 else f" ({nm:.0f} nm)"
+        self.stability_lbl.setText(f"{text} rms · pk-pk {ptp:.0f} cts")
 
     def _update_state(self, state: str) -> None:
+        if state != self._last_state:
+            # Errors from different states aren't comparable (Dither shows its swing).
+            self._error_history.clear()
+            self._last_state = state
         if state in _BUSY_STATES:
-            text, color = _BUSY_STATES[state], "#FF9800"
+            text, color = _BUSY_STATES[state], _ORANGE
         elif state in _GOOD_STATES:
-            text, color = state, "#4caf50"
+            text, color = state, _GREEN
         elif state in _BAD_STATES:
-            text, color = state, "#f44336"
+            text, color = state, _RED
         else:
-            text, color = (state or "--"), "#9e9e9e"
+            text, color = (state or "--"), _GREY
         self.state_lbl.setText(f"State: {text}")
         self.state_lbl.setStyleSheet(f"font-weight: bold; color: {color};")
 

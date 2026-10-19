@@ -1,50 +1,291 @@
 """
 Standalone test harness to run the CRISPy UI in demo mode.
 
-The mock below models two CRISP axes taken from a real ``crisp_dump.txt``: a
-translation-stage axis (``CRISPAFocus:Z:32`` paired with ``ZStage:Z:32``) and a
-piezo axis (``CRISPAFocus:P:34`` paired with ``PiezoStage:P:34``).  This lets the
-actuator badge, calibration/sensitivity readouts, µm conversion, and the
-fluctuation metric all run without hardware.  The piezo axis is given a noisier
-error signal so the fluctuation readout visibly differs between the two.
+The mock below models two CRISP axes based on a real ``crisp_dump.txt``: a
+translation-stage axis (``CRISPAFocus:Z:32`` paired with ``ZStage:Z:32``) and a piezo
+axis (``CRISPAFocus:P:34`` paired with ``PiezoStage:P:34``).
 
-To try the **Tune** box without hardware, the mock also simulates the physical detector
-knob: SNR, Sum and the error noise follow a bump that a virtual knob sweeps back and
-forth over ``_SWEEP_PERIOD_S`` seconds, peaking at ``_KNOB_OPTIMUM``. Every property
-access sleeps ``_SERIAL_LATENCY_S`` to mimic a Tiger serial round trip (an assumed
-figure, not a measurement), so the effect of reading fewer properties shows up as a
-higher sample rate. Set ``CRISPY_DEMO_LATENCY_MS`` to change it.
+Each axis is a small simulation that follows the ASI CRISP manual's description, so the
+diagnostic tools behave the way they should on hardware:
+
+* the error is an S-shaped function of focus position (the "focus curve"); its slope
+  is best with the **detector lateral adjustment screw** at its optimum, and the screw
+  also unbalances the detector (a large lock offset) and changes Sum;
+* SNR is measured once, at Log Cal, and stays fixed afterwards;
+* in Dither the error reads the change across the dither move (slope x cal_range),
+  with large temporary values for a moment after the screw moves;
+* while locked, the actuator jitters by roughly error noise / slope, less with more
+  averaging and lower loop gain, and follows a slow thermal drift of the sample.
+
+A **Demo controls** dock lets you turn each axis's screw and change Averages and Loop
+Gain. The piezo starts badly aligned (like this rig's 2026-08-14 log), the stage well
+aligned. Every property access sleeps ``_SERIAL_LATENCY_S`` to mimic a Tiger serial
+round trip (an assumed figure, not a measurement); set ``CRISPY_DEMO_LATENCY_MS`` to
+change it. None of the numbers are measurements; they only make the behaviour visible.
 """
 
 import importlib.util
+import math
 import os
 import random
 import sys
+import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from psygnal import Signal
-from qtpy.QtCore import QObject, QTimer
+from qtpy.QtCore import QObject, Qt, QTimer
 from qtpy.QtCore import Signal as QtSignal
-from qtpy.QtWidgets import QApplication, QMainWindow
+from qtpy.QtWidgets import (
+    QApplication,
+    QDockWidget,
+    QFormLayout,
+    QGroupBox,
+    QMainWindow,
+    QSlider,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 _SERIAL_LATENCY_S = float(os.environ.get("CRISPY_DEMO_LATENCY_MS", "10")) / 1000
-_SWEEP_PERIOD_S = 12.0  # one full there-and-back turn of the virtual knob
-_KNOB_OPTIMUM = 0.6  # knob position (0..1) where the signal peaks
+_LOCKED = {"Lock", "In Focus"}
 
 
-def _knob_position(t: float) -> float:
-    """Virtual knob position in 0..1: a triangle wave, there and back."""
-    phase = (t / _SWEEP_PERIOD_S) % 1.0
-    return 2 * phase if phase < 0.5 else 2 * (1 - phase)
+class SimAxis:
+    """One simulated CRISP axis and its focus actuator."""
+
+    def __init__(
+        self,
+        label: str,
+        stage: str,
+        *,
+        axis: str,
+        hex_addr: str,
+        z: float,
+        screw: float,
+        slope_max: float,
+        sign: int,
+        noise: float,
+        cal_range: float,
+        snr: float,
+        agc: int,
+        max_lock_range: str,
+    ) -> None:
+        self.lock = threading.RLock()
+        self.label, self.stage = label, stage
+        self.z = z  # actuator position, µm
+        self.z_focus = z  # actuator position at which the surface is in focus
+        self.screw = screw  # detector lateral adjustment screw, 0..1
+        self.screw_opt = 0.62
+        self.slope_max = slope_max  # counts/µm at the best screw position
+        self.sign = sign
+        self.width = 2.0  # µm from the lock point to the curve's peaks
+        self.noise = noise  # error noise per read, counts rms
+        self.cal_range = cal_range
+        self.snr = snr
+        self.agc = agc
+        self.state = "In Focus"
+        self.state_since = time.monotonic()
+        self.next_state: tuple[float, str] | None = None
+        self.lock_offset = self.diff(0.0)
+        self.cal_gain = round(self.sign * self.slope() * cal_range)
+        self.jitter = 0.0
+        self.t_last = time.monotonic()  # last position read (jitter memory)
+        self.t_drift = self.t_last  # last drift update
+        self.transient = 0.0
+        self.transient_t = 0.0
+        self.drift_um_per_s = 0.012 / 60  # the sample drifts 12 nm/min
+        self.dither_flip = False
+        self.props = {
+            "AxisLetter": axis,
+            "TigerHexAddress": hex_addr,
+            "Max Lock Range(mm)": max_lock_range,
+            "Number of Averages": "1",
+            "GainMultiplier": "10",
+            "Number of Skips": "5",
+            "LED Intensity": "50",
+            "Objective NA": "1.49",
+        }
+
+    # ---------------------------------------------------------------- optics
+    def slope(self) -> float:
+        x = (self.screw - self.screw_opt) / 0.18
+        return self.slope_max * (math.exp(-x * x) + 0.05)
+
+    def diff(self, u: float) -> float:
+        """Detector difference signal at defocus *u* µm (before the lock offset)."""
+        s = self.sign * self.slope()
+        balance = 9000.0 * (self.screw - self.screw_opt)
+        return s * u * math.exp(-u * u / (2 * self.width**2)) + balance
+
+    def signal_sum(self) -> float:
+        if self.state == "Idle":
+            return 0.0
+        if self.screw < 0.05 or self.screw > 0.97:
+            return 0.0  # a detector half out of range
+        return max(1.0, 74.0 - 300.0 * (self.screw - self.screw_opt) ** 2)
+
+    def set_screw(self, value: float) -> None:
+        with self.lock:
+            if abs(value - self.screw) > 1e-6:
+                self.transient = random.choice((-1, 1)) * random.uniform(300, 800)
+                self.transient_t = time.monotonic()
+            self.screw = value
+
+    # ---------------------------------------------------------------- states
+    def _advance(self, now: float) -> None:
+        if self.next_state is not None and now >= self.next_state[0]:
+            self.state = self.next_state[1]
+            self.state_since = now
+            self.next_state = None
+            if self.state == "loG_cal":
+                self.snr = round(2.0 + 0.1 * float(self.props["LED Intensity"]), 1)
+            if self.state == "Dither":
+                self.cal_gain = round(self.sign * self.slope() * self.cal_range)
+        # The sample drifts slowly; a lock follows it.
+        dz = self.drift_um_per_s * (now - self.t_drift)
+        self.t_drift = now
+        self.z_focus += dz
+        if self.state in _LOCKED:
+            self.z += dz
+
+    def set_state(self, value: str) -> None:
+        now = time.monotonic()
+        with self.lock:
+            self.next_state = None
+            if value in ("Ready", "Idle"):
+                self.state = value
+            elif value == "Lock":
+                # Settle onto the point where the error equals the lock offset.
+                for _ in range(20):
+                    u = self.z - self.z_focus
+                    e = self.diff(u) - self.lock_offset
+                    self.z -= e / (self.sign * self.slope())
+                self.state = "Lock"
+                self.next_state = (now + 0.5, "In Focus")
+            elif value == "loG_cal":
+                self.state = "Calibrating"
+                self.next_state = (now + 1.5, "loG_cal")
+            elif value == "Dither":
+                self.state = "Dither"
+            elif value == "gain_Cal":
+                self.state = "Calibrating"
+                self.next_state = (now + 1.0, "Dither")
+            elif value == "Reset Focus Offset":
+                self.lock_offset = self.diff(self.z - self.z_focus)
+                self.state = "Ready"
+            self.state_since = now
+
+    def read_state(self) -> str:
+        with self.lock:
+            self._advance(time.monotonic())
+            if self.state == "Dither":
+                # The controller cycles dither sub-states; the adapter reports most
+                # of them as "Calibrating".
+                self.dither_flip = not self.dither_flip
+                return "Dither" if self.dither_flip else "Calibrating"
+            return self.state
+
+    # ---------------------------------------------------------------- values
+    def _lock_sigma_um(self) -> float:
+        n = int(self.props["Number of Averages"])
+        gain = float(self.props["GainMultiplier"])
+        return self.noise / self.slope() * math.sqrt(gain / 4.0) / math.sqrt(2**n)
+
+    def position(self) -> float:
+        with self.lock:
+            now = time.monotonic()
+            self._advance(now)
+            dt, self.t_last = now - self.t_last, now
+            if self.state not in _LOCKED:
+                return self.z
+            # The servo chasing sensor noise: correlated jitter with a 0.3 s memory.
+            a = math.exp(-dt / 0.3)
+            self.jitter = a * self.jitter + math.sqrt(1 - a * a) * random.gauss(
+                0, self._lock_sigma_um()
+            )
+            return self.z + self.jitter
+
+    def error(self) -> float:
+        with self.lock:
+            now = time.monotonic()
+            self._advance(now)
+            if self.state == "Idle":
+                return 0.0
+            if self.state == "Dither" or (
+                self.state == "Calibrating" and self.next_state is None
+            ):
+                age = now - self.transient_t
+                bump = self.transient * math.exp(-age / 0.4) if age < 3 else 0.0
+                swing = self.sign * self.slope() * self.cal_range
+                return swing + bump + random.gauss(0, self.noise)
+            if self.state in _LOCKED:
+                n = int(self.props["Number of Averages"])
+                return random.gauss(0, self.noise / math.sqrt(2**n))
+            return (
+                self.diff(self.z - self.z_focus)
+                - self.lock_offset
+                + random.gauss(0, self.noise)
+            )
+
+    def get(self, prop: str) -> str:
+        if prop == "CRISP State":
+            return self.read_state()
+        if prop == "Dither Error":
+            return f"{self.error():.0f}"
+        with self.lock:
+            if prop == "Sum":
+                s = self.signal_sum()
+                return f"{s if s == 0 else s + random.gauss(0, 0.6):.0f}"
+            if prop == "Signal Noise Ratio":
+                return f"{self.snr:.4f}"
+            if prop == "LogAmpAGC":
+                return str(self.agc)
+            if prop == "Lock Offset":
+                return f"{self.lock_offset:.0f}"
+            if prop == "Calibration Gain":
+                return str(self.cal_gain)
+            if prop == "Calibration Range(um)":
+                return f"{self.cal_range:.4f}"
+            return self.props[prop]  # KeyError -> caller suppresses
 
 
-def _signal_quality(t: float) -> float:
-    """0..1 detector signal quality: a bump around the knob's optimum."""
-    x = (_knob_position(t) - _KNOB_OPTIMUM) / 0.12
-    return 2.718281828 ** (-(x * x))
+_AXES: dict[str, SimAxis] = {
+    "CRISPAFocus:Z:32": SimAxis(
+        "CRISPAFocus:Z:32",
+        "ZStage:Z:32",
+        axis="Z",
+        hex_addr="32",
+        z=7.84,
+        screw=0.60,
+        slope_max=3800.0,
+        sign=-1,
+        noise=3.0,
+        cal_range=0.677,
+        snr=4.6,
+        agc=41,
+        max_lock_range="0.1000",
+    ),
+    "CRISPAFocus:P:34": SimAxis(
+        "CRISPAFocus:P:34",
+        "PiezoStage:P:34",
+        axis="P",
+        hex_addr="34",
+        z=-19.79,
+        screw=0.30,
+        slope_max=450.0,
+        sign=-1,
+        noise=6.0,
+        cal_range=0.675,
+        snr=7.1,
+        agc=60,
+        max_lock_range="2.0000",
+    ),
+}
+_BY_STAGE = {ax.stage: ax for ax in _AXES.values()}
 
 
 # 1. Define the Mocks FIRST
@@ -61,49 +302,10 @@ class MockMDA:
     events = MockMDAEvents()
 
 
-# Per-axis property snapshots (values mirror a real dump).
-_AXIS_PROPS: dict[str, dict[str, str]] = {
-    "CRISPAFocus:Z:32": {
-        "CRISP State": "Lock",
-        "Signal Noise Ratio": "3.7",
-        "Dither Error": "-3",
-        "Sum": "40",
-        "LogAmpAGC": "32",
-        "Lock Offset": "-792",
-        "Calibration Gain": "-2524",
-        "Calibration Range(um)": "0.6770",
-        "AxisLetter": "Z",
-        "TigerHexAddress": "32",
-        "Max Lock Range(mm)": "0.1000",
-    },
-    "CRISPAFocus:P:34": {
-        "CRISP State": "Lock",
-        "Signal Noise Ratio": "7.1",
-        "Dither Error": "-44",
-        "Sum": "72",
-        "LogAmpAGC": "59",
-        "Lock Offset": "7429",
-        "Calibration Gain": "-377",
-        "Calibration Range(um)": "0.6750",
-        "AxisLetter": "P",
-        "TigerHexAddress": "34",
-        "Max Lock Range(mm)": "2.0000",
-    },
-}
-# Paired ASITiger stage devices used for actuator classification. Value is the
-# device *name* reported by ``getDeviceName`` (a piezo reports as "PiezoStage").
-_STAGE_DEVICES: dict[str, str] = {
-    "ZStage:Z:32": "ZStage:Z:32",
-    "PiezoStage:P:34": "PiezoStage:P:34",
-}
-# Simulated live error noise (counts, 1-sigma) per axis to demo the fluctuation.
-_ERROR_NOISE = {"CRISPAFocus:Z:32": 2.0, "CRISPAFocus:P:34": 15.0}
-_T0 = time.monotonic()  # the virtual knob starts turning at import
-
-
 class MockCMMCorePlus:
     _instance = None
     events = MockEvents()
+    mda = MockMDA()
 
     @classmethod
     def instance(cls):
@@ -113,47 +315,54 @@ class MockCMMCorePlus:
 
     # --- device enumeration (used by classify_focus_actuator) --------------
     def getLoadedDevicesOfType(self, device_type):
-        return list(_STAGE_DEVICES)
+        return list(_BY_STAGE)
 
     def getDeviceLibrary(self, device):
         return "ASITiger"
 
     def getDeviceName(self, device):
-        return _STAGE_DEVICES.get(device, device)
+        return device
 
     def getDeviceDescription(self, dev):
         return "Mock"
 
-    mda = MockMDA()
-
     def getLoadedDevices(self):
-        return [*_AXIS_PROPS, *_STAGE_DEVICES]
+        return [*_AXES, *_BY_STAGE]
 
     def hasProperty(self, label, prop):
-        # The demo exposes no PropertyWidget-backed parameters and no
-        # RefreshPropertyValues, so the panel skips both.
-        return False
+        # No PropertyWidget-backed parameters in the demo (the Demo controls dock
+        # stands in for them), but the refresh flag exists like on real hardware.
+        return prop == "RefreshPropertyValues"
 
     # --- property access ---------------------------------------------------
     def getProperty(self, label, prop):
-        props = _AXIS_PROPS[label]  # KeyError -> caller suppresses
         time.sleep(_SERIAL_LATENCY_S)  # one simulated serial round trip
-        quality = _signal_quality(time.monotonic() - _T0)
-        if prop == "Signal Noise Ratio":
-            return f"{0.8 + 9.0 * quality + random.gauss(0, 0.15):.2f}"
-        if prop == "Sum":
-            return f"{10 + 90 * quality + random.gauss(0, 1.0):.0f}"
-        if prop == "Dither Error":
-            base = float(props[prop])
-            # A better-centred line detector (higher quality) means a quieter error.
-            noise = _ERROR_NOISE.get(label, 5.0) * (1.5 - 1.2 * quality)
-            return f"{base + random.gauss(0, noise):.0f}"
-        return props[prop]
+        return _AXES[label].get(prop)  # KeyError -> caller suppresses
 
     def setProperty(self, label, prop, value):
         time.sleep(_SERIAL_LATENCY_S)
         print(f"[DEMO] {label} -> {prop}: {value}")
-        _AXIS_PROPS.setdefault(label, {})[prop] = str(value)
+        if label in _AXES:
+            if prop == "CRISP State":
+                _AXES[label].set_state(str(value))
+            elif prop in _AXES[label].props:
+                _AXES[label].props[prop] = str(value)
+
+    # --- stage positions -----------------------------------------------------
+    def getPosition(self, label):
+        time.sleep(_SERIAL_LATENCY_S)
+        return _BY_STAGE[label].position()
+
+    def setPosition(self, label, z):
+        time.sleep(_SERIAL_LATENCY_S)
+        ax = _BY_STAGE[label]
+        with ax.lock:
+            if ax.state in _LOCKED:
+                raise RuntimeError("COD 47: the focus axis is locked")
+            ax.z = float(z)
+
+    def waitForDevice(self, label):
+        time.sleep(0.005)
 
 
 def _install_async_poller_shim() -> None:
@@ -230,7 +439,35 @@ from CRISPy.plugin import launch_crisp_plugin  # noqa: E402
 
 
 def mock_discover(mmcore=None):
-    return list(_AXIS_PROPS)
+    return list(_AXES)
+
+
+def build_demo_controls() -> QWidget:
+    """Sliders/spin boxes standing in for the physical screw and the parameters."""
+    panel = QWidget()
+    layout = QVBoxLayout(panel)
+    for ax in _AXES.values():
+        box = QGroupBox(ax.label)
+        form = QFormLayout(box)
+        screw = QSlider(Qt.Orientation.Horizontal)
+        screw.setRange(0, 100)
+        screw.setValue(round(ax.screw * 100))
+        screw.valueChanged.connect(lambda v, a=ax: a.set_screw(v / 100))
+        form.addRow("Detector screw", screw)
+        for prop, label, lo, hi in (
+            ("Number of Averages", "Averages (2^N)", 0, 8),
+            ("GainMultiplier", "Loop Gain", 1, 50),
+        ):
+            spin = QSpinBox()
+            spin.setRange(lo, hi)
+            spin.setValue(int(ax.props[prop]))
+            spin.valueChanged.connect(
+                lambda v, a=ax, p=prop: a.props.__setitem__(p, str(v))
+            )
+            form.addRow(label, spin)
+        layout.addWidget(box)
+    layout.addStretch()
+    return panel
 
 
 def run_demo():
@@ -242,8 +479,11 @@ def run_demo():
 
         window = QMainWindow()
         window.setCentralWidget(widget)
+        dock = QDockWidget("Demo controls")
+        dock.setWidget(build_demo_controls())
+        window.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         window.setWindowTitle("CRISPy - Demo Mode (Pure Python)")
-        window.resize(800, 640)  # wide enough for both axes side-by-side
+        window.resize(1150, 900)  # wide enough for both axes side-by-side
         window.show()
 
         sys.exit(app.exec_())
