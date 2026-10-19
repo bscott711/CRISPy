@@ -188,6 +188,37 @@ def test_one_read_per_point_gives_no_noise_estimate() -> None:
     assert a.noise_floor_nm is None
 
 
+def test_a_curve_broader_than_the_scan_has_no_peaks_not_the_scan_ends() -> None:
+    # Like the rig's Z axis on 2026-10-19: a broad S, +50 .. -55 over ±10 µm, whole
+    # counts, zero crossing at -0.5 µm, ~8.6 counts/µm at the crossing.
+    def err(z: float) -> float:
+        return round(-60.0 * math.tanh((z + 0.5) / 7.0))
+
+    pts = [CurvePoint(z, err(z), 0.47, 3) for z in scan_offsets(10.0, 0.25)]
+    a = analyze_focus_curve(pts)
+    assert a.crossing_um == pytest.approx(-0.5, abs=0.15)
+    assert a.peak_low is None
+    assert a.peak_high is None
+    assert a.margin_low_um is None
+    assert a.capture_low_open and a.capture_high_open
+    # Fitted over a wide window, so whole-count rounding doesn't throw it off.
+    assert a.slope == pytest.approx(-60.0 / 7.0, rel=0.1)
+    assert a.resolution_nm == pytest.approx(1000 / (60.0 / 7.0), rel=0.1)
+
+
+def test_a_peak_on_one_side_only() -> None:
+    # Peaks 2 µm below; above, the error keeps growing to the end of the scan.
+    def err(z: float) -> float:
+        return s_curve(z) if z < 0 else 400.0 * z
+
+    pts = [CurvePoint(z, err(z), None, 1) for z in scan_offsets(6.0, 0.25)]
+    a = analyze_focus_curve(pts)
+    assert a.peak_low is not None
+    assert a.peak_low[0] == pytest.approx(-2.0, abs=0.26)
+    assert a.peak_high is None
+    assert a.capture_high_open
+
+
 def test_capture_range_ends_where_the_sign_turns_wrong() -> None:
     # A curve that turns over (like a second reflecting surface) at z = +3.
     pts = [

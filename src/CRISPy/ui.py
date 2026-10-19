@@ -521,9 +521,12 @@ class CrispControlPanel(QWidget):
         next_row = (len(_READOUTS) + 1) // 2
         self.sensitivity_lbl = QLabel("Sensitivity: --")
         self.sensitivity_lbl.setToolTip(
-            "|Calibration Gain| / Calibration Range, in error counts per µm. This\n"
-            "assumes Calibration Gain is the error change over the calibration\n"
-            "move; the Focus curve tab measures the real slope."
+            "How many counts of the error readout one µm of focus makes, measured by\n"
+            "the Focus curve (until the next Log Cal or Dither). The µm figures in\n"
+            "this panel use it.\n\n"
+            "|Calibration Gain| / Calibration Range is shown too, but it is on a\n"
+            "different, internal scale (on the rig ~300× the measured slope), so it\n"
+            "is not used for conversions."
         )
         grid.addWidget(self.sensitivity_lbl, next_row, 0, 1, 4)
         self.stability_lbl = QLabel("In-loop error: --")
@@ -839,10 +842,15 @@ class CrispControlPanel(QWidget):
             return None
 
     def _counts_per_um(self) -> float | None:
-        """The focus-curve slope if one was measured, else the calibration figure."""
+        """Error-readout counts per µm, from the last focus curve; else ``None``.
+
+        The Cal Gain / Cal Range figure is on a different, internal scale (on the rig
+        the Z axis's was ~300× the measured slope), so it is never used to convert
+        the error readout to µm.
+        """
         if self._measured_slope:
             return abs(self._measured_slope)
-        return self._sensitivity or None
+        return None
 
     def _to_um(self, counts: float) -> float | None:
         """Convert raw error counts to microns (see :meth:`_counts_per_um`)."""
@@ -859,16 +867,18 @@ class CrispControlPanel(QWidget):
 
     def _render_sensitivity(self) -> None:
         cal = self._sensitivity
+        cal_txt = f"Cal Gain / Range {cal:.0f} (internal scale)" if cal else ""
         if self._measured_slope:
             text = (
-                f"Sensitivity: {abs(self._measured_slope):.0f} counts/µm (focus curve)"
+                f"Error readout: {abs(self._measured_slope):.1f} counts/µm "
+                "(focus curve)"
             )
-            if cal:
-                text += f" · calibration figure {cal:.0f}"
-        elif cal:
-            text = f"Sensitivity: {cal:.0f} counts/µm (from Cal Gain, unverified)"
+            if cal_txt:
+                text += f" · {cal_txt}"
+        elif cal_txt:
+            text = f"{cal_txt} · run a Focus curve for the error's counts/µm"
         else:
-            text = "Sensitivity: -- (uncalibrated)"
+            text = "Sensitivity: -- (uncalibrated; run a Focus curve)"
         self.sensitivity_lbl.setText(text)
 
     def _add_parameter_widgets(self, form: QFormLayout) -> None:
@@ -1340,7 +1350,7 @@ class CrispControlPanel(QWidget):
             self.curve_plot.clear()
             return
         a = self._curve_analysis
-        vlines = [RefLine(0.0, _GREY, "start")]
+        vlines = [RefLine(0.0, _GREY, "start", label_bottom=True)]
         markers: list[tuple[float, float, str]] = []
         if a is not None and a.crossing_um is not None:
             vlines.append(RefLine(a.crossing_um, _BLUE, "lock point", dashed=False))
@@ -1360,28 +1370,48 @@ class CrispControlPanel(QWidget):
                 "No zero crossing in the scanned range: the lock point is outside it, "
                 "or there is no usable signal. Check Sum and the Dither alignment."
             )
-        lines = []
-        cal = self._sensitivity
-        slope = f"{_fmt(a.slope, '+.0f')} counts/µm"
-        if cal is not None:
-            slope += f" (the calibration readout says {cal:.0f})"
-        lines.append(f"<b>Lock point</b> at {a.crossing_um:+.2f} µm, slope {slope}.")
-        if cal and a.slope and not 0.7 <= abs(a.slope) / cal <= 1.0 / 0.7:
-            lines.append(
-                f"The two differ by {max(abs(a.slope) / cal, cal / abs(a.slope)):.1f}×: "
-                "either the calibration predates the last alignment (redo "
-                "3. Set Gain), or Calibration Gain isn't the slope the Sensitivity "
-                "readout assumes."
+        lines = [
+            (
+                f"<b>Lock point</b> at {a.crossing_um:+.2f} µm from the start: where "
+                "CRISP would hold focus with the current lock offset. (Set Offset in "
+                "Ready at best focus moves it to 0.)"
             )
-        lines.append(
-            "The panel now uses this measured slope for its µm figures (until the "
-            "next Log Cal or Dither)."
-        )
+        ]
+        res = a.resolution_nm
+        slope = f"<b>Slope</b> {_fmt(a.slope, '+.1f')} counts/µm of the error readout"
+        if res is not None:
+            slope += f": one count = {res:.0f} nm of focus"
+        lines.append(slope + ".")
+        cal = self._sensitivity
+        if cal and a.slope:
+            ratio = cal / abs(a.slope)
+            lines.append(
+                f"Cal Gain / Cal Range ({cal:.0f}) is {ratio:.0f}× this: it is on a "
+                "different (internal) scale, so it can't convert the error readout "
+                "to µm. The panel uses this measured slope instead, until the next "
+                "Log Cal or Dither."
+            )
         lo, hi = a.margin_low_um, a.margin_high_um
+        z_lo = min(p.z_um for p in self._curve_points) if self._curve_points else None
+        z_hi = max(p.z_um for p in self._curve_points) if self._curve_points else None
         if lo is not None and hi is not None:
             lines.append(
                 f"<b>Peaks</b> {lo:.2f} µm below and {hi:.2f} µm above the lock point "
                 "(a lock point close to a peak is hard to hold)."
+            )
+        else:
+            missing = [
+                side
+                for side, pk in (("below", a.peak_low), ("above", a.peak_high))
+                if pk is None
+            ]
+            span = ""
+            if z_lo is not None and z_hi is not None:
+                span = f" ({z_lo:+.1f} … {z_hi:+.1f} µm)"
+            lines.append(
+                f"<b>No peak {' or '.join(missing)} the lock point within the scan"
+                f"</b>{span}: the error is still growing at the end, so the curve is "
+                "broader than the scan. Scan wider (if safe) to find the peaks."
             )
         cap_lo = _fmt(a.capture_low_um, "+.2f")
         cap_hi = _fmt(a.capture_high_um, "+.2f")
@@ -1389,11 +1419,19 @@ class CrispControlPanel(QWidget):
             f"<b>Capture range</b> {'≤ ' if a.capture_low_open else ''}{cap_lo} … "
             f"{'≥ ' if a.capture_high_open else ''}{cap_hi} µm."
         )
-        if a.noise_floor_nm is not None:
-            lines.append(
-                f"<b>Error noise</b> ±{a.noise_counts:.1f} counts → focus noise floor "
-                f"≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)."
-            )
+        if a.noise_floor_nm is not None and a.noise_counts is not None:
+            if a.noise_counts <= 1.0:
+                lines.append(
+                    f"<b>Error noise</b> ±{a.noise_counts:.1f} counts, about one count "
+                    "of the readout, so it is mostly rounding: the readout can't show "
+                    f"focus noise below ≈ {a.noise_floor_nm:.0f} nm here. The real "
+                    "noise is smaller; the Hold test (actuator position) measures it."
+                )
+            else:
+                lines.append(
+                    f"<b>Error noise</b> ±{a.noise_counts:.1f} counts → focus noise "
+                    f"floor ≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)."
+                )
         else:
             lines.append(
                 "Use 2 or more reads per position to estimate the noise floor."

@@ -57,7 +57,7 @@ Once installed, launch `pymmcore-gui`. CRISPy will automatically register itself
 
 Telemetry is polled only while a panel is visible and pauses automatically during a Multi-Dimensional Acquisition so the Tiger serial port stays free. Each tick reads the state, Dither Error and Sum. The rest (SNR is fixed at Log Cal; the calibration values change only on recalibration) is read every 10 s, after a button press and when the state changes. The **Poll** checkbox and interval (100 ms to 10 s, default 750 ms) are in each panel. ASI's own plugin suggests turning polling off once calibration is done.
 
-## 🎛️ Aligning the detector (Dither)
+## 🎯 Aligning the detector (Dither)
 
 From the [ASI CRISP manual](https://docs.asiimaging.com/crisp_manual): in the Dither state the focus moves up and down by the calibration range, and the Err number is the *change* in error across that move. Slowly turn the **detector lateral adjustment screw** on the CRISP unit for the largest **absolute** Err (large negative numbers are as good as large positive ones). Pause after each adjustment, because moving the detector gives large temporary values. Aim for at least ±100 (ASI's plugin; the manual says > 50, and > 200 is "plenty of signal"), with Sum staying in 50-80. If Sum ends up outside that band, redo Log Cal.
 
@@ -78,10 +78,11 @@ The locked error number is measured *inside* the feedback loop, so it can look q
 
 1. **Check the calibration.** SNR > 4 dB, Sum 50-80, and a dither |Err| of at least 100. A Sum of 0 or 100 means the detector is saturated; redo Log Cal.
 1. **Run a Focus curve** (in Ready, after Set Offset). It steps the focus actuator through ±10 µm around its position (adjustable), reads the error at each step and returns it to the start. It reports:
-   - the **slope** at the lock point in counts/µm, next to the calibration's own figure (if they differ a lot, the calibration may predate the last alignment). After a focus curve the panel uses the measured slope for its µm figures, until the next Log Cal or Dither;
-   - how far the lock point is from the curve's **peaks** (a lock point close to a peak is hard to hold);
+   - the **lock point**: where CRISP would hold focus with the current lock offset, relative to where you started (Set Offset at best focus moves it to 0);
+   - the **slope** in counts of the error readout per µm, and how much focus one count is. The readout is a whole number and coarse (on the rig's Z axis one count was about 117 nm). After a focus curve the panel uses this slope for its µm figures, until the next Log Cal or Dither. The Cal Gain / Cal Range figure is on a different, internal scale (~300× on that axis), so it isn't used for conversions;
+   - how far the lock point is from the curve's **peaks** (a lock point close to a peak is hard to hold), or that there is no peak within the scan if the error is still growing at its ends;
    - the **capture range**;
-   - the **noise floor**: error noise ÷ slope, i.e. how much focus motion the sensor noise alone implies.
+   - the **noise floor**: error noise ÷ slope. When the noise is about one count, it is mostly rounding and the readout simply can't show smaller focus noise; the Hold test measures the real motion.
 1. **Run a Hold test unlocked** (Ready, sitting still). CRISP isn't driving the actuator, so the position shows the actuator's *own* noise (the piezo and its drive), and the error rms is the sensor noise. If the actuator already wanders by itself, the lock can't hold it stiller than that.
 1. **Run a Hold test locked.** It records the actuator's own position for 60 s (adjustable) and splits it into **drift** (the trend, nm/min), **wander** (how much the 1 s averages move) and **jitter** (the spread within each second). It also reports the error rms and whether the lock offset changed. Compared with the unlocked run, it shows what the lock adds or removes. The lock settings and the mode are recorded with each run, and the last runs sit side by side in a table.
 1. **Change one setting** in the Parameters box and run the Hold test again. ASI's levers for a still sample:
@@ -92,7 +93,7 @@ The locked error number is measured *inside* the feedback loop, so it can look q
 
 CRISPy never changes these settings for you; it only measures. The parameter sliders also ignore the mouse wheel unless you click them first, so scrolling the panel can't change a setting by accident. Both tools pause the normal poll, stop when the panel is hidden or an acquisition starts, and can save their data as CSV.
 
-## 🕹️ Joystick lockout
+## 🎮 Joystick lockout
 
 A joystick wheel that creeps while an axis is locked makes the servo fight it, which shows up as slow drift. So when an axis locks, CRISPy disables the wheel bound to that axis's actuator, and it restores the wheel when the axis unlocks. The **Joystick enabled** checkbox overrides this at any time, including while locked.
 

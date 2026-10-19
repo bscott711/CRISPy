@@ -89,6 +89,17 @@ class CurveAnalysis:
     noise_floor_nm: float | None  # noise_counts / |slope|
 
     @property
+    def resolution_nm(self) -> float | None:
+        """Focus distance per count of the error readout at the lock point, in nm.
+
+        The ``Dither Error`` readout is a whole number (the LCD's Err), so this is
+        the finest focus change it can show; noise near one count is mostly rounding.
+        """
+        if not self.slope:
+            return None
+        return 1000.0 / abs(self.slope)
+
+    @property
     def margin_low_um(self) -> float | None:
         """Distance from the lock point down to the lower peak."""
         if self.crossing_um is None or self.peak_low is None:
@@ -231,21 +242,27 @@ def _walk_side(
 ) -> tuple[tuple[float, float] | None, float | None, bool]:
     """Walk outward from *start* while the error has *want_sign*.
 
-    Returns the extreme point on that side, the last z with the correct sign, and
-    whether the correct sign continued to the end of the scan.
+    Returns the peak on that side, the last z with the correct sign, and whether the
+    correct sign continued to the end of the scan. If the largest error is the last
+    point of the scan, the curve is still rising there: that's not a peak, so the
+    peak is ``None`` (it lies beyond the scan).
     """
     peak: tuple[float, float] | None = None
-    last_z: float | None = None
+    last: CurvePoint | None = None
     i = start
     while 0 <= i < len(pts):
         p = pts[i]
         if _sign(p.error) != want_sign:
-            return peak, last_z, False
-        last_z = p.z_um
+            return peak, (last.z_um if last else None), False
+        last = p
         if peak is None or abs(p.error) > abs(peak[1]):
             peak = (p.z_um, p.error)
         i += step
-    return peak, last_z, True
+    # The end of the scan reaches the largest error (whole-count readings often tie
+    # there): the curve hasn't turned over inside the scan, so there's no peak in it.
+    if peak is not None and last is not None and abs(last.error) >= abs(peak[1]):
+        peak = None
+    return peak, (last.z_um if last else None), True
 
 
 def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
@@ -278,10 +295,15 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     peak_high, cap_high, high_open = _walk_side(pts, i + 1, +1, rising)
 
     # Fit the slope over the central third of the region between the peaks (at least
-    # the two points that bracket the crossing).
+    # the two points that bracket the crossing). With no peak inside the scan the
+    # curve is broad, so fit over a quarter of the way to the nearer scan end.
     step = statistics.median(b.z_um - a.z_um for a, b in pairwise(pts))
     margins = [abs(z_c - pk[0]) for pk in (peak_low, peak_high) if pk is not None]
-    half_width = max(1.5 * step, min(margins) / 3 if margins else 1.5 * step)
+    if margins:
+        half_width = max(1.5 * step, min(margins) / 3)
+    else:
+        to_end = min(z_c - pts[0].z_um, pts[-1].z_um - z_c)
+        half_width = max(1.5 * step, to_end / 4)
     near = [p for p in pts if abs(p.z_um - z_c) <= half_width]
     if len(near) < 2:
         near = [pts[i], pts[i + 1]]

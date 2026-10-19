@@ -38,6 +38,7 @@ class RefLine:
     label: str = ""
     dashed: bool = True
     label_left: bool = False  # put a horizontal line's label at the left end
+    label_bottom: bool = False  # put a vertical line's label at the bottom
 
 
 @dataclass
@@ -249,8 +250,9 @@ class LinePlot(QWidget):
                 QPointF(px(v.value), plot.top()), QPointF(px(v.value), plot.bottom())
             )
             if v.label:
+                y = plot.bottom() - 18 if v.label_bottom else plot.top() + 16
                 p.drawText(
-                    QRectF(px(v.value) + 3, plot.top() + 16, 120, 14),
+                    QRectF(px(v.value) + 3, y, 120, 14),
                     Qt.AlignmentFlag.AlignLeft,
                     v.label,
                 )

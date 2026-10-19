@@ -92,13 +92,23 @@ micro-manager/mmCoreAndDevices).
   the adapter source): it makes reads of the cached properties (Lock Offset,
   Calibration Gain/Range, parameters) query the controller. It is written once.
   State, SNR, Sum, Dither Error and AGC are always read from the controller.
-- **Sensitivity = |Calibration Gain| / Calibration Range is unverified, and likely not
-  counts/µm of the operating error.** On the rig (2026-10-19) |Cal Gain| was 10-13× the
-  dither |Err| on both axes, and the manual says the dither Err "is actually different
-  from the Err signal computed during operation". Only the Focus curve measures the
-  slope; after one, the panel uses it for µm figures until Log Cal / Dither.
-  `controller.set_lock_offset_um` (used by pymmcore-gui's per-channel focus offset)
-  still uses the Cal Gain figure; don't trust its µm scale without a focus curve.
+- **Three different scales; only the Focus curve converts the error to µm.** The error
+  readout (`Dither Error` = `LK Y?` = the LCD's Err) is a coarse whole-count number: on
+  the rig's Z axis (2026-10-19 focus curve) 8.6 counts/µm, so one count ≈ 117 nm.
+  |Cal Gain| / Cal Range was 2564, ~300× that, so Cal Gain (and probably Lock Offset,
+  which reads in the thousands) is an internal scale. The dither Err is a third scale
+  (|Cal Gain| was 10-13× it on both axes; the manual says it "is actually different
+  from the Err signal computed during operation"). The panel converts the error to µm
+  only with a measured slope (until Log Cal / Dither). Error noise near one count is
+  rounding, so the readout can't show focus noise below one count's worth; the Hold
+  test (actuator position) measures it. `controller.set_lock_offset_um` (used by
+  pymmcore-gui's per-channel focus offset) uses the Cal Gain figure, which may be right
+  for Lock Offset's internal scale but is unverified.
+- **The rig's Z focus curve had no peaks within ±10 µm** (a broad S, +50 .. -55 counts),
+  much broader than ASI's table for NA 1.25-1.4 objectives (focus range ~±2.5-3 µm).
+  Unexplained as of 2026-10-19; candidates are a scan that moved less than commanded
+  or a signal dominated by a broad reflection. The analysis reports the scan ends as
+  "no peak within the scan", not as peaks.
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

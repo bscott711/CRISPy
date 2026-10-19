@@ -53,6 +53,25 @@ pass. Not yet run on the rig** (branch `feat/crisp-unlocked-hold-and-na`).
   flight crashes at shutdown (0xC0000409). It's the existing `AsyncPoller` /
   thread-pool teardown, not this change; the smoke test now waits for the read.
 
+## Addendum: first Z focus curve (2026-10-19)
+
+The rig's Z curve (±10 µm, 0.25 µm steps) was a broad S, +50 to −55 counts, crossing at
+−0.50 µm, slope ~8.6 counts/µm, error noise ±0.5 counts, with no peak inside the scan.
+The panel's summary was misleading, so:
+
+- The scan ends are no longer reported as peaks (whole-count readings tie at the end):
+  "no peak within the scan", and the slope is fitted over a wider window then.
+- One count of the error readout = 1000 / slope nm (117 nm here). Noise of about one
+  count is reported as rounding (the readout's limit), not as the lock's noise floor.
+- Cal Gain / Cal Range (2564) was ~300× the measured slope: an internal scale. It is no
+  longer used for any µm conversion; only a measured slope is.
+- Plot labels "start" / "lock point" no longer overlap.
+- README anchors: headings with variation-selector emoji (🎛️, 🕹️) broke their links on
+  GitHub; replaced with 🎯 / 🎮.
+
+Open question for the bench: why the curve is so much broader than ASI's table suggests
+for an NA ~1.4-1.49 objective (scan moved less than commanded? broad reflection?).
+
 ## Bench (user)
 
 - Set Objective NA: piezo 1.0, Z 1.49 (Parameters box), then Log Cal → Dither → Set Gain.
