@@ -112,7 +112,17 @@ micro-manager/mmCoreAndDevices).
   edge of the capture range on that side. Why the lock sits on the weak feature is open
   (see the manual's "Offset the locking plane from the imaging plane"). The analysis
   reports a peak only if the curve turns over (falls ≥ `PEAK_DROP` beyond it), and lists
-  other zero crossings at least a quarter as steep as the lock point.
+  other zero crossings at least a quarter as steep as the lock point. The Z axis's Cal
+  Gain is negative (−1454); the manual says locking on a region whose slope is opposite
+  to a surface's (its "brown" regions) gives a negative calibration value, consistent
+  with the Z lock riding the far flank of that surface's response.
+- **The rig's piezo focus curve (2026-10-19, ±30 µm) is lopsided.** Lock point +0.06 µm
+  (after Set Offset), slope −18.7 counts/µm; below it the error sits at ~+15 and never
+  passes ~+20 to −30 µm; above, it ramps to −460 by +30 µm without turning over. No
+  surface comes into focus within ±30 µm: the lock point is the knee where a broad
+  response from something further away meets the background. That fits the piezo's
+  weak, wandering dither Err and its Cal Gain changing sign between calibrations
+  (−377 in August, +658 on 2026-10-19). `CurveAnalysis.lopsided` flags this.
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

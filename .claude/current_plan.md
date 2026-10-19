@@ -87,6 +87,14 @@ bump near −29.5 µm a "peak" and didn't mention the second crossing. Now:
 - Checked by rendering a curve traced from the screenshot through the real panel: lock
   −0.81, slope −11.8, peak +8.31 above, no false peak below, other crossing +15.5 µm.
 
+## Addendum 3: piezo focus curve at ±30 µm
+
+Lock point +0.06 µm, slope −18.7 counts/µm; below it the error sits at ~+15 (max ~+20) to
+−30 µm, above it ramps to −460 at +30 µm with no turnover. The lock point is a knee, not
+the middle of an S. Added `restoring_low/high` (largest restoring error each side within
+the capture range) and `lopsided` (ratio ≥ 4); the summary explains what that means.
+Checked with a curve traced from the screenshot.
+
 ## Bench (user)
 
 - Set Objective NA: piezo 1.0, Z 1.49 (Parameters box), then Log Cal → Dither → Set Gain.

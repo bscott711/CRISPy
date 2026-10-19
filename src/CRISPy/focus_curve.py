@@ -54,6 +54,8 @@ PEAK_DROP = 0.15
 _OTHER_SLOPE_HALF_WIDTH_UM = 1.0
 # Other crossings are reported only if at least this steep relative to the lock point.
 _OTHER_MIN_STEEPNESS = 0.25
+# A lock point whose two sides restore this many times differently sits at a knee.
+LOPSIDED_RATIO = 4.0
 
 
 class FocusCurveError(RuntimeError):
@@ -98,6 +100,19 @@ class CurveAnalysis:
     # surface coming into focus shows up as one; with the opposite slope sign it is
     # also where the capture range ends on that side.
     other_crossings: tuple[tuple[float, float | None], ...] = ()
+    # The largest error with the right (restoring) sign on each side of the lock
+    # point, within the capture range. Very unequal sides mean the lock point sits at
+    # a knee of the curve rather than in the middle of an S.
+    restoring_low: float | None = None
+    restoring_high: float | None = None
+
+    @property
+    def lopsided(self) -> bool:
+        """One side restores ``LOPSIDED_RATIO``× more strongly than the other."""
+        lo, hi = self.restoring_low, self.restoring_high
+        if not lo or not hi:
+            return False
+        return max(lo, hi) / min(lo, hi) >= LOPSIDED_RATIO
 
     @property
     def resolution_nm(self) -> float | None:
@@ -280,6 +295,17 @@ def _walk_side(
     return peak, walked[-1].z_um, open_end
 
 
+def _restoring(
+    pts: list[CurvePoint], z_c: float, edge: float | None, *, below: bool
+) -> float | None:
+    """Largest |error| between the lock point and the capture edge on one side."""
+    if edge is None:
+        return None
+    lo, hi = (edge, z_c) if below else (z_c, edge)
+    side = [abs(p.error) for p in pts if lo <= p.z_um <= hi and p.z_um != z_c]
+    return max(side) if side else None
+
+
 def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     """Find the lock point, slope, peaks, capture range and noise floor of a curve."""
     pts = sorted(points, key=lambda p: p.z_um)
@@ -358,6 +384,8 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
         noise_counts=noise,
         noise_floor_nm=floor_nm,
         other_crossings=tuple(others),
+        restoring_low=_restoring(pts, z_c, cap_low, below=True),
+        restoring_high=_restoring(pts, z_c, cap_high, below=False),
     )
 
 

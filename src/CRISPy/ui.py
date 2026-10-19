@@ -1423,6 +1423,20 @@ class CrispControlPanel(QWidget):
             if not found:
                 text += " Scan wider (if safe) to find the peaks."
             lines.append(text)
+        if a.lopsided and a.restoring_low and a.restoring_high:
+            weak_side, weak, strong = (
+                ("below", a.restoring_low, a.restoring_high)
+                if a.restoring_low < a.restoring_high
+                else ("above", a.restoring_high, a.restoring_low)
+            )
+            worth = f" (≈ {weak / abs(a.slope):.1f} µm worth)" if a.slope else ""
+            lines.append(
+                f"<b>Lopsided:</b> {weak_side} the lock point the error never gets "
+                f"past {weak:.0f} counts{worth}, against {strong:.0f} on the other "
+                "side. The lock point sits at a knee of the curve, not in the middle "
+                "of an S: it pushes back only weakly that way, and a small change in "
+                "the background or offset moves the knee (and the focus)."
+            )
         for z, s in a.other_crossings:
             if s is None or not a.slope:
                 continue

@@ -239,6 +239,27 @@ def test_a_second_surface_is_reported_as_another_crossing() -> None:
     assert a.peak_high is not None  # the lock curve turns over before it
 
 
+def test_a_lock_point_at_a_knee_is_lopsided() -> None:
+    # Like the rig's piezo on 2026-10-19: below the lock point the error sits at about
+    # +15 (never more than ~20); above, it ramps to -460 by +30 µm.
+    def err(z: float) -> float:
+        if z < 0:
+            return round(15.0 + 5.0 * math.exp(-((z + 2.0) ** 2)))
+        return round(-15.0 * z * (1 + z / 60.0))
+
+    pts = [CurvePoint(z, err(z), None, 1) for z in scan_offsets(30.0, 0.25)]
+    a = analyze_focus_curve(pts)
+    assert a.restoring_low == pytest.approx(20.0, abs=1.5)
+    assert a.restoring_high == pytest.approx(675.0, rel=0.05)
+    assert a.lopsided
+
+
+def test_a_symmetric_s_curve_is_not_lopsided() -> None:
+    a = analyze_focus_curve(_run(FakeCore(), half_range_um=8.0).points)
+    assert a.restoring_low == pytest.approx(a.restoring_high, rel=0.1)
+    assert not a.lopsided
+
+
 def test_a_peak_on_one_side_only() -> None:
     # Peaks 2 µm below; above, the error keeps growing to the end of the scan.
     def err(z: float) -> float:
