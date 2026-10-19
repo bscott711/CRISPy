@@ -1,102 +1,53 @@
-# Piezo CRISP noise: unlocked hold test, NA visibility, wheel guard
+# Focus curve: respect the actuator's travel; drop the "lopsided" verdict
 
-**Status: implemented; tests and a headless smoke test (in the pymmcore-gui host env)
-pass. Not yet run on the rig** (branch `feat/crisp-unlocked-hold-and-na`).
+**Status: implemented; tests and a demo scan through the real panel pass. Not yet run
+on the rig** (branch `feat/crisp-unlocked-hold-and-na`, PR #3).
 
-## Evidence from the rig (2026-10-19 screenshots)
+## Why
 
-|                          | Z axis (objective NA 1.49)   | Piezo (moves the "snouty", NA 1.0; next to an NA 0.95 air lens) |
-| ------------------------ | ---------------------------- | --------------------------------------------------------------- |
-| Dither \|Err\|           | ~115, tight (~±4%)           | ~70, spread ±13%, smoothed level wandering ~55-90               |
-| Cal Range                | 0.887 µm (= NA 1.30 setting) | 0.714 µm (= NA 1.45 setting)                                    |
-| Cal Gain / "Sensitivity" | −1454 / 1639                 | 658 / 922                                                       |
-| SNR, Sum                 | 6.0 dB, 64                   | 4.8 dB, 57                                                      |
-
-- The dither move is `cal_range = 1.5 µm / NA²`. The piezo's lens (NA 1.0) wants 1.5 µm;
-  it dithers 0.71 µm. The Z lens (1.49) wants 0.68 µm; it dithers 0.89 µm. The 2026-08
-  dump had 0.675 / 0.677 (both NA 1.49), so both settings changed since.
-- |Cal Gain| ≈ 10-13× the dither |Err| on both axes, so Cal Gain is not the dither swing
-  (the earlier "20× weaker piezo" estimate assumed it was, and was wrong). The manual also
-  says the dither Err "is actually different from the Err signal computed during
-  operation", so only the focus curve measures counts/µm of the operating error.
-- The piezo's smoothed |Err| wanders ±20% over seconds, ~5× more than white noise allows
-  for a 1 s median, so part of its scatter is slow (piezo/drive, air path, or optics).
+- The user: the piezo (150 µm travel) is not centred at focus, so ±30 µm may not fit on
+  one side. `run_focus_curve` recorded the *commanded* offset, so a piezo clamped at its
+  limit would plot as a flat stretch of error at made-up positions. The rig's piezo
+  curve (2026-10-19) is flat at ~+15 from about −2.5 µm down to −30 µm, which is what a
+  piezo stuck ~2.5 µm above its lower limit would look like. Unconfirmed: needs the
+  piezo position and its `LowerLim(mm)`.
+- ASI's docs (MOVE, SETLOW) don't say whether a move past a limit is clamped or
+  rejected, so the scan can't rely on an error.
+- "Lopsided" (b43d243) called a one-sided curve a defect. It isn't, for holding: what
+  holds focus is the slope through zero and the noise there. A weak side only slows the
+  recovery from a big excursion that way. And the weak side we saw may be the travel
+  limit. Remove it.
+- The piezo's reference reflection is a mirror after the air objective (O2), back
+  through both objectives: CRISP reads the lateral position of the returned beam
+  (manual: split photodiode), so tilt of that mirror or beam wander in that path reads
+  as focus error. Docs only (a lead for the bench, not code).
 
 ## Changes
 
-1. Hold test also runs **unlocked** (Ready / Idle): the actuator is not driven by CRISP,
-   so position = the piezo's own noise and error rms = the sensor noise. Table gets a
-   Mode column. Unlocked runs end if the state moves into Lock, Dither or calibration.
-1. Dither tab: scatter in counts (σ), and samples read after the dither ends are dropped
-   (the Z trace fell to 0 and showed "settling…" after the dither stopped).
-1. Readouts: Cal Range shows the NA it corresponds to; tooltip says to set Objective NA
-   to the objective the axis moves, before calibrating.
-1. Sensitivity: after a focus curve, the measured slope is used for the µm conversions
-   (labelled), calibration-derived otherwise (labelled unverified). Cleared on Log Cal /
-   Dither (the slope changes with AGC and alignment).
-1. Wheel guard: parameter widgets ignore the mouse wheel unless focused (clicked), so
-   scrolling the panel can't change Objective NA, LED, Loop Gain, Averages, ...
-1. Demo, tests, docs.
+1. `focus_curve.py`
+   - `travel_limits_um(mmcore, actuator, z0)`: the ASI `LowerLim(mm)` / `UpperLim(mm)`
+     properties ×1000; ignored unless they bracket the start position.
+   - `run_focus_curve` drops offsets outside the limits; after each move reads the
+     position back; a position the actuator didn't reach (> max(0.2 µm, step/2) away,
+     re-checked once after a short wait) is skipped (upward: stop, further is worse).
+     Points use the measured position.
+   - `CurveScan` gains `limits_um`, `limited_low/high`, `skipped`.
+   - Remove `lopsided`, `restoring_low/high`, `_restoring`, `LOPSIDED_RATIO`.
+   - CSV metadata: limits, skipped.
+1. `ui.py`: summary line when the scan was cut short by travel (how far it got, the
+   limit, where the start sits); no "Scan wider" on a side that hit the limit; confirm
+   dialog says it stops at the travel limit. Remove the Lopsided line.
+1. `run_demo.py`: stage travel limits (piezo focus 2.2 µm above its lower limit, as
+   suspected on the rig), clamped moves, `LowerLim(mm)` / `UpperLim(mm)` properties.
+1. Tests: clipping by limits; insane limits ignored; clamped (unknown-limit) positions
+   skipped and measured z recorded; upward stop; lopsided tests removed.
+1. Docs: CLAUDE.md (focus curve travel, piezo curve finding rewritten, mirror path),
+   README focus-curve section.
 
-## Verification done
+## Verification
 
-- `uv run pytest -q`: 82 passed. Planted bugs in the unlocked-mode check and in the
-  post-dither discard were both caught.
-- `ruff check .` at the 19 findings `main` had; `ruff format`, `mdformat` clean.
-- Smoke test of the real panel against the demo in the pymmcore-gui env (PyQt6 6.9, real
-  `AsyncPoller`): unlocked hold test in Ready (marked unlocked, the demo piezo's own
-  ~20 nm wander measured, writes nothing); post-dither readings dropped (final level 334,
-  not 0); scatter in counts shown; Cal Range shows "(NA 1.49)"; the focus-curve slope is
-  adopted and cleared by Dither; the wheel over an unfocused control scrolls the panel
-  and leaves the value alone, and works after a click.
-- Found while testing, not changed: exiting the process while a slow-poll read is in
-  flight crashes at shutdown (0xC0000409). It's the existing `AsyncPoller` /
-  thread-pool teardown, not this change; the smoke test now waits for the read.
-
-## Addendum: first Z focus curve (2026-10-19)
-
-The rig's Z curve (±10 µm, 0.25 µm steps) was a broad S, +50 to −55 counts, crossing at
-−0.50 µm, slope ~8.6 counts/µm, error noise ±0.5 counts, with no peak inside the scan.
-The panel's summary was misleading, so:
-
-- The scan ends are no longer reported as peaks (whole-count readings tie at the end):
-  "no peak within the scan", and the slope is fitted over a wider window then.
-- One count of the error readout = 1000 / slope nm (117 nm here). Noise of about one
-  count is reported as rounding (the readout's limit), not as the lock's noise floor.
-- Cal Gain / Cal Range (2564) was ~300× the measured slope: an internal scale. It is no
-  longer used for any µm conversion; only a measured slope is.
-- Plot labels "start" / "lock point" no longer overlap.
-- README anchors: headings with variation-selector emoji (🎛️, 🕹️) broke their links on
-  GitHub; replaced with 🎯 / 🎮.
-
-Open question for the bench: why the curve is so much broader than ASI's table suggests
-for an NA ~1.4-1.49 objective (scan moved less than commanded? broad reflection?).
-
-## Addendum 2: Z focus curve at ±30 µm
-
-Lock point −0.82 µm, slope −12.2 counts/µm, error levelling off at ~+130 down to −30 µm,
-turning over at +8.3 µm above, then a second, ~6× steeper crossing with the opposite slope
-at about +15.5 µm, rising to ~+300 by +26 µm. The summary called the plateau's one-count
-bump near −29.5 µm a "peak" and didn't mention the second crossing. Now:
-
-- A peak must turn over: beyond it the error must fall by ≥ 15% (`PEAK_DROP`) before
-  the scan ends, or change sign. Otherwise "no turnover within the scan".
-- Other zero crossings at least a quarter as steep as the lock point are listed with
-  their slope and marked on the plot; an opposite-sign one is flagged as the likely
-  edge of the capture range / another surface.
-- Checked by rendering a curve traced from the screenshot through the real panel: lock
-  −0.81, slope −11.8, peak +8.31 above, no false peak below, other crossing +15.5 µm.
-
-## Addendum 3: piezo focus curve at ±30 µm
-
-Lock point +0.06 µm, slope −18.7 counts/µm; below it the error sits at ~+15 (max ~+20) to
-−30 µm, above it ramps to −460 at +30 µm with no turnover. The lock point is a knee, not
-the middle of an S. Added `restoring_low/high` (largest restoring error each side within
-the capture range) and `lopsided` (ratio ≥ 4); the summary explains what that means.
-Checked with a curve traced from the screenshot.
-
-## Bench (user)
-
-- Set Objective NA: piezo 1.0, Z 1.49 (Parameters box), then Log Cal → Dither → Set Gain.
-- Dither |Err| and scatter in counts on both axes; Focus curve on both.
-- Hold test unlocked (Ready) and locked on the piezo.
+- pytest 92 passed; ruff at the 19-finding baseline; ruff format and mdformat clean.
+- A ±10 µm scan through the real panel on the demo piezo (start −19.8 µm, limits −22 …
+  128 µm): commanded nothing past −22 µm, covered −2.0 … +10 µm, "Travel limit" line
+  and red plot marker shown, no "Scan wider"; CSV records the limits.
+- Plot marks the cut with a red "travel limit" line.

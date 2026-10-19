@@ -1269,7 +1269,8 @@ class CrispControlPanel(QWidget):
         if not self._confirm_move(
             f"Move {actuator} from {-half:g} to +{half:g} µm around its current "
             f"position in {step:g} µm steps ({n} positions), then return it to the "
-            "start?\n\nDon't touch the focus wheel while it runs."
+            "start?\n\nThe scan stays inside the actuator's travel limits and leaves "
+            "out positions it can't reach. Don't touch the focus wheel while it runs."
         ):
             return
         if not self._begin_tool(_CURVE):
@@ -1360,6 +1361,17 @@ class CrispControlPanel(QWidget):
             for pk in (a.peak_low, a.peak_high):
                 if pk is not None:
                     markers.append((pk[0], pk[1], _ORANGE))
+        scan = self._curve_scan
+        if a is not None and scan is not None and scan.limits_um is not None:
+            for cut, limit in zip(
+                (scan.limited_low, scan.limited_high), scan.limits_um
+            ):
+                if cut:
+                    vlines.append(
+                        RefLine(
+                            limit - scan.z0_um, _RED, "travel limit", label_bottom=True
+                        )
+                    )
         self.curve_plot.set_data(
             [Series([p.z_um for p in pts], [p.error for p in pts], _BLUE, 1.8)],
             hlines=[RefLine(0.0, _GREY)],
@@ -1412,6 +1424,11 @@ class CrispControlPanel(QWidget):
             for side, pk in (("below", a.peak_low), ("above", a.peak_high))
             if pk is None
         ]
+        scan = self._curve_scan
+        cut = {
+            "below": scan is not None and scan.limited_low,
+            "above": scan is not None and scan.limited_high,
+        }
         if missing:
             span = ""
             if z_lo is not None and z_hi is not None:
@@ -1420,23 +1437,32 @@ class CrispControlPanel(QWidget):
                 f"<b>No turnover {' or '.join(missing)} the lock point within the "
                 f"scan</b>{span}: the error levels off or keeps growing to the end."
             )
-            if not found:
+            if not found and not all(cut[side] for side in missing):
                 text += " Scan wider (if safe) to find the peaks."
             lines.append(text)
-        if a.lopsided and a.restoring_low and a.restoring_high:
-            weak_side, weak, strong = (
-                ("below", a.restoring_low, a.restoring_high)
-                if a.restoring_low < a.restoring_high
-                else ("above", a.restoring_high, a.restoring_low)
-            )
-            worth = f" (≈ {weak / abs(a.slope):.1f} µm worth)" if a.slope else ""
-            lines.append(
-                f"<b>Lopsided:</b> {weak_side} the lock point the error never gets "
-                f"past {weak:.0f} counts{worth}, against {strong:.0f} on the other "
-                "side. The lock point sits at a knee of the curve, not in the middle "
-                "of an S: it pushes back only weakly that way, and a small change in "
-                "the background or offset moves the knee (and the focus)."
-            )
+        if scan is not None and z_lo is not None and z_hi is not None:
+            reached = [
+                f"{abs(z):.1f} µm {side}"
+                for side, z in (("below", z_lo), ("above", z_hi))
+                if cut[side]
+            ]
+            if reached:
+                text = (
+                    f"<b>Travel limit:</b> {scan.actuator} could only go "
+                    f"{' and '.join(reached)} the start"
+                )
+                if scan.limits_um is not None:
+                    lo_lim, hi_lim = scan.limits_um
+                    text += (
+                        f" (its limits are {lo_lim:.1f} … {hi_lim:.1f} µm; it started "
+                        f"at {scan.z0_um:.1f} µm)"
+                    )
+                if scan.skipped:
+                    text += (
+                        f"; {scan.skipped} position{'s' if scan.skipped > 1 else ''} "
+                        "it didn't reach were left out"
+                    )
+                lines.append(text + ". The curve past that wasn't measured.")
         for z, s in a.other_crossings:
             if s is None or not a.slope:
                 continue

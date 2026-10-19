@@ -116,13 +116,25 @@ micro-manager/mmCoreAndDevices).
   Gain is negative (−1454); the manual says locking on a region whose slope is opposite
   to a surface's (its "brown" regions) gives a negative calibration value, consistent
   with the Z lock riding the far flank of that surface's response.
-- **The rig's piezo focus curve (2026-10-19, ±30 µm) is lopsided.** Lock point +0.06 µm
-  (after Set Offset), slope −18.7 counts/µm; below it the error sits at ~+15 and never
-  passes ~+20 to −30 µm; above, it ramps to −460 by +30 µm without turning over. No
-  surface comes into focus within ±30 µm: the lock point is the knee where a broad
-  response from something further away meets the background. That fits the piezo's
-  weak, wandering dither Err and its Cal Gain changing sign between calibrations
-  (−377 in August, +658 on 2026-10-19). `CurveAnalysis.lopsided` flags this.
+- **The focus curve respects the actuator's travel.** The piezo has 150 µm of travel and
+  focus is not centred in it. ASI's docs don't say whether a move past a firmware limit
+  is clamped or rejected, so the scan clips to `LowerLim(mm)` / `UpperLim(mm)` (when they
+  bracket the start), reads the position back after every move, leaves out positions it
+  didn't reach, and places points at the measured position. Before this, points were at
+  the *commanded* offset, so a clamped actuator plotted as a flat stretch.
+- **The rig's piezo focus curve (2026-10-19, ±30 µm, recorded before that fix).** Lock
+  point +0.06 µm (after Set Offset), slope −18.7 counts/µm; the error rises to ~+20 by
+  −2.5 µm and then sits flat at ~+12-17 to −30 µm; above, it ramps to −460 by +30 µm
+  without turning over. The flat stretch is most likely the piezo stopped at its lower
+  limit about 2.5 µm below focus (unconfirmed: needs the position and `LowerLim(mm)`).
+  The piezo's reference reflection is a mirror after the air objective (O2), back
+  through both objectives; the user's design simulation says it behaves like a
+  glass/water interface. A one-sided curve is not in itself a holding problem (what
+  holds focus is the slope through zero and the noise there), so the analysis doesn't
+  flag asymmetry; an earlier "lopsided" verdict was removed. CRISP reads the lateral
+  position of the returned beam (split photodiode), so anything that tilts the returned
+  beam (that mirror, air in its path) also reads as focus error: a lead for the
+  piezo's second-scale noise, untested.
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

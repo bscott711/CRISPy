@@ -77,7 +77,7 @@ The normal poll pauses while it runs, so only one reader uses the serial port. I
 The locked error number is measured *inside* the feedback loop, so it can look quiet while the focus moves. On this rig's 2026-08-14 log, the locked piezo's error stayed within ±9 counts while the piezo moved ~100 nm between samples. Measure the focus motion instead, and change one thing at a time.
 
 1. **Check the calibration.** SNR > 4 dB, Sum 50-80, and a dither |Err| of at least 100. A Sum of 0 or 100 means the detector is saturated; redo Log Cal.
-1. **Run a Focus curve** (in Ready, after Set Offset). It steps the focus actuator through ±10 µm around its position (adjustable), reads the error at each step and returns it to the start. It reports:
+1. **Run a Focus curve** (in Ready, after Set Offset). It steps the focus actuator through ±10 µm around its position (adjustable), reads the error at each step and returns it to the start. It stays inside the actuator's travel limits (`LowerLim(mm)` / `UpperLim(mm)`), leaves out any position the actuator doesn't reach, and plots each point where the actuator actually was, so a scan that runs into a limit shows up as a shorter curve with a **Travel limit** note, not as a flat stretch. It reports:
    - the **lock point**: where CRISP would hold focus with the current lock offset, relative to where you started (Set Offset at best focus moves it to 0);
    - the **slope** in counts of the error readout per µm, and how much focus one count is. The readout is a whole number and coarse (on the rig's Z axis one count was about 117 nm). After a focus curve the panel uses this slope for its µm figures, until the next Log Cal or Dither. The Cal Gain / Cal Range figure is on a different, internal scale (~300× on that axis), so it isn't used for conversions;
    - how far the lock point is from the curve's **peaks** (a lock point close to a peak is hard to hold), or that there is no peak within the scan if the error is still growing at its ends;
@@ -106,6 +106,7 @@ The wheel binding is the stage's `JoystickInput` property. The value to restore 
 CRISPy includes a standalone test harness that mocks the Micro-Manager core. It models two axes based on a real controller dump, a Z stage and a piezo, each as a small simulation that follows the manual:
 
 - an S-shaped focus curve whose slope depends on the detector screw;
+- travel limits where moves stop without an error (the demo piezo starts 2.2 µm above its lower limit);
 - a fixed SNR;
 - a dither Err with temporary jumps when the screw moves;
 - lock jitter that scales with noise ÷ slope and drops with averaging.

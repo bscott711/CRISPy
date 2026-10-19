@@ -43,6 +43,8 @@ class FakeCore:
         fail_at: float | None = None,
         fail_restore: bool = False,
         slope: float = 400.0,
+        travel: tuple[float, float] | None = None,
+        reported_limits_mm: tuple[float, float] | None = None,
     ) -> None:
         self.z = z0
         self.focus = focus
@@ -51,6 +53,8 @@ class FakeCore:
         self.fail_at = fail_at
         self.fail_restore = fail_restore
         self.slope = slope
+        self.travel = travel  # moves stop at these (µm), without an error
+        self.reported_limits_mm = reported_limits_mm  # LowerLim(mm) / UpperLim(mm)
         self.moves: list[float] = []
         self.rng = random.Random(1)
 
@@ -60,6 +64,11 @@ class FakeCore:
         if prop == "Dither Error":
             e = s_curve(self.z - self.focus, self.slope) + self.rng.gauss(0, self.noise)
             return f"{e:.3f}"
+        if label == ACT and self.reported_limits_mm is not None:
+            if prop == "LowerLim(mm)":
+                return str(self.reported_limits_mm[0])
+            if prop == "UpperLim(mm)":
+                return str(self.reported_limits_mm[1])
         raise KeyError(prop)
 
     def getPosition(self, label: str) -> float:
@@ -73,6 +82,8 @@ class FakeCore:
         if self.fail_restore and self.moves and abs(z - 25.0) < 1e-9:
             raise RuntimeError("serial timeout")
         self.moves.append(z)
+        if self.travel is not None:
+            z = min(max(z, self.travel[0]), self.travel[1])
         self.z = z
 
     def waitForDevice(self, label: str) -> None:
@@ -150,6 +161,60 @@ def test_on_point_sees_every_point() -> None:
     seen: list[CurvePoint] = []
     scan = _run(FakeCore(), on_point=seen.append)
     assert seen == scan.points
+
+
+def test_the_scan_stays_inside_reported_travel_limits() -> None:
+    # Focus 2.5 µm above the lower limit of a 150 µm piezo (limits in mm).
+    core = FakeCore(z0=2.5, focus=2.5, reported_limits_mm=(0.0, 0.150))
+    scan = _run(core)
+    assert scan.limits_um == pytest.approx((0.0, 150.0))
+    assert scan.limited_low and not scan.limited_high
+    assert min(core.moves) == pytest.approx(0.0)  # never commanded past the limit
+    assert scan.points[0].z_um == pytest.approx(-2.5)
+    assert scan.points[-1].z_um == pytest.approx(6.0)
+    assert scan.skipped == 0
+    assert core.z == 2.5
+
+
+def test_limits_that_dont_bracket_the_start_are_ignored() -> None:
+    # Unset (0, 0) or in another frame: fall back to reading the position back.
+    for limits in ((0.0, 0.0), (0.1, 0.2)):
+        scan = _run(FakeCore(reported_limits_mm=limits))
+        assert scan.limits_um is None
+        assert not scan.limited_low and not scan.limited_high
+        assert len(scan.points) == len(scan_offsets(6.0, 0.25))
+
+
+def test_positions_the_actuator_does_not_reach_are_left_out() -> None:
+    # No reported limits, but the stage stops 2.5 µm below the start without an error.
+    # The old scan plotted those positions as a flat stretch at the commanded z.
+    core = FakeCore(travel=(22.5, 1000.0))
+    scan = _run(core)
+    assert scan.limited_low and not scan.limited_high
+    assert scan.skipped == len([d for d in scan_offsets(6.0, 0.25) if d < -2.5])
+    zs = [p.z_um for p in scan.points]
+    assert zs[0] == pytest.approx(-2.5)
+    assert len(set(zs)) == len(zs)  # no pile-up at the limit
+    assert core.z == 25.0
+
+
+def test_the_scan_stops_going_up_at_an_unreported_limit() -> None:
+    core = FakeCore(travel=(0.0, 27.0))
+    scan = _run(core)
+    assert scan.limited_high and not scan.limited_low
+    assert scan.skipped == 1  # the first miss going up ends the scan
+    assert scan.points[-1].z_um == pytest.approx(2.0)
+    assert scan.completed
+    assert core.z == 25.0
+
+
+def test_points_are_placed_at_the_measured_position() -> None:
+    class Offset(FakeCore):
+        def getPosition(self, label: str) -> float:
+            return self.z + 0.05  # within tolerance, but not where it was sent
+
+    scan = _run(Offset())
+    assert scan.points[0].z_um == pytest.approx(-6.0 + 0.05)
 
 
 # -------------------------------------------------------------------------- analysis
@@ -239,27 +304,6 @@ def test_a_second_surface_is_reported_as_another_crossing() -> None:
     assert a.peak_high is not None  # the lock curve turns over before it
 
 
-def test_a_lock_point_at_a_knee_is_lopsided() -> None:
-    # Like the rig's piezo on 2026-10-19: below the lock point the error sits at about
-    # +15 (never more than ~20); above, it ramps to -460 by +30 µm.
-    def err(z: float) -> float:
-        if z < 0:
-            return round(15.0 + 5.0 * math.exp(-((z + 2.0) ** 2)))
-        return round(-15.0 * z * (1 + z / 60.0))
-
-    pts = [CurvePoint(z, err(z), None, 1) for z in scan_offsets(30.0, 0.25)]
-    a = analyze_focus_curve(pts)
-    assert a.restoring_low == pytest.approx(20.0, abs=1.5)
-    assert a.restoring_high == pytest.approx(675.0, rel=0.05)
-    assert a.lopsided
-
-
-def test_a_symmetric_s_curve_is_not_lopsided() -> None:
-    a = analyze_focus_curve(_run(FakeCore(), half_range_um=8.0).points)
-    assert a.restoring_low == pytest.approx(a.restoring_high, rel=0.1)
-    assert not a.lopsided
-
-
 def test_a_peak_on_one_side_only() -> None:
     # Peaks 2 µm below; above, the error keeps growing to the end of the scan.
     def err(z: float) -> float:
@@ -317,3 +361,13 @@ def test_write_curve_csv(tmp_path: Path) -> None:
     assert "# crisp: CRISPAFocus:P:34" in text
     header = text.index("z_rel_um,z_abs_um,error_counts,error_std,n")
     assert len(text) - header - 1 == len(scan.points)
+    assert not any("travel" in line for line in text[:header])
+
+
+def test_write_curve_csv_records_the_travel_limit(tmp_path: Path) -> None:
+    core = FakeCore(z0=2.5, focus=2.5, reported_limits_mm=(0.0, 0.150))
+    out = tmp_path / "curve.csv"
+    write_curve_csv(out, _run(core), {})
+    text = out.read_text(encoding="utf-8").splitlines()
+    assert "# travel_limits_um: 0.000 .. 150.000" in text
+    assert "# limited_by_travel: low" in text

@@ -76,9 +76,11 @@ class SimAxis:
         snr: float,
         agc: int,
         max_lock_range: str,
+        travel_um: tuple[float, float],
     ) -> None:
         self.lock = threading.RLock()
         self.label, self.stage = label, stage
+        self.travel_um = travel_um  # the actuator's firmware limits; moves clamp there
         self.z = z  # actuator position, µm
         self.z_focus = z  # actuator position at which the surface is in focus
         self.screw = screw  # detector lateral adjustment screw, 0..1
@@ -279,6 +281,7 @@ _AXES: dict[str, SimAxis] = {
         snr=4.6,
         agc=41,
         max_lock_range="0.1000",
+        travel_um=(-5000.0, 5000.0),
     ),
     "CRISPAFocus:P:34": SimAxis(
         "CRISPAFocus:P:34",
@@ -295,6 +298,8 @@ _AXES: dict[str, SimAxis] = {
         snr=7.1,
         agc=60,
         max_lock_range="2.0000",
+        # A 150 µm piezo with focus 2.2 µm above its lower limit.
+        travel_um=(-22.0, 128.0),
     ),
 }
 _BY_STAGE = {ax.stage: ax for ax in _AXES.values()}
@@ -349,6 +354,10 @@ class MockCMMCorePlus:
     # --- property access ---------------------------------------------------
     def getProperty(self, label, prop):
         time.sleep(_SERIAL_LATENCY_S)  # one simulated serial round trip
+        if label in _BY_STAGE:
+            lo, hi = _BY_STAGE[label].travel_um
+            limits = {"LowerLim(mm)": lo / 1000, "UpperLim(mm)": hi / 1000}
+            return f"{limits[prop]:.6f}"  # KeyError -> caller suppresses
         return _AXES[label].get(prop)  # KeyError -> caller suppresses
 
     def setProperty(self, label, prop, value):
@@ -371,7 +380,8 @@ class MockCMMCorePlus:
         with ax.lock:
             if ax.state in _LOCKED:
                 raise RuntimeError("COD 47: the focus axis is locked")
-            ax.z = float(z)
+            lo, hi = ax.travel_um
+            ax.z = min(max(float(z), lo), hi)  # stops at the limit, no error
 
     def waitForDevice(self, label):
         time.sleep(0.005)

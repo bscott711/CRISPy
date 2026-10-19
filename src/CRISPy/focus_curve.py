@@ -7,7 +7,10 @@ the useful lock range is the region with the correct slope, and a lock point clo
 peak of the curve "would be hard to hold". On a Tiger controller ASI's own plugin builds
 the curve in software, and so does this module: with CRISP in the Ready state (unlocked,
 LED on) it steps the paired focus actuator through a range around its current position,
-reads the error at each step, and always returns the actuator to where it started.
+reads the error at each step, and always returns the actuator to where it started. The
+scan stays inside the actuator's travel limits when it reports them, and every point is
+placed at the position the actuator reads back, so a stage stopped at its limit can't
+pass for a flat stretch of the curve.
 
 The analysis reports, from measured data rather than the calibration:
 
@@ -54,8 +57,12 @@ PEAK_DROP = 0.15
 _OTHER_SLOPE_HALF_WIDTH_UM = 1.0
 # Other crossings are reported only if at least this steep relative to the lock point.
 _OTHER_MIN_STEEPNESS = 0.25
-# A lock point whose two sides restore this many times differently sits at a knee.
-LOPSIDED_RATIO = 4.0
+# ASI stages and piezos report their firmware travel limits (SL / SU) in mm.
+LOWER_LIMIT_PROP = "LowerLim(mm)"
+UPPER_LIMIT_PROP = "UpperLim(mm)"
+# A position counts as reached when the actuator reads back within this distance of it
+# (or half a step, if that is larger).
+REACH_TOL_UM = 0.2
 
 
 class FocusCurveError(RuntimeError):
@@ -80,6 +87,13 @@ class CurveScan:
     z0_um: float  # absolute starting position; the actuator was returned here
     points: list[CurvePoint] = field(default_factory=list)
     completed: bool = True  # False if stopped early
+    # The actuator's travel limits (absolute µm), when it reports usable ones.
+    limits_um: tuple[float, float] | None = None
+    # The actuator's travel cut the scan short on that side: positions past a limit
+    # were left out, or the actuator didn't get to them.
+    limited_low: bool = False
+    limited_high: bool = False
+    skipped: int = 0  # positions left out because the actuator didn't reach them
 
 
 @dataclass(frozen=True)
@@ -100,19 +114,6 @@ class CurveAnalysis:
     # surface coming into focus shows up as one; with the opposite slope sign it is
     # also where the capture range ends on that side.
     other_crossings: tuple[tuple[float, float | None], ...] = ()
-    # The largest error with the right (restoring) sign on each side of the lock
-    # point, within the capture range. Very unequal sides mean the lock point sits at
-    # a knee of the curve rather than in the middle of an S.
-    restoring_low: float | None = None
-    restoring_high: float | None = None
-
-    @property
-    def lopsided(self) -> bool:
-        """One side restores ``LOPSIDED_RATIO``× more strongly than the other."""
-        lo, hi = self.restoring_low, self.restoring_high
-        if not lo or not hi:
-            return False
-        return max(lo, hi) / min(lo, hi) >= LOPSIDED_RATIO
 
     @property
     def resolution_nm(self) -> float | None:
@@ -148,6 +149,34 @@ def scan_offsets(half_range_um: float, step_um: float) -> list[float]:
     return [round(k * step_um, 6) for k in range(-n, n + 1)]
 
 
+def travel_limits_um(
+    mmcore: CMMCorePlus, actuator: str, z0_um: float
+) -> tuple[float, float] | None:
+    """The actuator's firmware travel limits in µm, if it reports usable ones.
+
+    Reads the ASITiger ``LowerLim(mm)`` / ``UpperLim(mm)`` properties. A pair that
+    doesn't bracket the current position *z0_um* (unset, or in another coordinate
+    frame) is ignored: the scan then relies on reading the position back.
+
+    Parameters
+    ----------
+    mmcore
+        The shared core.
+    actuator
+        The stage device.
+    z0_um
+        Its current position, µm.
+    """
+    lo = read_float(mmcore, actuator, LOWER_LIMIT_PROP)
+    hi = read_float(mmcore, actuator, UPPER_LIMIT_PROP)
+    if lo is None or hi is None:
+        return None
+    lo, hi = lo * 1000.0, hi * 1000.0
+    if not lo < hi or not lo <= z0_um <= hi:
+        return None
+    return lo, hi
+
+
 def run_focus_curve(
     mmcore: CMMCorePlus,
     label: str,
@@ -164,6 +193,11 @@ def run_focus_curve(
 
     Blocks until done; run it on a worker thread. The actuator is always moved back to
     its starting position, including when the scan is stopped or fails.
+
+    The scan leaves out positions past the actuator's travel limits
+    (:func:`travel_limits_um`) and positions it doesn't reach (it reads back more than
+    :data:`REACH_TOL_UM` or half a step away); a position it misses going up ends the
+    scan. Each point is placed at the position read back, not the one commanded.
 
     Parameters
     ----------
@@ -204,19 +238,40 @@ def run_focus_curve(
     except Exception as e:
         raise FocusCurveError(f"Could not read the position of {actuator}: {e}") from e
 
+    limits = travel_limits_um(mmcore, actuator, z0)
     offsets = scan_offsets(half_range_um, step_um)
+    limited_low = limited_high = False
+    if limits is not None:
+        lo, hi = limits[0] - z0 - 1e-6, limits[1] - z0 + 1e-6
+        limited_low = offsets[0] < lo
+        limited_high = offsets[-1] > hi
+        offsets = [dz for dz in offsets if lo <= dz <= hi]
+    tol = max(REACH_TOL_UM, step_um / 2)
     points: list[CurvePoint] = []
     failure: Exception | None = None
     completed = True
+    skipped = 0
     try:
         for dz in offsets:
             if should_stop is not None and should_stop():
                 completed = False
                 break
-            mmcore.setPosition(actuator, z0 + dz)
+            target = z0 + dz
+            mmcore.setPosition(actuator, target)
             mmcore.waitForDevice(actuator)
             if settle_s > 0:
                 time.sleep(settle_s)
+            z = float(mmcore.getPosition(actuator))
+            if abs(z - target) > tol:
+                time.sleep(max(settle_s, 0.05))  # still moving, or stopped short?
+                z = float(mmcore.getPosition(actuator))
+            if abs(z - target) > tol:
+                skipped += 1
+                if dz > 0:
+                    limited_high = True
+                    break  # further up is only further past the limit
+                limited_low = True
+                continue
             values = [
                 v
                 for v in (
@@ -228,7 +283,7 @@ def run_focus_curve(
             if not values:
                 continue
             std = statistics.pstdev(values) if len(values) > 1 else None
-            point = CurvePoint(dz, statistics.fmean(values), std, len(values))
+            point = CurvePoint(z - z0, statistics.fmean(values), std, len(values))
             points.append(point)
             if on_point is not None:
                 on_point(point)
@@ -246,7 +301,16 @@ def run_focus_curve(
         raise FocusCurveError(
             f"Focus curve stopped: {failure} ({actuator} was returned to {z0:.3f} µm)"
         ) from failure
-    return CurveScan(actuator=actuator, z0_um=z0, points=points, completed=completed)
+    return CurveScan(
+        actuator=actuator,
+        z0_um=z0,
+        points=points,
+        completed=completed,
+        limits_um=limits,
+        limited_low=limited_low,
+        limited_high=limited_high,
+        skipped=skipped,
+    )
 
 
 def _sign(v: float) -> int:
@@ -293,17 +357,6 @@ def _walk_side(
         if not beyond or min(beyond) > (1 - PEAK_DROP) * abs(walked[k].error):
             peak = None  # levels off or still growing at the end of the scan
     return peak, walked[-1].z_um, open_end
-
-
-def _restoring(
-    pts: list[CurvePoint], z_c: float, edge: float | None, *, below: bool
-) -> float | None:
-    """Largest |error| between the lock point and the capture edge on one side."""
-    if edge is None:
-        return None
-    lo, hi = (edge, z_c) if below else (z_c, edge)
-    side = [abs(p.error) for p in pts if lo <= p.z_um <= hi and p.z_um != z_c]
-    return max(side) if side else None
 
 
 def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
@@ -384,14 +437,21 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
         noise_counts=noise,
         noise_floor_nm=floor_nm,
         other_crossings=tuple(others),
-        restoring_low=_restoring(pts, z_c, cap_low, below=True),
-        restoring_high=_restoring(pts, z_c, cap_high, below=False),
     )
 
 
 def write_curve_csv(path: Path | str, scan: CurveScan, meta: dict[str, str]) -> None:
     """Save a scan as CSV: ``#``-prefixed metadata lines, then one row per point."""
-    header = {"actuator": scan.actuator, "z0_um": f"{scan.z0_um:.4f}", **meta}
+    header = {"actuator": scan.actuator, "z0_um": f"{scan.z0_um:.4f}"}
+    if scan.limits_um is not None:
+        lo, hi = scan.limits_um
+        header["travel_limits_um"] = f"{lo:.3f} .. {hi:.3f}"
+    cut = [s for s, c in (("low", scan.limited_low), ("high", scan.limited_high)) if c]
+    if cut:
+        header["limited_by_travel"] = " and ".join(cut)
+    if scan.skipped:
+        header["positions_not_reached"] = str(scan.skipped)
+    header.update(meta)
     with open(path, "w", newline="", encoding="utf-8") as fh:
         fh.writelines(f"# {key}: {value}\n" for key, value in header.items())
         writer = csv.writer(fh)
