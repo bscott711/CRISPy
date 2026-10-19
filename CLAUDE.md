@@ -127,9 +127,11 @@ micro-manager/mmCoreAndDevices).
   −2.5 µm and then sits flat at ~+12-17 to −30 µm; above, it ramps to −460 by +30 µm
   without turning over. The flat stretch is most likely the piezo stopped at its lower
   limit about 2.5 µm below focus (unconfirmed: needs the position and `LowerLim(mm)`).
-  The piezo's reference reflection is a mirror after the air objective (O2), back
-  through both objectives; the user's design simulation says it behaves like a
-  glass/water interface. A one-sided curve is not in itself a holding problem (what
+  The piezo's reference reflection is a flat mirror square to the air objective (O2)
+  in its infinity space, back through O2 and the snouty; the user's design simulation
+  says it behaves like a reflection at the snouty's face. Bench-verified: blocking the
+  beam behind O2 removes the signal entirely. (A paraxial "cat's-eye retroreflector,
+  wrong pupil half" argument predicted otherwise and was wrong; don't re-raise it.) A one-sided curve is not in itself a holding problem (what
   holds focus is the slope through zero and the noise there), so the analysis doesn't
   flag asymmetry; an earlier "lopsided" verdict was removed. CRISP reads the lateral
   position of the returned beam (split photodiode), so anything that tilts the returned
