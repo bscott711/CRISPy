@@ -8,10 +8,10 @@ A modern, multi-device ASI CRISP autofocus plugin designed specifically for the 
 
 - **Multi-Device Support:** Control and calibrate N ASI CRISP axes on a Tiger controller at once (e.g. a Z stage and a piezo). Each axis locks independently.
 - **Smart UI Orchestration:** One panel for a single CRISP, two side by side for a pair, and tabs for three or more.
-- **Live Telemetry:** SNR (green at or above the 4 dB ASI target), Dither Error, Sum, AGC, Lock Offset and the CRISP state, read off the GUI thread so a slow serial port never stalls the live view.
-- **Actuator-Aware Scaling:** Each axis shows whether it drives a piezo or a Z stage, its calibration gain and range, the resulting error sensitivity (counts per µm), the focus error in microns, and a rolling fluctuation (std-dev and peak-to-peak).
-- **Fast Tune Mode:** High-rate sampling with a peak-hold meter for aligning the CRISP detector knob. See [Tuning the detector knob](#-tuning-the-detector-knob).
-- **Guided Calibration:** Buttons for the 3-step calibration (Log Cal, Dither, Set Gain) next to the live SNR and error readouts.
+- **Live Telemetry:** SNR (green at or above the 4 dB ASI target), Dither Error, Sum (green inside ASI's 50-80 band), AGC, Lock Offset and the CRISP state, read off the GUI thread so a slow serial port never stalls the live view. Each readout's tooltip gives ASI's guidance for it.
+- **Actuator-Aware Scaling:** Each axis shows whether it drives a piezo or a Z stage, its calibration gain and range, the resulting error sensitivity (counts per µm), the focus error in microns, and the in-loop error fluctuation while locked.
+- **Guided Calibration:** Buttons for the 3-step calibration (Log Cal, Dither, Set Gain), with a **Dither assistant** for the detector alignment. See [Aligning the detector](#-aligning-the-detector-dither).
+- **Lock Diagnostics:** A **Focus curve** that measures the error slope, peaks and capture range around the lock point, and a **Hold test** that measures how still the locked focus actually stays. See [Diagnosing a noisy lock](#-diagnosing-a-noisy-lock).
 - **Joystick Lockout:** The joystick wheel is disabled while an axis is locked and restored when it unlocks. See [Joystick lockout](#-joystick-lockout).
 - **Lock-Offset Setpoint:** `ASICrispController` can read and write the servo's lock offset in counts or microns, for hosts that want to hold a deliberately shifted focus plane (e.g. a per-wavelength chromatic correction).
 - **Native Integration:** Built on `qtpy` and reuses `pymmcore-widgets` property controls to match `pymmcore-gui`.
@@ -48,28 +48,46 @@ Once installed, launch `pymmcore-gui`. CRISPy will automatically register itself
 1. Open `pymmcore-gui` and load your Hardware Configuration.
 1. Navigate to **Plugins -> CRISPy**.
 1. The plugin will automatically discover all loaded ASI CRISP devices.
-1. Follow the 3-step calibration in each axis's **Calibration** box:
-   - **Step 1:** Run Log Cal (wait for a green SNR).
-   - **Step 2:** Run Dither (wait for a low Dither Error).
+1. Focus on your sample, then follow the 3-step calibration in each axis's **Calibration** box:
+   - **Step 1:** Log Cal. Aim for SNR > 4 dB (at least 2); if it is low, raise LED Intensity and repeat.
+   - **Step 2:** Dither. Turn the detector lateral adjustment screw for the largest |Err| (see [Aligning the detector](#-aligning-the-detector-dither)).
    - **Step 3:** Set Gain.
 1. Use **Set Ready** to turn the LED on and **Lock** to engage the servo. **Set Offset** re-zeroes the focus error at the current position and **Save to Controller** writes the settings to the controller's NVRAM.
 
-Telemetry is polled only while a panel is visible and pauses automatically during a Multi-Dimensional Acquisition so the Tiger serial port stays free. The **Poll** checkbox and interval (100 ms to 10 s, default 750 ms) are in each panel.
+Telemetry is polled only while a panel is visible and pauses automatically during a Multi-Dimensional Acquisition so the Tiger serial port stays free. Each tick reads the state, Dither Error and Sum. The rest (SNR is fixed at Log Cal; the calibration values change only on recalibration) is read every 10 s, after a button press and when the state changes. The **Poll** checkbox and interval (100 ms to 10 s, default 750 ms) are in each panel. ASI's own plugin suggests turning polling off once calibration is done.
 
-## 🎛️ Tuning the detector knob
+## 🎛️ Aligning the detector (Dither)
 
-The CRISP unit has a physical knob that moves the line detector. It has no software readout, so the best setting can only be found by sweeping it and watching a peak-held metric. The normal readouts are too slow for that: they poll every 750 ms and the fluctuation figure averages the last 20 polls.
+From the [ASI CRISP manual](https://docs.asiimaging.com/crisp_manual): in the Dither state the focus moves up and down by the calibration range, and the Err number is the *change* in error across that move. Slowly turn the **detector lateral adjustment screw** on the CRISP unit for the largest **absolute** Err (large negative numbers are as good as large positive ones). Pause after each adjustment, because moving the detector gives large temporary values. Aim for at least ±100 (ASI's plugin; the manual says > 50, and > 200 is "plenty of signal"), with Sum staying in 50-80. If Sum ends up outside that band, redo Log Cal.
 
-Press **Start Tune** in a panel (the LED must be on):
+Pressing **2. Dither** opens the **Dither** tab and starts the assistant (or press **Watch** if the controller is already dithering):
 
-- It samples only SNR, Sum and Dither Error, as fast as the controller allows (capped at 100 Hz), and shows the achieved rate.
-- Each metric is averaged over a short window (default 0.5 s, adjustable) and the best value seen is held next to the live one.
-- The **meter** shows the live value as a percentage of the best seen. Choose whether it follows SNR, Sum or Stability (lowest error fluctuation).
-- Sweep the knob, note the peak, then back up until the live value matches it. **Reset peak** starts a fresh sweep.
+- It reads only Dither Error and Sum, as fast as the link allows, and shows the rate.
+- The big number is the median of |Err| over a short window (default 1 s), so brief spikes are ignored.
+- The **peak** is the best value seen while the readings were steady (the window's thirds agree within 10%), so a temporary value from moving the detector can't become the peak, however long it takes to decay. "settling…" means it hasn't settled yet.
+- The trace shows the last 30 s with the 100 and 200 marks; the raw readings are the grey dots.
+- Sum is checked against 50-80; 0 or 100 means a detector half is saturated.
 
-While tuning, normal polling is paused so only one reader uses the serial port, and the Readouts box is marked as paused because its values freeze. Tune stops when the panel is hidden or closed or an acquisition starts, and shows "no data from the controller" if samples stop arriving.
+The normal poll pauses while it runs, so only one reader uses the serial port. It stops by itself when the state leaves Dither (while dithering, the controller's sub-states read as "Calibrating", which counts), when the panel is hidden or closed, and when an acquisition starts.
 
-The controller's own **Number of Averages** and **Update Skips** limit how often these values can change. CRISPy never changes them for you, because they write controller state; lower them yourself if the rate is still too slow.
+## 🔬 Diagnosing a noisy lock
+
+The locked error number is measured *inside* the feedback loop, so it can look quiet while the focus moves. On this rig's 2026-08-14 log, the locked piezo's error stayed within ±9 counts while the piezo moved ~100 nm between samples. Measure the focus motion instead, and change one thing at a time.
+
+1. **Check the calibration.** SNR > 4 dB, Sum 50-80, and a dither |Err| of at least 100. A Sum of 0 or 100 means the detector is saturated; redo Log Cal.
+1. **Run a Focus curve** (in Ready, after Set Offset). It steps the focus actuator through ±10 µm around its position (adjustable), reads the error at each step and returns it to the start. It reports:
+   - the **slope** at the lock point in counts/µm, next to the calibration's own figure (if they differ a lot, the calibration may predate the last alignment);
+   - how far the lock point is from the curve's **peaks** (a lock point close to a peak is hard to hold);
+   - the **capture range**;
+   - the **noise floor**: error noise ÷ slope, i.e. how much focus motion the sensor noise alone implies.
+1. **Run a Hold test** (locked, sitting still). It records the actuator's own position for 60 s (adjustable) and splits it into **drift** (the trend, nm/min), **wander** (how much the 1 s averages move) and **jitter** (the spread within each second). It also reports the error rms and whether the lock offset changed. The lock settings are recorded with each run, and the last runs sit side by side in a table.
+1. **Change one setting** in the Parameters box and run the Hold test again. ASI's levers for a still sample:
+   - **Averages (2^N)**: "N of 5 to 8 with reduced loop gain (LR T=1 to 5) can … hold the focus very still". Too much averaging adds delay and can oscillate.
+   - **Update rate (ms)**: "Increase Update_Rate to improve stability when using piezo Z-axis drive systems" (piezo default 5 ms); raise Loop Gain as you do.
+   - **Loop Gain**: reduce it if the lock jitters or oscillates.
+1. To see whether polling itself disturbs the lock, run the Hold test once at a low rate and once at a high rate.
+
+CRISPy never changes these settings for you; it only measures. Both tools pause the normal poll, stop when the panel is hidden or an acquisition starts, and can save their data as CSV.
 
 ## 🕹️ Joystick lockout
 
@@ -81,7 +99,14 @@ The wheel binding is the stage's `JoystickInput` property. The value to restore 
 
 ## 🧪 Demo Mode (No Hardware Required)
 
-CRISPy includes a standalone test harness that mocks the Micro-Manager core. It models two axes taken from a real controller dump, a Z stage and a piezo, so the actuator badge, calibration and sensitivity readouts, micron conversion and fluctuation metric all run without hardware. It also simulates a virtual detector knob sweeping back and forth, with a bump in SNR and Sum and quieter error near the optimum, plus a simulated serial delay per property read, so you can try **Tune** on your desk.
+CRISPy includes a standalone test harness that mocks the Micro-Manager core. It models two axes based on a real controller dump, a Z stage and a piezo, each as a small simulation that follows the manual:
+
+- an S-shaped focus curve whose slope depends on the detector screw;
+- a fixed SNR;
+- a dither Err with temporary jumps when the screw moves;
+- lock jitter that scales with noise ÷ slope and drops with averaging.
+
+A **Demo controls** dock stands in for the screw and the Averages / Loop Gain settings; the piezo starts badly aligned. Every property read has a simulated serial delay. None of the numbers are measurements.
 
 The demo needs a Qt binding in the environment. The `pymmcore-gui` environment has one; otherwise add one for the run:
 
@@ -124,6 +149,7 @@ CRISPy strictly adheres to Separation of Concerns (SoC) and DRY principles. All 
 
 - **`controller.py`**: The Hardware Interface. `ASICrispController` wraps the shared core to write the settable `CRISP State` values (`loG_cal`, `Dither`, `gain_Cal`, `Ready`, `Lock`, ...), read the calibration gain, range and sensitivity, switch the joystick, and read and write the lock-offset setpoint.
 - **`discovery.py`**: The Device Finder. Finds the loaded CRISP autofocus devices, pairs each with its ASITiger stage (same axis letter and hex address) and classifies that actuator as a piezo or a stage.
-- **`tuning.py`**: Fast Tune mode, with no Qt dependency. It reads SNR, Sum and Dither Error, keeps the rolling window and peak-hold, and runs the sampler thread.
-- **`ui.py`**: The Visuals. `CrispControlPanel` is a Qt-native panel for one axis that reuses `pymmcore-widgets` property controls for the adjustable parameters.
+- **`dither.py`**, **`focus_curve.py`**, **`hold.py`**: The diagnostics, with no Qt dependency: the Dither assistant's tracker, the focus-curve scan and analysis, and the hold test's recorder and analysis.
+- **`sampling.py`**: The fast reader thread and read helpers the diagnostics share.
+- **`ui.py`** and **`plot.py`**: The Visuals. `CrispControlPanel` is a Qt-native panel for one axis that reuses `pymmcore-widgets` property controls for the adjustable parameters; `plot.py` is a small QPainter plot for the diagnostics.
 - **`plugin.py`**: The Entry Point. Registered via `pyproject.toml` entry points. Acts as the orchestrator, querying discovery, instantiating controllers, and building the panels (single, splitter or tabs).

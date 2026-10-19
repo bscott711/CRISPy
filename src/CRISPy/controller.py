@@ -52,6 +52,8 @@ class CrispController(Protocol):
     def label(self) -> str: ...
     @property
     def actuator_type(self) -> ActuatorType: ...
+    @property
+    def actuator_label(self) -> str | None: ...
     def set_state(self, state: str) -> None: ...
     def set_log_cal(self) -> None: ...
     def set_dither(self) -> None: ...
@@ -99,6 +101,15 @@ class ASICrispController:
     def actuator_type(self) -> ActuatorType:
         """``"piezo"``, ``"stage"``, or ``"unknown"`` for the paired focus device."""
         return self._actuator_type
+
+    @property
+    def actuator_label(self) -> str | None:
+        """Label of the stage device this axis drives (e.g. ``PiezoStage:P:34``).
+
+        ``None`` if no ASITiger stage with the same axis letter and hex address is
+        loaded.
+        """
+        return self._joystick_stage_label
 
     def set_state(self, state: str) -> None:
         """Write an exact ASITiger ``CRISP State`` value (e.g. ``"Lock"``)."""
