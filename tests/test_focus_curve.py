@@ -236,6 +236,25 @@ def test_the_scan_stays_inside_reported_travel_limits() -> None:
     assert core.z == 2.5
 
 
+def test_limits_follow_a_flipped_axis_polarity() -> None:
+    # "Positive towards sample": positions are negated in software, the controller's
+    # limits are not. Controller limits 0 .. 0.150 mm are -150 .. 0 µm here, so a
+    # start at -2.5 µm is 2.5 µm below the top.
+    class Flipped(FakeCore):
+        def getProperty(self, label: str, prop: str) -> str:
+            if label == ACT and prop == "AxisPolarity":
+                return "Positive towards sample"
+            return super().getProperty(label, prop)
+
+    core = Flipped(z0=-2.5, focus=-2.5, reported_limits_mm=(0.0, 0.150))
+    scan = _run(core)
+    assert scan.limits_um == pytest.approx((-150.0, 0.0))
+    assert scan.limited_high and not scan.limited_low
+    assert max(core.moves) == pytest.approx(0.0)  # never commanded past the limit
+    assert scan.points[-1].z_um == pytest.approx(2.5)
+    assert scan.points[0].z_um == pytest.approx(-6.0)
+
+
 def test_limits_that_dont_bracket_the_start_are_ignored() -> None:
     # Unset (0, 0) or in another frame: fall back to reading the position back.
     for limits in ((0.0, 0.0), (0.1, 0.2)):

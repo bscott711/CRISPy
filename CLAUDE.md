@@ -124,7 +124,15 @@ micro-manager/mmCoreAndDevices).
   is clamped or rejected, so the scan clips to `LowerLim(mm)` / `UpperLim(mm)` (when they
   bracket the start), reads the position back after every move, leaves out positions it
   didn't reach, and places points at the measured position. Before this, points were at
-  the *commanded* offset, so a clamped actuator plotted as a flat stretch.
+  the *commanded* offset, so a clamped actuator plotted as a flat stretch. The limits are
+  in the controller's coordinates: with the adapter's `AxisPolarity` at "Positive
+  towards sample" (positions negated in software) they are negated and swapped.
+- **The rig's Z sign was flipped on 2026-10-20** (`AxisPolarity` = "Positive towards
+  sample" in the System/Startup preset of `hardware_profiles/20260630-OPM.cfg`): positive
+  now moves the 1.49 objective up. In the Z focus curves recorded before that, positive
+  moved it down, so the steep crossings at +15.5 / +17.6 / +25.1 µm were on the
+  objective-down side (toward the coverslip, if the objective is below it); later Z
+  curves show them mirrored, at negative z.
 - **The rig's piezo focus curve (2026-10-19, ±30 µm, recorded before that fix).** Lock
   point +0.06 µm (after Set Offset), slope −18.7 counts/µm; the error rises to ~+20 by
   −2.5 µm and then sits flat at ~+12-17 to −30 µm; above, it ramps to −460 by +30 µm

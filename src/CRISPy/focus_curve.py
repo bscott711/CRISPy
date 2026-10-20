@@ -71,9 +71,14 @@ _OTHER_MIN_STEEPNESS = 0.25
 # clean curve stays well under it.
 _SMOOTH_ABOVE_COUNTS = 1.0
 _SMOOTH_HALF_WIDTH_UM = 0.4
-# ASI stages and piezos report their firmware travel limits (SL / SU) in mm.
+# ASI stages and piezos report their firmware travel limits (SL / SU) in mm, in the
+# controller's coordinates.
 LOWER_LIMIT_PROP = "LowerLim(mm)"
 UPPER_LIMIT_PROP = "UpperLim(mm)"
+# The adapter's AxisPolarity: "Positive towards sample" flips the sign of positions in
+# software only (ASI's default is "Negative towards sample"), so the limits flip too.
+AXIS_POLARITY_PROP = "AxisPolarity"
+FLIPPED_POLARITY = "Positive towards sample"
 # A position counts as reached when the actuator reads back within this distance of it
 # (or half a step, if that is larger).
 REACH_TOL_UM = 0.2
@@ -174,7 +179,9 @@ def travel_limits_um(
 ) -> tuple[float, float] | None:
     """The actuator's firmware travel limits in µm, if it reports usable ones.
 
-    Reads the ASITiger ``LowerLim(mm)`` / ``UpperLim(mm)`` properties. A pair that
+    Reads the ASITiger ``LowerLim(mm)`` / ``UpperLim(mm)`` properties. They are in the
+    controller's coordinates, so with ``AxisPolarity`` set to "Positive towards
+    sample" (positions negated in software) they are negated and swapped. A pair that
     doesn't bracket the current position *z0_um* (unset, or in another coordinate
     frame) is ignored: the scan then relies on reading the position back.
 
@@ -192,6 +199,8 @@ def travel_limits_um(
     if lo is None or hi is None:
         return None
     lo, hi = lo * 1000.0, hi * 1000.0
+    if read_str(mmcore, actuator, AXIS_POLARITY_PROP) == FLIPPED_POLARITY:
+        lo, hi = -hi, -lo
     if not lo < hi or not lo <= z0_um <= hi:
         return None
     return lo, hi
