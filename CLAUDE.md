@@ -137,7 +137,12 @@ micro-manager/mmCoreAndDevices).
   point +0.06 µm (after Set Offset), slope −18.7 counts/µm; the error rises to ~+20 by
   −2.5 µm and then sits flat at ~+12-17 to −30 µm; above, it ramps to −460 by +30 µm
   without turning over. The flat stretch is most likely the piezo stopped at its lower
-  limit about 2.5 µm below focus (unconfirmed: needs the position and `LowerLim(mm)`).
+  limit about 2.5 µm below focus. That fits the user's positions (2026-10-20): the
+  piezo's 0 is kept at the center of its 150 µm travel (so about −75 … +75 µm; it gets
+  no "Zero" in the stage panel), and the snouty's image is in focus at −70 µm, out of
+  focus at −65 and −75: best focus sits ~5 µm above the lower limit. A piezo's focus
+  curve defaults to ±5 µm (`DEFAULT_PIEZO_HALF_RANGE_UM`). The Z axis was zeroed by the
+  user at image focus the same day.
   The piezo's reference reflection is a flat mirror square to the air objective (O2)
   in its infinity space, back through O2 and the snouty; the user's design simulation
   says it behaves like a reflection at the snouty's face. Bench-verified: blocking the

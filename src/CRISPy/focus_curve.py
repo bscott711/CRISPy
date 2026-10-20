@@ -56,6 +56,9 @@ STATE_PROP = "CRISP State"
 LOCKED_STATES = frozenset({"Lock", "In Focus"})
 
 DEFAULT_HALF_RANGE_UM = 10.0
+# For a piezo: the rig's snouty image is out of focus 5 µm either side of best focus,
+# and best focus sits only ~5 µm above the piezo's lower limit (user, 2026-10-20).
+DEFAULT_PIEZO_HALF_RANGE_UM = 5.0
 DEFAULT_STEP_UM = 0.25
 DEFAULT_SETTLE_S = 0.05
 DEFAULT_READS = 3

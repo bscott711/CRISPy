@@ -79,6 +79,7 @@ from .dither import (
 )
 from .focus_curve import (
     DEFAULT_HALF_RANGE_UM,
+    DEFAULT_PIEZO_HALF_RANGE_UM,
     DEFAULT_READS,
     DEFAULT_SETTLE_S,
     DEFAULT_STEP_UM,
@@ -872,7 +873,11 @@ class CrispControlPanel(QWidget):
         self.curve_range = QDoubleSpinBox()
         self.curve_range.setRange(0.5, 50.0)
         self.curve_range.setDecimals(1)
-        self.curve_range.setValue(DEFAULT_HALF_RANGE_UM)
+        self.curve_range.setValue(
+            DEFAULT_PIEZO_HALF_RANGE_UM
+            if self.controller.actuator_type == "piezo"
+            else DEFAULT_HALF_RANGE_UM
+        )
         self.curve_range.setPrefix("± ")
         self.curve_range.setSuffix(" µm")
         self.curve_step = QDoubleSpinBox()
