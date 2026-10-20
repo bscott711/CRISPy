@@ -40,14 +40,56 @@ def _no_hooks():
 
 
 def test_a_sharper_image_scores_higher() -> None:
-    scores = [focus_score(blurred(s)) for s in (0.0, 1.0, 2.0, 4.0)]
+    # Optics blur any real image over more than a pixel; from there, sharper is higher.
+    scores = [focus_score(blurred(s)) for s in (1.0, 1.5, 2.5, 4.0)]
     assert scores == sorted(scores, reverse=True)
     assert scores[0] > 3 * scores[-1]
 
 
-def test_the_score_ignores_brightness() -> None:
-    img = blurred(1.0)
+def test_the_score_ignores_brightness_and_the_camera_offset() -> None:
+    img = blurred(1.5)
     assert focus_score(img * 7.0) == pytest.approx(focus_score(img))
+    assert focus_score(img + 500.0) == pytest.approx(focus_score(img))
+
+
+def _dim_noisy_scan(seed: int = 0) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Dim cells, camera noise as large as the structure, best focus at z = +1.
+
+    Like the rig's piezo scan of 2026-10-20 (2400 px, mean ~20 counts above a ~100
+    count offset), where a plain Brenner gradient moved 1% across the scan.
+    """
+    rng = np.random.default_rng(seed)
+    size = 600
+    f = np.fft.fftfreq(size)
+    f2 = f[:, None] ** 2 + f[None, :] ** 2
+    cells = np.real(
+        np.fft.ifft2(
+            np.fft.fft2(rng.random((size, size))) * np.exp(-2 * (np.pi * 4) ** 2 * f2)
+        )
+    )
+    cells = (cells - cells.min()) / (cells.max() - cells.min()) * 40.0
+    spectrum = np.fft.fft2(cells)
+    zs = np.arange(-3.0, 3.01, 0.5)
+    frames = []
+    for z in zs:
+        sigma = 1.0 + 3.0 * abs(z - 1.0)
+        img = np.real(np.fft.ifft2(spectrum * np.exp(-2 * (np.pi * sigma) ** 2 * f2)))
+        frames.append(img + 100.0 + rng.normal(0, 15.0, img.shape))
+    return zs, frames
+
+
+def test_the_score_finds_focus_in_dim_noisy_images() -> None:
+    zs, frames = _dim_noisy_scan()
+    scores = np.array([focus_score(f) for f in frames])
+    assert zs[scores.argmax()] == pytest.approx(1.0, abs=0.5)
+    assert scores.min() < 0.5 * scores.max()  # it moves, unlike a plain gradient
+
+    def plain_brenner(a: np.ndarray) -> float:
+        d = a[:, 2:] - a[:, :-2]
+        return float(np.mean(d * d) / a.mean() ** 2)
+
+    plain = np.array([plain_brenner(f) for f in frames])
+    assert plain.min() > 0.9 * plain.max()  # what the panel showed on the rig
 
 
 def test_degenerate_images_score_zero() -> None:

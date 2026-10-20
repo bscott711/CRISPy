@@ -38,6 +38,9 @@ if TYPE_CHECKING:
     SnapProvider = Callable[[], Mapping[str, np.ndarray]]
     ImageViewFactory = Callable[[str], Any]
 
+# focus_score bins an image to about this many pixels on its short side.
+SCORE_SIDE_PX = 300
+
 _provider: SnapProvider | None = None
 _view_factory: ImageViewFactory | None = None
 
@@ -119,13 +122,37 @@ def _grey(img: np.ndarray) -> np.ndarray:
     return a.astype(np.float64, copy=False)
 
 
-def focus_score(img: np.ndarray) -> float:
-    """How sharp an image is: higher is sharper.
+def _binned(a: np.ndarray, b: int) -> np.ndarray:
+    if b <= 1:
+        return a
+    h, w = (a.shape[0] // b) * b, (a.shape[1] // b) * b
+    return a[:h, :w].reshape(h // b, b, w // b, b).mean(axis=(1, 3))
 
-    The Brenner gradient (mean squared difference between pixels two apart, along both
-    axes) divided by the mean intensity squared, so scaling the brightness doesn't
-    change it. Defocus spreads the light without changing its total, so across a scan
-    the score peaks where the image is in focus.
+
+def _mean_sq_diff(a: np.ndarray, lag: int) -> float:
+    dx = a[:, lag:] - a[:, :-lag]
+    dy = a[lag:, :] - a[:-lag, :]
+    return float(np.mean(dx * dx) + np.mean(dy * dy))
+
+
+def focus_score(img: np.ndarray) -> float:
+    """How sharp an image is: higher is sharper (0 for no usable structure).
+
+    Built for dim fluorescence images whose camera noise is as large as the structure
+    (the rig's 2026-10-20 piezo scan: mean ~20 counts above a ~100 count offset, where a
+    plain Brenner gradient moved by 1% across the whole scan):
+
+    1. Bin the image so its short side is about ``SCORE_SIDE_PX`` (8×8 on a 2400 px
+       sensor): defocus shows at that scale, and binning averages the noise down.
+    2. Gradient energy with the noise cancelled: the mean squared difference between
+       pixels two apart minus that between neighbours. Pixel noise is uncorrelated, so
+       it adds the same to both and drops out; structure, blurred by the optics over
+       more than a pixel, differs more over two pixels than over one.
+    3. Divide by the signal squared: the mean above the 1st percentile (the camera's
+       dark offset), so brightness, bleaching and the offset don't change the score.
+
+    Defocus spreads the light without changing its total, so across a scan the score
+    peaks where the image is in focus.
 
     Parameters
     ----------
@@ -133,14 +160,16 @@ def focus_score(img: np.ndarray) -> float:
         A 2-D image (an RGB image is averaged over its colours first).
     """
     a = _grey(img)
-    if a.ndim != 2 or a.shape[0] < 3 or a.shape[1] < 3:
+    if a.ndim != 2 or min(a.shape) < 3:
         return 0.0
-    mean = float(a.mean())
-    if mean <= 0:
+    a = _binned(a, max(1, round(min(a.shape) / SCORE_SIDE_PX)))
+    if min(a.shape) < 3:
         return 0.0
-    dx = a[:, 2:] - a[:, :-2]
-    dy = a[2:, :] - a[:-2, :]
-    return float((np.mean(dx * dx) + np.mean(dy * dy)) / (mean * mean))
+    signal = float(a.mean() - np.percentile(a, 1))
+    if signal <= 0:
+        return 0.0
+    energy = _mean_sq_diff(a, 2) - _mean_sq_diff(a, 1)
+    return max(0.0, energy / (signal * signal))
 
 
 class FrameStore:

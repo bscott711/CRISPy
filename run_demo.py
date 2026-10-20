@@ -329,7 +329,7 @@ class SimCamera:
                     self.piezo_offset_um if ax.label.endswith("P:34") else 0.0
                 )
                 defocus2 += (ax.z + ax.own - best) ** 2
-        sigma = 0.7 + 3.0 * math.sqrt(defocus2)  # blur, pixels
+        sigma = 1.2 + 3.0 * math.sqrt(defocus2)  # blur, pixels (optics: > 1 px)
         img = np.real(
             np.fft.ifft2(self.spectrum * np.exp(-2 * (math.pi * sigma) ** 2 * self.f2))
         )

@@ -170,7 +170,7 @@ def _snapper(core: FakeCore, best: float):
     from test_imaging import blurred
 
     def snap() -> dict:
-        return {"Camera-1": blurred(0.5 + 1.5 * abs(core.z - best), size=48)}
+        return {"Camera-1": blurred(1.0 + 0.3 * abs(core.z - best), size=64)}
 
     return snap
 
@@ -185,7 +185,7 @@ def test_the_scan_scores_an_image_at_each_position() -> None:
     )
     assert all(set(p.scores) == {"Camera-1"} for p in scan.points)
     assert [p for p, _ in seen] == scan.points
-    assert all(f["Camera-1"].shape == (48, 48) for _, f in seen)  # full frames
+    assert all(f["Camera-1"].shape == (64, 64) for _, f in seen)  # full frames
     sharp = sharpest_position(scan.points, "Camera-1")
     assert sharp is not None
     z, inside = sharp

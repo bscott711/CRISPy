@@ -166,17 +166,32 @@ micro-manager/mmCoreAndDevices).
 - **Hold-test error is detrended, with its trend reported.** In an unlocked run the
   actuator stands still, so an error trend is the optics or sensor drifting; ÷ slope it
   is the drift a lock would follow. Without detrending, a ramp of R counts gives R/√12.
-  The plot draws the error as well as the position (the user's ask: unlocked, the
+  An unlocked run's plot draws the error as well as the position (the user's ask: the
   position is flat and the error is the measure of how things move): with a measured
-  slope as −error/slope in nm on the position's axis, otherwise in counts (unlocked).
+  slope as −error/slope in nm on the position's axis, otherwise in counts. A locked
+  run's plot shows only the position: drawn as focus, the in-loop error (±5 counts of
+  sensor noise, ≈ ±300-700 nm "worth" on the rig's piezo) swamped the 30-40 nm the
+  piezo actually moved; the summary states it in words.
 - **Rig, 2026-10-20 (after the day's alignment, piezo NA set to 1.00):** SNR 5.1 dB,
   Sum 61, Cal Gain 580, Cal Range 1.499 µm; locked in-loop error ±4.9 counts rms. A
   locked 60 s hold test: the piezo ramped +1008 nm/min steadily, with jitter 48 nm and
   wander 50 nm about the ramp (Averages 1, Loop Gain 4, Update 10 ms, LED 36). Whether
-  the lock tracked a real drift or a drifting reference is open (camera check).
+  the lock tracked a real drift or a drifting reference is open (camera check). Later
+  that day (the piezo at −72.5 µm) a locked 60 s run had drift
+  −0.2 nm/min, jitter 33 nm, wander 20 nm, pk-pk 225 nm: the ramp had stopped.
 - **The Focus curve can snap an image at each position** (the user's ask: see the image
-  go in and out of focus). Each image's sharpness (Brenner gradient / mean²) peaks where
+  go in and out of focus). Each image's sharpness (`imaging.focus_score`) peaks where
   the image is in focus; the summary gives that position's distance from the lock point.
+  The rig's images are dim: on the 2026-10-20 piezo scan (2400 px, both cameras) the
+  mean was only ~17-25 counts above a ~100 count offset and constant (no bleaching), and
+  a plain Brenner gradient / mean² moved 1% across the scan (pixel noise dominates), its
+  "sharpest" picked by noise. So the score bins to ~300 px, cancels uncorrelated pixel
+  noise (lag-2 minus lag-1 mean squared differences) and divides by the signal above the
+  1st percentile (the dark offset). On those frames it fell 2-3× from −75 to −67.75 µm on
+  both cameras, matching same-contrast crops (sharpest at −75 … −72.5 µm, at the travel
+  limit); CRISP's lock point was −72.4 µm. The user had judged image focus at ~−70 µm by
+  eye earlier. A pixel-white pattern scores 0 (it cancels like noise); real images are
+  blurred by the optics over more than a pixel.
   On the rig the core can't snap: pymmcore-gui hands Camera-1/Camera-2 to worker
   processes for the whole session and fires the lasers around each Snap. So snapping
   goes through a host hook, `imaging.set_snap_provider()`, which pymmcore-gui's

@@ -2014,21 +2014,22 @@ class CrispControlPanel(QWidget):
             self._paint_hold(self._hold_samples, locked=locked)
 
     def _paint_hold(self, samples: list[HoldSample], *, locked: bool) -> None:
-        """Plot the position and the error over time.
+        """Plot the position over time, and for an unlocked run the error too.
 
-        With a measured slope both go on one nm axis: the error as the move a lock
-        would make to cancel it (-error / slope). Unlocked, the actuator stands still,
-        so that trace is how the focus moves without the lock. Without a slope, an
-        unlocked run shows the error in counts and a locked run the position.
+        Unlocked, the actuator stands still, so the error is how the focus moves
+        without the lock: with a measured slope it goes on the position's nm axis as the
+        move a lock would make to cancel it (-error / slope), otherwise in counts. A
+        locked run's error is in-loop (mostly sensor noise the lock averages out), so
+        drawn as focus it would look like motion that isn't there; only the position.
         """
         pos = [(s.t, s.position_um) for s in samples if s.position_um is not None]
-        err = [(s.t, s.error) for s in samples if s.error is not None]
+        err = [] if locked else [(s.t, s.error) for s in samples if s.error is not None]
         slope = self._measured_slope
         series: list[Series] = []
         label = "position (nm)"
         if slope and err:
             label = "nm: position (blue), error ÷ slope (orange)"
-        elif err and not locked:
+        elif err:
             label = "error (counts); run a Focus curve to see it in nm"
             pos = []
         if pos:
@@ -2041,7 +2042,7 @@ class CrispControlPanel(QWidget):
                     1.4,
                 )
             )
-        if err and (slope or not locked):
+        if err:
             scale = -1000.0 / slope if slope else 1.0
             series.append(
                 Series(
@@ -2099,12 +2100,21 @@ class CrispControlPanel(QWidget):
                     f" trend and drifted {s.error_drift_per_min:+.1f} counts/min (run a"
                     " Focus curve to see these in nm)."
                 )
-        elif s.drift_nm_per_min is not None and abs(s.drift_nm_per_min) >= 200:
-            summary += (
-                " A steady drift while locked is the lock following something: if"
-                " the image stays sharp, the focus itself drifted (mechanics,"
-                " temperature); if it blurs, CRISP's reference drifted."
-            )
+        else:
+            sens = self._measured_slope
+            if s.error_rms is not None and sens and s.rms_nm is not None:
+                summary += (
+                    f" The in-loop error was {s.error_rms:.1f} counts rms (≈"
+                    f" {s.error_rms / abs(sens) * 1000:.0f} nm if it were focus); the"
+                    f" actuator moved {s.rms_nm:.0f} nm rms, so most of that is sensor"
+                    " noise the lock averages out."
+                )
+            if s.drift_nm_per_min is not None and abs(s.drift_nm_per_min) >= 200:
+                summary += (
+                    " A steady drift while locked is the lock following something: if"
+                    " the image stays sharp, the focus itself drifted (mechanics,"
+                    " temperature); if it blurs, CRISP's reference drifted."
+                )
         change = result.lock_offset_change
         if change:
             summary += (
