@@ -1625,32 +1625,59 @@ class CrispControlPanel(QWidget):
             self.hold_status.setText(
                 f"Recording… {sample.t:.0f} / {self.hold_duration.value()} s"
             )
-            self._paint_hold(self._hold_samples)
+            locked = self._hold.locked if self._hold is not None else True
+            self._paint_hold(self._hold_samples, locked=locked)
 
-    def _paint_hold(self, samples: list[HoldSample]) -> None:
+    def _paint_hold(self, samples: list[HoldSample], *, locked: bool) -> None:
+        """Plot the position and the error over time.
+
+        With a measured slope both go on one nm axis: the error as the move a lock
+        would make to cancel it (-error / slope). Unlocked, the actuator stands still,
+        so that trace is how the focus moves without the lock. Without a slope, an
+        unlocked run shows the error in counts and a locked run the position.
+        """
         pos = [(s.t, s.position_um) for s in samples if s.position_um is not None]
-        if not pos:
-            self.hold_plot.clear()
-            return
-        z_first = pos[0][1]
-        self.hold_plot.set_data(
-            [
+        err = [(s.t, s.error) for s in samples if s.error is not None]
+        slope = self._measured_slope
+        series: list[Series] = []
+        label = "position (nm)"
+        if slope and err:
+            label = "nm: position (blue), error ÷ slope (orange)"
+        elif err and not locked:
+            label = "error (counts); run a Focus curve to see it in nm"
+            pos = []
+        if pos:
+            z_first = pos[0][1]
+            series.append(
                 Series(
                     [t for t, _ in pos],
                     [(z - z_first) * 1000.0 for _, z in pos],  # type: ignore[operator]
                     _BLUE,
                     1.4,
                 )
-            ],
-            hlines=[RefLine(0.0, _GREY)],
-        )
+            )
+        if err and (slope or not locked):
+            scale = -1000.0 / slope if slope else 1.0
+            series.append(
+                Series(
+                    [t for t, _ in err],
+                    [e * scale for _, e in err],  # type: ignore[operator]
+                    _ORANGE,
+                    1.0,
+                )
+            )
+        if not series:
+            self.hold_plot.clear()
+            return
+        self.hold_plot.set_y_label(label)
+        self.hold_plot.set_data(series, hlines=[RefLine(0.0, _GREY)])
 
     def _on_hold_done(self, result: HoldResult) -> None:
         self._hold = None
         self._hold_results.insert(0, result)
         del self._hold_results[_HOLD_RESULTS_KEPT:]
         self._end_tool(_HOLD)
-        self._paint_hold(result.samples)
+        self._paint_hold(result.samples, locked=result.locked)
         self._fill_hold_table()
         s = result.stats
         mode = "Locked" if result.locked else "Unlocked"
@@ -1680,6 +1707,12 @@ class CrispControlPanel(QWidget):
                 summary += (
                     f" The error drifted {s.error_drift_per_min:+.1f} counts/min: a lock"
                     f" would move the actuator ≈ {follow:+.0f} nm/min to follow it."
+                )
+            elif s.error_rms is not None and s.error_drift_per_min is not None:
+                summary += (
+                    f" The error scattered {s.error_rms:.1f} counts rms about its"
+                    f" trend and drifted {s.error_drift_per_min:+.1f} counts/min (run a"
+                    " Focus curve to see these in nm)."
                 )
         elif s.drift_nm_per_min is not None and abs(s.drift_nm_per_min) >= 200:
             summary += (

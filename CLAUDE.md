@@ -150,6 +150,9 @@ micro-manager/mmCoreAndDevices).
 - **Hold-test error is detrended, with its trend reported.** In an unlocked run the
   actuator stands still, so an error trend is the optics or sensor drifting; ÷ slope it
   is the drift a lock would follow. Without detrending, a ramp of R counts gives R/√12.
+  The plot draws the error as well as the position (the user's ask: unlocked, the
+  position is flat and the error is the measure of how things move): with a measured
+  slope as −error/slope in nm on the position's axis, otherwise in counts (unlocked).
 - **Rig, 2026-10-20 (after the day's alignment, piezo NA set to 1.00):** SNR 5.1 dB,
   Sum 61, Cal Gain 580, Cal Range 1.499 µm; locked in-loop error ±4.9 counts rms. A
   locked 60 s hold test: the piezo ramped +1008 nm/min steadily, with jitter 48 nm and

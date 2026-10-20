@@ -122,6 +122,12 @@ class LinePlot(QWidget):
     def clear(self) -> None:
         self.set_data()
 
+    def set_y_label(self, text: str) -> None:
+        """Change the y-axis title."""
+        if text != self._y_label:
+            self._y_label = text
+            self.update()
+
     # ------------------------------------------------------------------ ranges
     def _ranges(self) -> tuple[float, float, float, float] | None:
         f = self._frame

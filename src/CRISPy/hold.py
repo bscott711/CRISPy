@@ -257,6 +257,11 @@ class HoldTest:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def locked(self) -> bool:
+        """Whether this is a locked run (CRISP driving) or an unlocked one."""
+        return self._locked
+
     def start(self) -> None:
         if self.running:
             return

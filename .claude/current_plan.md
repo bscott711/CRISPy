@@ -76,3 +76,12 @@ error-ramp hold case; all earlier tests unchanged); ruff at the baseline. Render
 through the real panel with curves and hold runs traced from the screenshots: piezo
 slope −16.1, no peaks, capture ≥ ±10 µm, scatter ±2.9 counts ≈ 179 nm; Z noise line
 "one count = 80 nm"; unlocked ramp → "a lock would move the actuator ≈ +981 nm/min".
+
+## Addendum: the hold plot shows the error (2026-10-20)
+
+The user: an unlocked hold test plotted a flat line (the piezo stands still), but the
+error moves, and that is the measure of how things move without the lock. The plot now
+draws the error too: with a measured slope as −error/slope in nm on the position's axis
+(the move a lock would make), otherwise in counts for an unlocked run. The unlocked
+summary gives the error's rms and trend in counts when there is no slope. Rendered
+through the real panel for unlocked (with and without a slope) and locked runs.
