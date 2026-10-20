@@ -791,15 +791,16 @@ class CrispControlPanel(QWidget):
         cols = [
             "Started",
             "Mode",
-            "Averages",
-            "Loop Gain",
-            "Update (ms)",
-            "LED %",
             "Drift nm/min",
             "Jitter nm",
             "Wander nm",
             "pk-pk nm",
             "Err rms",
+            "Err /min",
+            "Averages",
+            "Loop Gain",
+            "Update (ms)",
+            "LED %",
             "Note",
         ]
         self.hold_table = QTableWidget(0, len(cols))
@@ -810,7 +811,8 @@ class CrispControlPanel(QWidget):
         self.hold_table.setToolTip(
             "Newest first. All after removing the drift (the straight-line trend).\n"
             "Jitter: rms spread within each second. Wander: rms of the 1 s averages.\n"
-            "pk-pk: largest minus smallest position."
+            "pk-pk: largest minus smallest position.\n"
+            "Err rms: the error about its trend. Err /min: the error's trend (counts/min)."
         )
         v.addWidget(self.hold_table)
         return tab
@@ -1485,24 +1487,43 @@ class CrispControlPanel(QWidget):
             f"<b>Capture range</b> {'≤ ' if a.capture_low_open else ''}{cap_lo} … "
             f"{'≥ ' if a.capture_high_open else ''}{cap_hi} µm."
         )
-        if a.noise_floor_nm is not None and a.noise_counts is not None:
-            if a.noise_counts <= 1.0:
-                lines.append(
-                    f"<b>Error noise</b> ±{a.noise_counts:.1f} counts, about one count "
-                    "of the readout, so it is mostly rounding: the readout can't show "
-                    f"focus noise below ≈ {a.noise_floor_nm:.0f} nm here. The real "
-                    "noise is smaller; the Hold test (actuator position) measures it."
-                )
-            else:
-                lines.append(
-                    f"<b>Error noise</b> ±{a.noise_counts:.1f} counts → focus noise "
-                    f"floor ≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)."
-                )
-        else:
-            lines.append(
-                "Use 2 or more reads per position to estimate the noise floor."
-            )
+        lines.append(self._curve_noise_text(a))
         return "<br>".join(lines)
+
+    @staticmethod
+    def _curve_noise_text(a: CurveAnalysis) -> str:
+        reads = ""
+        if a.noise_counts is not None:
+            reads = f"; the reads at one position agreed to ±{a.noise_counts:.1f}"
+        if a.scatter_counts is not None and a.scatter_counts > 1.0 and a.scatter_nm:
+            return (
+                f"<b>Error noise</b> ±{a.scatter_counts:.1f} counts rms from one "
+                f"position to the next, ≈ {a.scatter_nm:.0f} nm of focus at this "
+                f"slope{reads}."
+            )
+        biggest = max(
+            (n for n in (a.scatter_counts, a.noise_counts) if n is not None),
+            default=None,
+        )
+        if biggest is None:
+            return "Use 2 or more reads per position to estimate the noise floor."
+        if biggest <= 1.0:
+            one = (
+                f" (one count = {a.resolution_nm:.0f} nm here)"
+                if a.resolution_nm
+                else ""
+            )
+            return (
+                "<b>Error noise</b> about one count or less, i.e. mostly the readout's "
+                f"rounding: it can't show focus changes smaller than one count{one}. "
+                "The Hold test (actuator position) measures the real noise."
+            )
+        floor = (
+            f" → focus noise floor ≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)"
+            if a.noise_floor_nm is not None
+            else ""
+        )
+        return f"<b>Error noise</b> ±{biggest:.1f} counts{floor}."
 
     def _on_curve_save(self) -> None:
         if self._curve_scan is None:
@@ -1650,9 +1671,22 @@ class CrispControlPanel(QWidget):
             sens = self._measured_slope
             if s.error_rms is not None and sens:
                 summary += (
-                    f" The error's {s.error_rms:.1f} counts rms is the sensor noise:"
-                    f" ≈ {s.error_rms / abs(sens) * 1000:.0f} nm at the measured slope."
+                    f" The error's {s.error_rms:.1f} counts rms (about its trend) is"
+                    " the sensor and optics noise: ≈"
+                    f" {s.error_rms / abs(sens) * 1000:.0f} nm at the measured slope."
                 )
+            if s.error_drift_per_min is not None and sens:
+                follow = -s.error_drift_per_min / sens * 1000
+                summary += (
+                    f" The error drifted {s.error_drift_per_min:+.1f} counts/min: a lock"
+                    f" would move the actuator ≈ {follow:+.0f} nm/min to follow it."
+                )
+        elif s.drift_nm_per_min is not None and abs(s.drift_nm_per_min) >= 200:
+            summary += (
+                " A steady drift while locked is the lock following something: if"
+                " the image stays sharp, the focus itself drifted (mechanics,"
+                " temperature); if it blurs, CRISP's reference drifted."
+            )
         change = result.lock_offset_change
         if change:
             summary += (
@@ -1672,15 +1706,16 @@ class CrispControlPanel(QWidget):
             cells = [
                 r.started.strftime("%H:%M:%S"),
                 "locked" if r.locked else "unlocked",
-                r.settings.get("Averages", ""),
-                r.settings.get("Loop Gain", ""),
-                r.settings.get("Update rate (ms)", ""),
-                r.settings.get("LED (%)", ""),
                 _fmt(s.drift_nm_per_min, "+.1f", ""),
                 _fmt(s.jitter_nm, ".0f", ""),
                 _fmt(s.wander_nm, ".0f", ""),
                 _fmt(s.pkpk_nm, ".0f", ""),
                 _fmt(s.error_rms, ".1f", ""),
+                _fmt(s.error_drift_per_min, "+.1f", ""),
+                r.settings.get("Averages", ""),
+                r.settings.get("Loop Gain", ""),
+                r.settings.get("Update rate (ms)", ""),
+                r.settings.get("LED (%)", ""),
                 note,
             ]
             for col, text in enumerate(cells):

@@ -51,3 +51,28 @@ on the rig** (branch `feat/crisp-unlocked-hold-and-na`, PR #3).
   128 µm): commanded nothing past −22 µm, covered −2.0 … +10 µm, "Travel limit" line
   and red plot marker shown, no "Scan wider"; CSV records the limits.
 - Plot marks the cut with a red "travel limit" line.
+
+## Addendum: noisy curves and the hold-test error trend (2026-10-20)
+
+Rig: the piezo curve (±10 µm, 0.1 µm steps) is a clean straight line, but the summary
+said slope 0, a peak 0.1 µm away and capture "--": the line moves 1.6 counts per step,
+the noise is ±3. The Z summary said "can't show focus noise below ≈ 0 nm" (reads at a
+position all equal). The locked piezo hold test ramped +1 µm/min; the error rms wasn't
+detrended, and there was no error trend to compare an unlocked run with.
+
+- `analyze_focus_curve`: running mean (±0.4 µm) for decisions when the noise (median
+  2nd difference) is above rounding and ≥ the per-step change; chain-merged crossings
+  (lock point = middle); direction from a local fit; slope window ≥ the smoothing. New
+  `scatter_counts` / `scatter_nm` (rms about a local cubic).
+- Summary noise line: scatter between positions in counts and nm; ≤ 1 count says one
+  count = N nm (no more "≈ 0 nm").
+- `analyze_hold`: error rms about its trend, `error_drift_per_min`; the unlocked summary
+  says what a lock would follow (nm/min); a locked drift ≥ 200 nm/min gets the "sharp
+  image = real drift, blurring = reference drift" note. Table: measurements before
+  settings, so they show without scrolling; new Err /min column.
+
+Verification: 124 tests pass (20 seeds of a rig-like noisy line, 10 of a noisy S, the
+error-ramp hold case; all earlier tests unchanged); ruff at the baseline. Rendered
+through the real panel with curves and hold runs traced from the screenshots: piezo
+slope −16.1, no peaks, capture ≥ ±10 µm, scatter ±2.9 counts ≈ 179 nm; Z noise line
+"one count = 80 nm"; unlocked ramp → "a lock would move the actuator ≈ +981 nm/min".

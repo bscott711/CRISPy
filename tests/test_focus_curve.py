@@ -304,6 +304,48 @@ def test_a_second_surface_is_reported_as_another_crossing() -> None:
     assert a.peak_high is not None  # the lock curve turns over before it
 
 
+@pytest.mark.parametrize("seed", range(20))
+def test_a_noisy_straight_curve_at_fine_steps(seed: int) -> None:
+    # The rig's piezo on 2026-10-20 (±10 µm, 0.1 µm steps): a straight line of about
+    # -16 counts/µm through +0.7 µm, scattered ±3 counts from point to point. At this
+    # step the line moves 1.6 counts per point, less than the noise, so single pairs
+    # of points near the crossing go the wrong way.
+    rng = random.Random(seed)
+    pts = [
+        CurvePoint(z, round(-16.0 * (z - 0.7) + rng.gauss(0, 3.0)), 0.0, 3)
+        for z in scan_offsets(10.0, 0.1)
+    ]
+    a = analyze_focus_curve(pts)
+    assert a.crossing_um == pytest.approx(0.7, abs=0.3)
+    assert a.slope == pytest.approx(-16.0, rel=0.1)
+    assert a.peak_low is None and a.peak_high is None
+    assert a.capture_low_open and a.capture_high_open
+    assert a.other_crossings == ()
+    assert a.scatter_counts == pytest.approx(3.0, rel=0.35)
+    assert a.scatter_nm == pytest.approx(a.scatter_counts / 16.0 * 1000, rel=0.1)
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_a_noisy_s_curve_still_shows_its_peaks(seed: int) -> None:
+    rng = random.Random(seed)
+    pts = [
+        CurvePoint(z, round(s_curve(z, -16.0, 5.0) + rng.gauss(0, 3.0)), 0.0, 3)
+        for z in scan_offsets(10.0, 0.1)
+    ]
+    a = analyze_focus_curve(pts)
+    assert a.crossing_um == pytest.approx(0.0, abs=0.3)
+    assert a.peak_low is not None and a.peak_high is not None
+    assert a.peak_low[0] == pytest.approx(-5.0, abs=1.0)
+    assert a.peak_high[0] == pytest.approx(5.0, abs=1.0)
+    assert a.other_crossings == ()
+
+
+def test_scatter_is_zero_for_a_clean_whole_count_curve() -> None:
+    pts = [CurvePoint(z, round(-10.0 * z), 0.0, 3) for z in scan_offsets(5.0, 0.25)]
+    a = analyze_focus_curve(pts)
+    assert a.scatter_counts == pytest.approx(0.0, abs=0.7)
+
+
 def test_a_peak_on_one_side_only() -> None:
     # Peaks 2 µm below; above, the error keeps growing to the end of the scan.
     def err(z: float) -> float:

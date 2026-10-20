@@ -22,6 +22,11 @@ Either way the record is split into:
   little: its rise over 1 s divided by √12).
 
 ``jitter² + wander²`` is the detrended mean-square, so the two add up to the total.
+
+The error gets the same straight-line fit: its **trend** (counts/min) and its rms about
+the trend. In an unlocked run the actuator stands still, so an error trend is the optics
+or the sensor drifting; divided by the focus-curve slope it is the drift a lock would
+follow. (Without the detrending, a ramp of R counts over the run alone gives R/√12 rms.)
 It also records the lock settings and the lock offset at the start and end, so runs can
 be compared one change at a time. It never writes a setting.
 
@@ -104,7 +109,8 @@ class HoldStats:
     wander_nm: float | None  # detrended, bin_s and slower
     pkpk_nm: float | None  # detrended
     error_mean: float | None
-    error_rms: float | None  # population std-dev of the error
+    error_rms: float | None  # about the error's straight-line trend
+    error_drift_per_min: float | None = None  # the trend, counts/min
 
 
 @dataclass
@@ -149,9 +155,13 @@ def analyze_hold(
     duration = samples[-1].t - samples[0].t if len(samples) > 1 else 0.0
     rate = (len(samples) - 1) / duration if duration > 0 else None
 
-    errors = [s.error for s in samples if s.error is not None]
-    err_mean = statistics.fmean(errors) if errors else None
-    err_rms = statistics.pstdev(errors) if len(errors) > 1 else None
+    errs = [(s.t, s.error) for s in samples if s.error is not None]
+    err_mean = statistics.fmean(e for _, e in errs) if errs else None
+    err_rms = err_drift = None
+    if len(errs) > 1:
+        ea, eb = _linear_fit([t for t, _ in errs], [e for _, e in errs])
+        err_rms = math.sqrt(statistics.fmean((e - (ea + eb * t)) ** 2 for t, e in errs))
+        err_drift = eb * 60.0
 
     pos = [(s.t, s.position_um) for s in samples if s.position_um is not None]
     drift = rms = jitter = wander = pkpk = None
@@ -189,6 +199,7 @@ def analyze_hold(
         pkpk_nm=pkpk,
         error_mean=err_mean,
         error_rms=err_rms,
+        error_drift_per_min=err_drift,
     )
 
 
@@ -369,6 +380,7 @@ def write_hold_csv(path: Path | str, result: HoldResult) -> None:
         "wander_nm": s.wander_nm,
         "pkpk_nm": s.pkpk_nm,
         "error_rms": s.error_rms,
+        "error_drift_per_min": s.error_drift_per_min,
     }
     with open(path, "w", newline="", encoding="utf-8") as fh:
         fh.writelines(

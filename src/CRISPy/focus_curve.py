@@ -18,8 +18,13 @@ The analysis reports, from measured data rather than the calibration:
   there, in error counts per µm;
 * the peaks either side and how far the lock point is from each;
 * the capture range (where the error still has the sign that drives back to focus);
-* the error noise at each step, and the focus noise it implies (noise / slope), which is
-  the floor the lock can't do better than without more averaging or more signal.
+* the error noise: the scatter from one position to the next, and the spread of the
+  reads at one position, with the focus noise it implies (noise / slope).
+
+When the error scatters by more than the readout's rounding, the decisions (zero
+crossings, which way the curve runs, peaks, capture range) are made on a running mean,
+so a few counts of noise at fine steps can't flip a sign near the lock point. The slope
+is always fitted to the raw points.
 
 Nothing here imports Qt.
 """
@@ -30,7 +35,7 @@ import csv
 import math
 import statistics
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -57,6 +62,11 @@ PEAK_DROP = 0.15
 _OTHER_SLOPE_HALF_WIDTH_UM = 1.0
 # Other crossings are reported only if at least this steep relative to the lock point.
 _OTHER_MIN_STEEPNESS = 0.25
+# Point-to-point scatter (counts rms) above which decisions use a running mean of
+# about this half-width (µm, at least one point each side). Whole-count rounding of a
+# clean curve stays well under it.
+_SMOOTH_ABOVE_COUNTS = 1.0
+_SMOOTH_HALF_WIDTH_UM = 0.4
 # ASI stages and piezos report their firmware travel limits (SL / SU) in mm.
 LOWER_LIMIT_PROP = "LowerLim(mm)"
 UPPER_LIMIT_PROP = "UpperLim(mm)"
@@ -108,12 +118,16 @@ class CurveAnalysis:
     capture_high_um: float | None
     capture_low_open: bool  # the correct sign continued to the end of the scan
     capture_high_open: bool
-    noise_counts: float | None  # typical per-step error std-dev near the crossing
+    noise_counts: float | None  # typical spread of the reads at one position
     noise_floor_nm: float | None  # noise_counts / |slope|
     # Every other zero crossing in the scan, as (z, slope there). Another reflecting
     # surface coming into focus shows up as one; with the opposite slope sign it is
     # also where the capture range ends on that side.
     other_crossings: tuple[tuple[float, float | None], ...] = ()
+    # Scatter of the error from one position to the next near the lock point (robust
+    # rms, counts), and the focus distance it amounts to at the slope (nm).
+    scatter_counts: float | None = None
+    scatter_nm: float | None = None
 
     @property
     def resolution_nm(self) -> float | None:
@@ -359,6 +373,93 @@ def _walk_side(
     return peak, walked[-1].z_um, open_end
 
 
+def _d2_noise(errors: list[float]) -> float | None:
+    """A rough, robust rms of the point-to-point noise, from 2nd differences.
+
+    Second differences cancel a straight line and nearly cancel a smooth curve, so what
+    is left is the noise: for independent noise of rms σ they have rms σ√6. The median
+    ignores the few points where the curve bends sharply, but of whole counts it moves
+    in steps: good enough to decide whether the curve is noisy, not to report.
+    """
+    d2 = [abs(a - 2 * b + c) for a, b, c in zip(errors, errors[1:], errors[2:])]
+    if len(d2) < 3:
+        return None
+    return 1.4826 * statistics.median(d2) / math.sqrt(6)
+
+
+def _solve(a: list[list[float]], b: list[float]) -> list[float] | None:
+    """Solve the square system ``a x = b`` (Gaussian elimination); ``None`` if singular."""
+    n = len(b)
+    m = [[*row, rhs] for row, rhs in zip(a, b)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(m[r][col]))
+        if abs(m[piv][col]) < 1e-12:
+            return None
+        m[col], m[piv] = m[piv], m[col]
+        for r in range(col + 1, n):
+            f = m[r][col] / m[col][col]
+            for c in range(col, n + 1):
+                m[r][c] -= f * m[col][c]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        x[r] = (m[r][n] - sum(m[r][c] * x[c] for c in range(r + 1, n))) / m[r][r]
+    return x
+
+
+def _cubic_scatter(pts: list[CurvePoint]) -> float | None:
+    """Rms scatter of the error about a least-squares cubic in z (8 points or more).
+
+    Near the lock point a focus curve is close to a cubic (an S), so what is left is the
+    noise from one position to the next.
+    """
+    n = len(pts)
+    if n < 8:
+        return None
+    mz = statistics.fmean(p.z_um for p in pts)
+    half = max(abs(p.z_um - mz) for p in pts) or 1.0
+    us = [(p.z_um - mz) / half for p in pts]
+    ys = [p.error for p in pts]
+    a = [[sum(u ** (r + c) for u in us) for c in range(4)] for r in range(4)]
+    b = [sum(y * u**r for u, y in zip(us, ys)) for r in range(4)]
+    coef = _solve(a, b)
+    if coef is None:
+        return None
+    ssr = sum(
+        (y - sum(c * u**j for j, c in enumerate(coef))) ** 2 for u, y in zip(us, ys)
+    )
+    return math.sqrt(ssr / (n - 4))
+
+
+def _running_mean(pts: list[CurvePoint], k: int) -> list[CurvePoint]:
+    """Each error replaced by the mean over up to *k* points each side.
+
+    The window shrinks symmetrically at the ends, so a straight line is unchanged.
+    """
+    if k <= 0:
+        return pts
+    n = len(pts)
+    out = []
+    for i, p in enumerate(pts):
+        j = min(k, i, n - 1 - i)
+        window = pts[i - j : i + j + 1]
+        out.append(replace(p, error=statistics.fmean(w.error for w in window)))
+    return out
+
+
+@dataclass
+class _Crossing:
+    """Zero crossings close together, seen as one: the z and index range they span."""
+
+    z_first: float
+    i_first: int  # index of the lower point of the first crossing
+    z_last: float
+    i_last: int
+
+    @property
+    def z(self) -> float:
+        return (self.z_first + self.z_last) / 2
+
+
 def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     """Find the lock point, slope, peaks, capture range and noise floor of a curve."""
     pts = sorted(points, key=lambda p: p.z_um)
@@ -368,40 +469,63 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
 
     step = statistics.median(b.z_um - a.z_um for a, b in pairwise(pts))
 
-    # Every zero crossing, as (z, index of the lower point). Crossings within two
-    # steps of each other are one crossing seen through noise; keep the first.
-    crossings: list[tuple[float, int]] = []
-    for i in range(len(pts) - 1):
-        a, b = pts[i], pts[i + 1]
+    # Decide on a running mean when the error scatters by more than rounding and by
+    # about as much as the curve changes from one point to the next. (A clean curve
+    # sampled coarsely bends a lot per step, but changes by more.)
+    errs = [p.error for p in pts]
+    d1 = [abs(b - a) for a, b in pairwise(errs)]
+    d2 = [abs(a - 2 * b + c) for a, b, c in zip(errs, errs[1:], errs[2:])]
+    noisy = (
+        (_d2_noise(errs) or 0.0) >= _SMOOTH_ABOVE_COUNTS
+        and bool(d2)
+        and statistics.median(d2) >= statistics.median(d1)
+    )
+    k = max(1, round(_SMOOTH_HALF_WIDTH_UM / step)) if noisy and step > 0 else 0
+    sm = _running_mean(pts, k)
+    merge = max(2 * step, k * step)
+
+    # Every zero crossing. Crossings within `merge` of the previous one are one
+    # crossing seen through noise.
+    crossings: list[_Crossing] = []
+    for i in range(len(sm) - 1):
+        a, b = sm[i], sm[i + 1]
         if a.error == 0:
             z = a.z_um
         elif _sign(a.error) * _sign(b.error) < 0:
             z = a.z_um + (b.z_um - a.z_um) * (-a.error) / (b.error - a.error)
         else:
             continue
-        if crossings and z - crossings[-1][0] <= 2 * step:
+        if crossings and z - crossings[-1].z_last <= merge:
+            crossings[-1].z_last, crossings[-1].i_last = z, i
             continue
-        crossings.append((z, i))
+        crossings.append(_Crossing(z, i, z, i))
     if not crossings:
         return empty
     # The lock point is the crossing nearest the starting position (z = 0).
-    z_c, i = min(crossings, key=lambda c: abs(c[0]))
-    rising = _sign(pts[i + 1].error - pts[i].error) or 1
+    lock = min(crossings, key=lambda c: abs(c.z))
+    z_c, i = lock.z, lock.i_first
+
+    # Which way the curve runs through the lock point: a fit over a few points, not
+    # one pair, which noise can turn around.
+    around = [p for p in pts if abs(p.z_um - z_c) <= max(2 * step, k * step)]
+    local = _fit_slope([p.z_um for p in around], [p.error for p in around])
+    rising = _sign(local) if local else (_sign(sm[i + 1].error - sm[i].error) or 1)
 
     # Below the crossing the error has the opposite sign to above it.
-    lo_start = i if pts[i].error != 0 else i - 1
-    peak_low, cap_low, low_open = _walk_side(pts, lo_start, -1, -rising)
-    peak_high, cap_high, high_open = _walk_side(pts, i + 1, +1, rising)
+    lo_start = i if sm[i].error != 0 else i - 1
+    peak_low, cap_low, low_open = _walk_side(sm, lo_start, -1, -rising)
+    peak_high, cap_high, high_open = _walk_side(sm, lock.i_last + 1, +1, rising)
 
     # Fit the slope over the central third of the region between the peaks (at least
-    # the two points that bracket the crossing). With no peak inside the scan the
-    # curve is broad, so fit over a quarter of the way to the nearer scan end.
+    # the two points that bracket the crossing, and the running mean's width). With no
+    # peak inside the scan the curve is broad, so fit over a quarter of the way to the
+    # nearer scan end.
     margins = [abs(z_c - pk[0]) for pk in (peak_low, peak_high) if pk is not None]
     if margins:
-        half_width = max(1.5 * step, min(margins) / 3)
+        half_width = max(1.5 * step, k * step, min(margins) / 3)
     else:
         to_end = min(z_c - pts[0].z_um, pts[-1].z_um - z_c)
-        half_width = max(1.5 * step, to_end / 4)
+        half_width = max(1.5 * step, k * step, to_end / 4)
     near = [p for p in pts if abs(p.z_um - z_c) <= half_width]
     if len(near) < 2:
         near = [pts[i], pts[i + 1]]
@@ -412,13 +536,18 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     floor_nm = None
     if noise is not None and slope:
         floor_nm = noise / abs(slope) * 1000.0
+    scatter = _cubic_scatter(near)
+    scatter_nm = None
+    if scatter is not None and slope:
+        scatter_nm = scatter / abs(slope) * 1000.0
 
     # Other crossings, if they are at least a quarter as steep as the lock point: a
     # shallower one is noise or tails wandering across zero, not another surface.
     others: list[tuple[float, float | None]] = []
-    for z, _ in crossings:
-        if z == z_c:
+    for c in crossings:
+        if c is lock:
             continue
+        z = c.z
         local = [p for p in pts if abs(p.z_um - z) <= _OTHER_SLOPE_HALF_WIDTH_UM]
         s = _fit_slope([p.z_um for p in local], [p.error for p in local])
         if s is not None and slope and abs(s) < _OTHER_MIN_STEEPNESS * abs(slope):
@@ -437,6 +566,8 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
         noise_counts=noise,
         noise_floor_nm=floor_nm,
         other_crossings=tuple(others),
+        scatter_counts=scatter,
+        scatter_nm=scatter_nm,
     )
 
 

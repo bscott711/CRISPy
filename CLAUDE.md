@@ -137,6 +137,24 @@ micro-manager/mmCoreAndDevices).
   position of the returned beam (split photodiode), so anything that tilts the returned
   beam (that mirror, air in its path) also reads as focus error: a lead for the
   piezo's second-scale noise, untested.
+- **The focus-curve analysis must survive noise at fine steps.** The rig's piezo curve
+  of 2026-10-20 (±10 µm, 0.1 µm steps) was a straight line, −16 counts/µm, scattered
+  ±3 counts from point to point: more than its 1.6 counts per step, so single pairs near
+  the crossing went the wrong way and the old analysis reported slope 0, a "peak"
+  0.1 µm away and no capture range. When the point-to-point noise (median of 2nd
+  differences) is above rounding and at least the per-step change, decisions use a
+  ±0.4 µm running mean, nearby crossings merge, and the direction comes from a local
+  fit. The reported scatter is the rms about a local cubic (not the median: whole
+  counts). Reads at one position were identical (±0.0) on both axes, so the readout
+  doesn't change within a few tens of ms; the spread between positions is the noise.
+- **Hold-test error is detrended, with its trend reported.** In an unlocked run the
+  actuator stands still, so an error trend is the optics or sensor drifting; ÷ slope it
+  is the drift a lock would follow. Without detrending, a ramp of R counts gives R/√12.
+- **Rig, 2026-10-20 (after the day's alignment, piezo NA set to 1.00):** SNR 5.1 dB,
+  Sum 61, Cal Gain 580, Cal Range 1.499 µm; locked in-loop error ±4.9 counts rms. A
+  locked 60 s hold test: the piezo ramped +1008 nm/min steadily, with jitter 48 nm and
+  wander 50 nm about the ramp (Averages 1, Loop Gain 4, Update 10 ms, LED 36). Whether
+  the lock tracked a real drift or a drifting reference is open (camera check).
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

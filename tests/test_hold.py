@@ -81,6 +81,19 @@ def test_error_statistics_and_rate() -> None:
     assert stats.duration_s == pytest.approx(10.0)
 
 
+def test_an_error_ramp_is_reported_as_a_trend_not_as_noise() -> None:
+    # Unlocked, with the optics drifting: the error ramps 16 counts/min (1 µm/min at
+    # 16 counts/µm) with ±1 count of noise on top. Without detrending, the ramp alone
+    # would give 16/√12 ≈ 4.6 counts rms over the minute.
+    samples = [
+        HoldSample(k * 0.1, 25.0, 16.0 * (k * 0.1) / 60.0 + (-1) ** k)
+        for k in range(601)
+    ]
+    stats = analyze_hold(samples)
+    assert stats.error_drift_per_min == pytest.approx(16.0, rel=0.01)
+    assert stats.error_rms == pytest.approx(1.0, rel=0.02)
+
+
 def test_missing_positions_give_no_position_stats() -> None:
     stats = analyze_hold([HoldSample(k * 0.1, None, 1.0) for k in range(20)])
     assert stats.rms_nm is None
