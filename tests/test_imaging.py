@@ -1,19 +1,21 @@
-"""Tests for snapping, the sharpness score and thumbnails (no Qt, no camera)."""
+"""Tests for snapping, the sharpness score and the frame store (no Qt, no camera)."""
 
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
-from CRISPy import imaging
 from CRISPy.imaging import (
+    FrameStore,
     core_snap,
     focus_score,
+    image_view_factory,
+    set_image_view_factory,
     set_snap_provider,
     snap_images,
-    thumbnail,
 )
 
 
@@ -29,10 +31,12 @@ def blurred(sigma: float, size: int = 96, seed: int = 0) -> np.ndarray:
 
 
 @pytest.fixture(autouse=True)
-def _no_provider():
+def _no_hooks():
     set_snap_provider(None)
+    set_image_view_factory(None)
     yield
     set_snap_provider(None)
+    set_image_view_factory(None)
 
 
 def test_a_sharper_image_scores_higher() -> None:
@@ -55,19 +59,6 @@ def test_an_rgb_image_is_scored_in_grey() -> None:
     grey = blurred(1.0)
     rgb = np.stack([grey, grey, grey], axis=-1)
     assert focus_score(rgb) == pytest.approx(focus_score(grey))
-
-
-def test_thumbnail_is_small_and_8_bit() -> None:
-    thumb = thumbnail(np.arange(2048 * 1024, dtype=np.uint16).reshape(1024, 2048))
-    assert thumb.dtype == np.uint8
-    assert max(thumb.shape) <= imaging.THUMBNAIL_PX
-    assert thumb.flags["C_CONTIGUOUS"]
-    assert thumb.min() == 0 and thumb.max() == 255
-
-
-def test_thumbnail_of_a_flat_or_tiny_image() -> None:
-    assert thumbnail(np.full((50, 50), 7.0)).max() == 0
-    assert thumbnail(np.ones((1, 1000))).shape[0] == 1
 
 
 def test_core_snap_uses_the_current_camera() -> None:
@@ -99,3 +90,58 @@ def test_a_provider_replaces_the_core() -> None:
     core.getCameraDevice.return_value = "Camera-1"
     snap_images(core)
     core.snapImage.assert_called_once()
+
+
+def test_the_view_factory_hook() -> None:
+    assert image_view_factory() is None
+
+    def factory(camera: str) -> object:
+        return camera
+
+    set_image_view_factory(factory)
+    assert image_view_factory() is factory
+
+
+def test_frame_store_keeps_full_frames_on_disk() -> None:
+    store = FrameStore(3)
+    a = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    store.put(0, {"Camera-1": a, "Camera-2": a * 2})
+    store.put(2, {"Camera-1": a + 1})
+    assert store.cameras == ["Camera-1", "Camera-2"]
+    directory = store.directory
+    assert directory is not None
+    frame = store.get(0, "Camera-1")
+    np.testing.assert_array_equal(frame, a)
+    assert frame.dtype == np.uint16
+    np.testing.assert_array_equal(store.get(2, "Camera-1"), a + 1)
+    assert store.get(1, "Camera-1") is None  # never put
+    assert store.get(2, "Camera-2") is None
+    assert store.get(0, "Camera-3") is None
+    frame[:] = 0  # a copy: the store is unchanged
+    np.testing.assert_array_equal(store.get(0, "Camera-1"), a)
+    store.close()
+    assert store.cameras == []
+    assert not os.path.exists(directory)
+
+
+def test_frame_store_ignores_odd_frames_and_indices() -> None:
+    store = FrameStore(2)
+    store.put(0, {"Camera-1": np.zeros((4, 4), np.uint16)})
+    store.put(1, {"Camera-1": np.zeros((5, 5), np.uint16)})  # another shape
+    store.put(5, {"Camera-1": np.zeros((4, 4), np.uint16)})  # past the capacity
+    assert store.get(1, "Camera-1") is None
+    assert store.get(0, "Camera-1") is not None
+    store.close()
+    store.close()  # twice is fine
+
+
+def test_frame_store_files_go_when_the_store_does() -> None:
+    import gc
+
+    store = FrameStore(1)
+    store.put(0, {"Camera-1": np.ones((4, 4))})
+    directory = store.directory
+    assert directory is not None and os.path.exists(directory)
+    del store
+    gc.collect()
+    assert not os.path.exists(directory)

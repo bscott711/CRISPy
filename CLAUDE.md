@@ -35,9 +35,9 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
 - `focus_curve.py` — Qt-free `run_focus_curve` (step the actuator, read the error,
   always return to start) and `analyze_focus_curve` (lock point, slope, peaks,
   capture range, noise floor)
-- `imaging.py` — Qt-free camera images for the Focus curve: `set_snap_provider()` (the
-  host's hook), `snap_images()` / `core_snap()`, `focus_score()` (sharpness),
-  `thumbnail()`
+- `imaging.py` — Qt-free camera images for the Focus curve: the host's hooks
+  `set_snap_provider()` / `set_image_view_factory()`, `snap_images()` / `core_snap()`,
+  `focus_score()` (sharpness), `FrameStore` (full frames on disk)
 - `hold.py` — Qt-free `HoldTest` (records actuator position + error while locked) and
   `analyze_hold` (drift / wander / jitter)
 - `sampling.py` — the shared fast reader thread (`Sampler`) and read helpers
@@ -170,7 +170,16 @@ micro-manager/mmCoreAndDevices).
   `CrispWidget` sets (lasers + `CameraWorkerService.snap()`); without one CRISPy snaps
   with the core's current camera. CRISPy still imports nothing from pymmcore-gui. Snaps
   run on the GUI thread (`ui._GuiCall`: the scan's worker asks and waits), as a Snap
-  button would; scoring and thumbnails run on the worker.
+  button would; scoring runs on the worker.
+- **The images look like the Preview windows** (the user rejected a binned thumbnail
+  with its own contrast stretch). A second hook, `imaging.set_image_view_factory()`:
+  pymmcore-gui returns its `PygfxPreview` (per-camera mode: it shows only what
+  `append()` gets); without one, `ui._FrameView` does the same (full resolution, grey,
+  contrast from the frame's min to max, wheel zoom, drag pan). They live in their own
+  window (`ui._CurveImagesWindow`, one view per camera, a position slider): a GPU canvas
+  inside the panel's scroll area wouldn't clip. The frames are kept full size in
+  `imaging.FrameStore` (a memory-mapped `.npy` per camera in a temp dir, deleted on the
+  next scan, on close, or when the store is collected).
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

@@ -20,6 +20,7 @@ the ASITiger device-adapter properties:
 
 from __future__ import annotations
 
+import itertools
 import math
 import re
 import statistics
@@ -34,7 +35,7 @@ from typing import TYPE_CHECKING, cast
 
 from pymmcore_plus import CMMCorePlus
 from qtpy.QtCore import QEvent, QObject, Qt, Signal
-from qtpy.QtGui import QImage, QPixmap, QWheelEvent
+from qtpy.QtGui import QColor, QImage, QPixmap, QWheelEvent
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
@@ -44,6 +45,9 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -95,7 +99,7 @@ from .hold import (
     HoldTest,
     write_hold_csv,
 )
-from .imaging import snap_images, snap_provider
+from .imaging import FrameStore, image_view_factory, snap_images, snap_provider
 from .plot import LinePlot, RefLine, Series
 from .sampling import Sampler, device_present, read_str
 
@@ -109,7 +113,6 @@ if TYPE_CHECKING:
     from .controller import CrispController
 
 _PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
-_CURVE_IMAGE_PX = 220  # the focus curve's image view
 # How long a focus-curve position waits for its snap on the GUI thread.
 _SNAP_TIMEOUT_S = 30.0
 # The summary suggests moving the lock point to the sharpest image beyond this, µm.
@@ -418,6 +421,139 @@ class _GuiCall(QObject):
             job.done.set()
 
 
+class _FrameView(QGraphicsView):
+    """One full image, shown the way the host's preview windows show it.
+
+    Grey, with the contrast stretched from the frame's minimum to its maximum, at full
+    resolution; the wheel zooms and dragging pans. Used when the host provides no
+    viewer of its own (:func:`.imaging.set_image_view_factory`).
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self._item = QGraphicsPixmapItem()
+        self.scene().addItem(self._item)
+        self._shape: tuple[int, int] | None = None
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setBackgroundBrush(QColor(40, 40, 40))
+        self.setMinimumSize(320, 320)
+
+    def append(self, img: np.ndarray) -> None:
+        a = img[..., :3].mean(axis=-1) if img.ndim == 3 else img
+        lo, hi = float(a.min()), float(a.max())
+        scale = 255.0 / (hi - lo) if hi > lo else 0.0
+        a8 = ((a - lo) * scale).astype("uint8")
+        h, w = a8.shape
+        qimg = QImage(a8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+        self._item.setPixmap(QPixmap.fromImage(qimg.copy()))
+        if self._shape != (h, w):
+            self._shape = (h, w)
+            self.scene().setSceneRect(0, 0, w, h)
+            self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def wheelEvent(self, event: QWheelEvent | None) -> None:
+        if event is None:
+            return
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+
+
+class _CurveImagesWindow(QWidget):
+    """The focus curve's images: one view per camera and a slider over the positions.
+
+    Each view is the host's own (the widget of its preview windows, through
+    :func:`.imaging.set_image_view_factory`) or :class:`_FrameView`. A window of its
+    own, not part of the panel: a GPU canvas inside the panel's scroll area wouldn't
+    clip when the panel scrolls.
+
+    Parameters
+    ----------
+    title
+        The window title.
+    frame_at
+        Returns ``(z, {camera: frame})`` for a position index.
+    parent
+        The panel; the window is closed and deleted with it.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        frame_at: Callable[[int], tuple[float, dict[str, np.ndarray]]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(title)
+        self._frame_at = frame_at
+        v = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setToolTip("Step through the images by position.")
+        self.slider.valueChanged.connect(self._display)
+        self.caption = QLabel()
+        top.addWidget(self.slider, 1)
+        top.addWidget(self.caption)
+        v.addLayout(top)
+        self._row = QHBoxLayout()
+        v.addLayout(self._row, 1)
+        self._views: dict[str, QWidget] = {}
+        self._count = 0
+        self.resize(1000, 560)
+
+    def reset(self) -> None:
+        """A new scan: no positions yet (the views stay, showing the last image)."""
+        self._count = 0
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, 0)
+        self.slider.blockSignals(False)
+        self.caption.setText("waiting for the first image…")
+
+    def set_count(self, count: int) -> None:
+        self._count = count
+        self.slider.setRange(0, max(0, count - 1))
+
+    def show_index(self, index: int) -> None:
+        if self.slider.value() == index:
+            self._display(index)
+        else:
+            self.slider.setValue(index)
+
+    def _view(self, camera: str) -> QWidget:
+        view = self._views.get(camera)
+        if view is not None:
+            return view
+        view = None
+        factory = image_view_factory()
+        if factory is not None:
+            with suppress(Exception):
+                view = factory(camera)
+        if not isinstance(view, QWidget) or not callable(getattr(view, "append", None)):
+            view = _FrameView()
+        box = QWidget()
+        col = QVBoxLayout(box)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.addWidget(QLabel(camera))
+        col.addWidget(view, 1)
+        self._row.addWidget(box, 1)
+        self._views[camera] = view
+        detach = getattr(view, "detach", None)  # host previews listen to the core
+        if callable(detach):
+            self.destroyed.connect(lambda *_: detach())
+        return view
+
+    def _display(self, index: int) -> None:
+        if not 0 <= index < self._count:
+            return
+        z, frames = self._frame_at(index)
+        for camera, frame in frames.items():
+            self._view(camera).append(frame)  # type: ignore[attr-defined]
+        self.caption.setText(
+            f"z = {z:+.2f} µm from the start ({index + 1} / {self._count})"
+        )
+
+
 class CrispControlPanel(QWidget):
     """Control + telemetry panel for a single CRISP axis."""
 
@@ -468,8 +604,10 @@ class CrispControlPanel(QWidget):
         self._curve_points: list[CurvePoint] = []
         self._curve_scan: CurveScan | None = None
         self._curve_analysis: CurveAnalysis | None = None
-        # (z, {camera: thumbnail}) per position, when the scan snapped images.
-        self._curve_thumbs: list[tuple[float, dict[str, np.ndarray]]] = []
+        # The last scan's full frames (kept on disk), the z of each, their window.
+        self._curve_frames: FrameStore | None = None
+        self._curve_frame_z: list[float] = []
+        self._curve_images: _CurveImagesWindow | None = None
         self._gui_call = _GuiCall(self)
         self._hold: HoldTest | None = None
         self._hold_samples: list[HoldSample] = []
@@ -794,31 +932,28 @@ class CrispControlPanel(QWidget):
         v.addWidget(self.curve_plot)
 
         self.curve_images_box = QWidget()
-        img_row = QHBoxLayout(self.curve_images_box)
-        img_row.setContentsMargins(0, 0, 0, 0)
-        self.curve_image = QLabel()
-        self.curve_image.setFixedSize(_CURVE_IMAGE_PX, _CURVE_IMAGE_PX)
-        self.curve_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.curve_image.setStyleSheet("background: black;")
-        img_row.addWidget(self.curve_image)
-        side = QVBoxLayout()
+        box = QVBoxLayout(self.curve_images_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Sharpness of"))
         self.curve_camera = QComboBox()
-        self.curve_camera.setToolTip("Which camera's images and sharpness to show.")
+        self.curve_camera.setToolTip("Which camera's sharpness to plot and report.")
         self.curve_camera.currentIndexChanged.connect(self._on_curve_camera)
-        self.curve_image_slider = QSlider(Qt.Orientation.Horizontal)
-        self.curve_image_slider.setToolTip("Step through the images by position.")
-        self.curve_image_slider.valueChanged.connect(self._show_curve_image)
-        self.curve_image_caption = QLabel()
+        row.addWidget(self.curve_camera)
+        row.addStretch()
+        self.curve_images_btn = QPushButton("Show images")
+        self.curve_images_btn.setToolTip(
+            "The images at every position, full size, one view per camera."
+        )
+        self.curve_images_btn.clicked.connect(self._on_curve_show_images)
+        row.addWidget(self.curve_images_btn)
+        box.addLayout(row)
         self.curve_sharp_plot = LinePlot(
             x_label="z from start (µm)",
             y_label="image sharpness (relative)",
             min_height=110,
         )
-        side.addWidget(self.curve_camera)
-        side.addWidget(self.curve_image_slider)
-        side.addWidget(self.curve_image_caption)
-        side.addWidget(self.curve_sharp_plot, 1)
-        img_row.addLayout(side, 1)
+        box.addWidget(self.curve_sharp_plot)
         self.curve_images_box.setVisible(False)
         v.addWidget(self.curve_images_box)
         self.curve_result_lbl = QLabel()
@@ -1092,6 +1227,10 @@ class CrispControlPanel(QWidget):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_tools()
+        if self._curve_images is not None:
+            self._curve_images.close()
+        if self._curve_frames is not None:
+            self._curve_frames.close()
         super().closeEvent(event)
 
     # ------------------------------------------------------------- tool core
@@ -1379,10 +1518,17 @@ class CrispControlPanel(QWidget):
         self._curve_stop.clear()
         self._curve_points = []
         self._curve_analysis = None
-        self._curve_thumbs = []
+        if self._curve_frames is not None:
+            self._curve_frames.close()
+        self._curve_frames = FrameStore(n) if snap else None
+        self._curve_frame_z = []
         self.curve_images_box.setVisible(False)
-        self.curve_image.clear()
         self.curve_sharp_plot.clear()
+        if snap:
+            window = self._images_window()
+            window.reset()
+            window.show()
+            window.raise_()
         self.tools_tabs.setCurrentWidget(self._curve_tab)
         self.curve_status.setStyleSheet("")
         self.curve_status.setText(f"Scanning {n} positions…")
@@ -1411,6 +1557,15 @@ class CrispControlPanel(QWidget):
         reads: int,
         snap: bool,
     ) -> None:
+        store = self._curve_frames
+        count = itertools.count()
+
+        def keep_frames(point: CurvePoint, frames: Mapping[str, np.ndarray]) -> None:
+            index = next(count)
+            if store is not None:
+                store.put(index, frames)  # full size, to disk, on this thread
+            self._emit("curve_images", (index, point.z_um, tuple(frames)))
+
         def snap_on_gui_thread() -> Mapping[str, np.ndarray]:
             frames = self._gui_call.call(
                 lambda: snap_images(self.mmcore), _SNAP_TIMEOUT_S
@@ -1429,7 +1584,7 @@ class CrispControlPanel(QWidget):
                 should_stop=self._curve_stop.is_set,
                 on_point=lambda p: self._emit("curve_point", p),
                 snap=snap_on_gui_thread if snap else None,
-                on_images=lambda p, t: self._emit("curve_images", (p, t)),
+                on_images=keep_frames,
             )
         except Exception as e:  # noqa: BLE001 - reported in the panel
             self._emit("curve_error", str(e))
@@ -1445,51 +1600,47 @@ class CrispControlPanel(QWidget):
         )
         self._paint_curve()
 
-    def _on_curve_images(
-        self, payload: tuple[CurvePoint, Mapping[str, np.ndarray]]
-    ) -> None:
+    def _images_window(self) -> _CurveImagesWindow:
+        if self._curve_images is None:
+            self._curve_images = _CurveImagesWindow(
+                f"Focus curve images: {self.controller.label}",
+                self._curve_frame_at,
+                self,
+            )
+        return self._curve_images
+
+    def _curve_frame_at(self, index: int) -> tuple[float, dict[str, np.ndarray]]:
+        store = self._curve_frames
+        z = self._curve_frame_z[index] if index < len(self._curve_frame_z) else 0.0
+        if store is None:
+            return z, {}
+        frames = {}
+        for camera in store.cameras:
+            frame = store.get(index, camera)
+            if frame is not None:
+                frames[camera] = frame
+        return z, frames
+
+    def _on_curve_images(self, payload: tuple[int, float, tuple[str, ...]]) -> None:
         if self._active_tool != _CURVE:
             return
-        point, thumbs = payload
-        self._curve_thumbs.append((point.z_um, dict(thumbs)))
-        for camera in thumbs:
+        index, z, cameras = payload
+        self._curve_frame_z.append(z)
+        for camera in cameras:
             if self.curve_camera.findText(camera) < 0:
                 self.curve_camera.addItem(camera)
         self.curve_images_box.setVisible(True)
-        last = len(self._curve_thumbs) - 1
-        self.curve_image_slider.setRange(0, last)
-        if self.curve_image_slider.value() == last:
-            self._show_curve_image(last)
-        else:
-            self.curve_image_slider.setValue(last)
+        window = self._images_window()
+        window.set_count(len(self._curve_frame_z))
+        window.show_index(index)  # follow the scan
 
-    def _show_curve_image(self, index: int) -> None:
-        if not 0 <= index < len(self._curve_thumbs):
-            return
-        z, thumbs = self._curve_thumbs[index]
-        camera = self.curve_camera.currentText()
-        img = thumbs.get(camera)
-        if img is None:
-            if not thumbs:
-                return
-            camera, img = next(iter(thumbs.items()))
-        h, w = img.shape
-        qimg = QImage(img.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
-        self.curve_image.setPixmap(
-            QPixmap.fromImage(qimg).scaled(
-                _CURVE_IMAGE_PX,
-                _CURVE_IMAGE_PX,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-        self.curve_image_caption.setText(
-            f"{camera}: z = {z:+.2f} µm from the start "
-            f"({index + 1} / {len(self._curve_thumbs)})"
-        )
+    def _on_curve_show_images(self) -> None:
+        window = self._images_window()
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def _on_curve_camera(self) -> None:
-        self._show_curve_image(self.curve_image_slider.value())
         self._paint_curve()
         if self._curve_analysis is not None and self._active_tool != _CURVE:
             self.curve_result_lbl.setText(self._curve_summary(self._curve_analysis))
@@ -1509,13 +1660,13 @@ class CrispControlPanel(QWidget):
         if scan.completed and self._curve_analysis.slope:
             self._set_measured_slope(self._curve_analysis.slope)
         sharp = sharpest_position(scan.points, self.curve_camera.currentText())
-        if sharp is not None and self._curve_thumbs:
+        if sharp is not None and self._curve_frame_z:
             # Show the sharpest image to start with.
             nearest = min(
-                range(len(self._curve_thumbs)),
-                key=lambda i: abs(self._curve_thumbs[i][0] - sharp[0]),
+                range(len(self._curve_frame_z)),
+                key=lambda i: abs(self._curve_frame_z[i] - sharp[0]),
             )
-            self.curve_image_slider.setValue(nearest)
+            self._images_window().show_index(nearest)
 
     def _on_curve_error(self, message: str) -> None:
         self.curve_status.setText(message)

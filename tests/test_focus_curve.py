@@ -185,7 +185,7 @@ def test_the_scan_scores_an_image_at_each_position() -> None:
     )
     assert all(set(p.scores) == {"Camera-1"} for p in scan.points)
     assert [p for p, _ in seen] == scan.points
-    assert all(t["Camera-1"].dtype == np.uint8 for _, t in seen)
+    assert all(f["Camera-1"].shape == (48, 48) for _, f in seen)  # full frames
     sharp = sharpest_position(scan.points, "Camera-1")
     assert sharp is not None
     z, inside = sharp

@@ -1,23 +1,32 @@
-"""Camera images for the Focus curve: snapping, a sharpness score and thumbnails.
+"""Camera images for the Focus curve: snapping, showing, keeping, and a sharpness score.
 
-Snapping goes through a **snap provider** when the host has set one with
-:func:`set_snap_provider`, otherwise through the core's current camera. A host needs
-the hook when the core can't snap by itself: pymmcore-gui on the ASI rig hands its
-cameras to worker processes for the whole session and fires the lasers around each
-Snap, so it registers a provider that does what its own Snap button does. CRISPy calls
-the provider on the GUI thread, like a Snap button would.
+Two optional host hooks, for hosts whose core can't snap by itself or that have their
+own image viewer (pymmcore-gui on the ASI rig sets both):
 
-:func:`focus_score` rates how sharp an image is; across a focus curve its peak is where
-the image is in focus, to compare with where CRISP would lock. :func:`thumbnail` makes a
-small 8-bit copy for display.
+* a **snap provider** (:func:`set_snap_provider`): how to snap. pymmcore-gui hands its
+  cameras to worker processes for the whole session and fires the lasers around each
+  Snap, so it provides what its own Snap button does. Without one CRISPy snaps with the
+  core's current camera.
+* an **image view factory** (:func:`set_image_view_factory`): the widget that shows a
+  camera's images, so they look like the host's preview windows. Without one the panel
+  uses its own viewer that behaves the same way.
+
+:class:`FrameStore` keeps a scan's full-resolution frames on disk for stepping through
+them afterwards. :func:`focus_score` rates how sharp an image is; across a focus curve
+its peak is where the image is in focus, to compare with where CRISP would lock.
 
 Nothing here imports Qt.
 """
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING
+import os
+import shutil
+import tempfile
+import threading
+import weakref
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -27,10 +36,10 @@ if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
 
     SnapProvider = Callable[[], Mapping[str, np.ndarray]]
-
-THUMBNAIL_PX = 256
+    ImageViewFactory = Callable[[str], Any]
 
 _provider: SnapProvider | None = None
+_view_factory: ImageViewFactory | None = None
 
 
 def set_snap_provider(provider: SnapProvider | None) -> None:
@@ -50,6 +59,25 @@ def set_snap_provider(provider: SnapProvider | None) -> None:
 def snap_provider() -> SnapProvider | None:
     """The provider set with :func:`set_snap_provider`, if any."""
     return _provider
+
+
+def set_image_view_factory(factory: ImageViewFactory | None) -> None:
+    """Set the widget that shows a camera's images, or use CRISPy's own with ``None``.
+
+    Parameters
+    ----------
+    factory
+        Called on the GUI thread with a camera label; returns a QWidget with an
+        ``append(image)`` method that shows one full image, e.g. the widget of the
+        host's preview windows, so the Focus curve's images look the same.
+    """
+    global _view_factory
+    _view_factory = factory
+
+
+def image_view_factory() -> ImageViewFactory | None:
+    """The factory set with :func:`set_image_view_factory`, if any."""
+    return _view_factory
 
 
 def core_snap(mmcore: CMMCorePlus) -> dict[str, np.ndarray]:
@@ -115,28 +143,96 @@ def focus_score(img: np.ndarray) -> float:
     return float((np.mean(dx * dx) + np.mean(dy * dy)) / (mean * mean))
 
 
-def thumbnail(img: np.ndarray, max_px: int = THUMBNAIL_PX) -> np.ndarray:
-    """A small 8-bit copy of *img* for display.
+class FrameStore:
+    """A scan's full-resolution frames, kept on disk until :meth:`close`.
 
-    Block-averaged to at most *max_px* a side, then stretched between its 0.5 and 99.5
-    percentiles (each image on its own, so structure shows at any brightness).
+    One memory-mapped ``.npy`` file per camera in a temporary directory, so a long scan
+    of large frames doesn't fill memory. Each camera's file holds *capacity* frames of
+    the shape and dtype of its first frame; a later frame of another shape isn't kept.
+    Safe to fill from one thread while another reads.
 
     Parameters
     ----------
-    img
-        A 2-D image (an RGB image is averaged over its colours first).
-    max_px
-        The longest side of the result.
+    capacity
+        The most frames per camera (the scan's number of positions).
     """
-    a = _grey(img)
-    if a.ndim != 2 or a.size == 0:
-        return np.zeros((1, 1), np.uint8)
-    h, w = a.shape
-    f = max(1, min(math.ceil(max(h, w) / max_px), h, w))
-    h2, w2 = (h // f) * f, (w // f) * f
-    a = a[:h2, :w2].reshape(h2 // f, f, w2 // f, f).mean(axis=(1, 3))
-    lo, hi = np.percentile(a, (0.5, 99.5))
-    if hi <= lo:
-        return np.zeros(a.shape, np.uint8)
-    out = np.clip((a - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
-    return np.ascontiguousarray(out)
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._s = _StoreState()
+        # Delete the files however the store goes: close(), garbage collection (the
+        # panel deleted without a close event), or the interpreter exiting.
+        self._finalizer = weakref.finalize(self, self._s.clear)
+
+    @property
+    def cameras(self) -> list[str]:
+        """The cameras with at least one frame, in the order they first appeared."""
+        with self._s.lock:
+            return list(self._s.arrays)
+
+    @property
+    def directory(self) -> str | None:
+        """Where the files are, once there is one."""
+        return self._s.directory
+
+    def put(self, index: int, frames: Mapping[str, np.ndarray]) -> None:
+        """Keep *frames* (``{camera: image}``) as frame *index*."""
+        if not 0 <= index < self.capacity:
+            return
+        s = self._s
+        with s.lock:
+            for camera, img in frames.items():
+                a = np.asarray(img)
+                arr = s.arrays.get(camera)
+                if arr is None:
+                    if s.directory is None:
+                        s.directory = tempfile.mkdtemp(prefix="crispy-curve-")
+                    path = os.path.join(s.directory, f"camera{len(s.arrays)}.npy")
+                    arr = np.lib.format.open_memmap(
+                        path, mode="w+", dtype=a.dtype, shape=(self.capacity, *a.shape)
+                    )
+                    s.arrays[camera] = arr
+                    s.filled[camera] = set()
+                if arr.shape[1:] != a.shape or arr.dtype != a.dtype:
+                    continue
+                arr[index] = a
+                s.filled[camera].add(index)
+
+    def get(self, index: int, camera: str) -> np.ndarray | None:
+        """A copy of frame *index* of *camera* (``None`` if it wasn't kept).
+
+        A copy, not a view of the file, so nothing outside keeps the file open.
+        """
+        s = self._s
+        with s.lock:
+            arr = s.arrays.get(camera)
+            if arr is None or index not in s.filled[camera]:
+                return None
+            return np.array(arr[index])
+
+    def close(self) -> None:
+        """Forget the frames and delete the files."""
+        self._finalizer()
+
+
+class _StoreState:
+    """A :class:`FrameStore`'s data, apart from it so its finalizer can clear it."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.directory: str | None = None
+        self.arrays: dict[str, np.ndarray] = {}
+        self.filled: dict[str, set[int]] = {}
+
+    def clear(self) -> None:
+        with self.lock:
+            arrays, self.arrays, self.filled = self.arrays, {}, {}
+            directory, self.directory = self.directory, None
+        for arr in arrays.values():
+            mm = getattr(arr, "_mmap", None)  # Windows can't delete an open mapping
+            if mm is not None:
+                with suppress(Exception):
+                    mm.close()
+        arrays.clear()
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)

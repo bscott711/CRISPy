@@ -41,7 +41,7 @@ from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
-from .imaging import focus_score, thumbnail
+from .imaging import focus_score
 from .sampling import read_float, read_str
 
 if TYPE_CHECKING:
@@ -247,8 +247,8 @@ def run_focus_curve(
         goes into the point's ``scores``. A snap that raises ends the scan like a
         failed move.
     on_images
-        Called with each point and a :func:`.imaging.thumbnail` per camera, when
-        *snap* is given.
+        Called with each point and its full frames (``{camera: image}``), when *snap*
+        is given.
 
     Raises
     ------
@@ -314,18 +314,16 @@ def run_focus_curve(
                 continue
             std = statistics.pstdev(values) if len(values) > 1 else None
             scores: dict[str, float] = {}
-            thumbs: dict[str, np.ndarray] = {}
+            frames: Mapping[str, np.ndarray] = {}
             if snap is not None:
-                for camera, img in snap().items():
-                    scores[camera] = focus_score(img)
-                    if on_images is not None:
-                        thumbs[camera] = thumbnail(img)
+                frames = snap()
+                scores = {camera: focus_score(img) for camera, img in frames.items()}
             point = CurvePoint(
                 z - z0, statistics.fmean(values), std, len(values), scores
             )
             points.append(point)
-            if on_images is not None and thumbs:
-                on_images(point, thumbs)
+            if on_images is not None and frames:
+                on_images(point, frames)
             if on_point is not None:
                 on_point(point)
     except Exception as e:  # noqa: BLE001 - re-raised below after the restore

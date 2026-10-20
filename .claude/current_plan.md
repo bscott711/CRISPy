@@ -55,3 +55,29 @@ itself, meant for the GUI thread) bracketed by `open_selected_lasers()` /
 - pytest, ruff (19-finding baseline), mdformat; host tests that touch the CRISP widget.
 - Demo scan through the real panel with snapping: images shown, sharpness peak found
   near the simulated best focus, summary and CSV.
+
+## Addendum: show the images like the Preview windows
+
+The user: "The little binned image with whatever autoscaling you cooked up is not it. We
+should be using the same style of display that the Preview windows show." On the rig
+those are pymmcore-gui's `PygfxPreview` docks: a GPU canvas, full resolution, grey LUT,
+contrast auto = the frame's min to max, wheel zoom and drag pan.
+
+- `imaging.set_image_view_factory(fn)`: a second host hook. `fn(camera)` returns a QWidget
+  with `append(image)`; pymmcore-gui returns its `PygfxPreview`. Without one, CRISPy's
+  `_FrameView` (QGraphicsView) does the same: full resolution, grey, min-max, zoom/pan.
+- The images get their own window (one view per camera, position slider, caption): a
+  native GPU canvas inside the panel's scroll area wouldn't clip when scrolled. The
+  panel keeps the camera selector, the sharpness plot and a "Show images" button.
+- `imaging.FrameStore`: the scan's full-resolution frames in one memory-mapped `.npy`
+  per camera in a temp dir (81 positions × 2 cameras × 8-20 MB won't fit comfortably in
+  memory); copies out, deleted on the next scan and when the panel closes.
+- `run_focus_curve(on_images=...)` now passes the full frames; `thumbnail()` goes.
+
+Done and checked: 139 CRISPy tests (FrameStore keeps full frames and copies out, skips
+odd shapes and indices, deletes its files on close and when collected; the view hook);
+demo scan through the real panel: the window follows the scan and ends on the sharpest
+image, frames full size, a host view replaces CRISPy's own, files deleted on the next
+scan and on close. pymmcore-gui's real `PygfxPreview` rendered inside the window (grey,
+min-max contrast). Host: 6 tests, full suite 288 passed / 2 skipped; ruff, mypy pass,
+pyright only the 3 errors `main` has.
