@@ -35,6 +35,9 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
 - `focus_curve.py` — Qt-free `run_focus_curve` (step the actuator, read the error,
   always return to start) and `analyze_focus_curve` (lock point, slope, peaks,
   capture range, noise floor)
+- `imaging.py` — Qt-free camera images for the Focus curve: `set_snap_provider()` (the
+  host's hook), `snap_images()` / `core_snap()`, `focus_score()` (sharpness),
+  `thumbnail()`
 - `hold.py` — Qt-free `HoldTest` (records actuator position + error while locked) and
   `analyze_hold` (drift / wander / jitter)
 - `sampling.py` — the shared fast reader thread (`Sampler`) and read helpers
@@ -158,6 +161,16 @@ micro-manager/mmCoreAndDevices).
   locked 60 s hold test: the piezo ramped +1008 nm/min steadily, with jitter 48 nm and
   wander 50 nm about the ramp (Averages 1, Loop Gain 4, Update 10 ms, LED 36). Whether
   the lock tracked a real drift or a drifting reference is open (camera check).
+- **The Focus curve can snap an image at each position** (the user's ask: see the image
+  go in and out of focus). Each image's sharpness (Brenner gradient / mean²) peaks where
+  the image is in focus; the summary gives that position's distance from the lock point.
+  On the rig the core can't snap: pymmcore-gui hands Camera-1/Camera-2 to worker
+  processes for the whole session and fires the lasers around each Snap. So snapping
+  goes through a host hook, `imaging.set_snap_provider()`, which pymmcore-gui's
+  `CrispWidget` sets (lasers + `CameraWorkerService.snap()`); without one CRISPy snaps
+  with the core's current camera. CRISPy still imports nothing from pymmcore-gui. Snaps
+  run on the GUI thread (`ui._GuiCall`: the scan's worker asks and waits), as a Snap
+  button would; scoring and thumbnails run on the worker.
 - **Objective NA must be the objective each axis moves**: it sets the dither move
   (1.5 µm / NA²). This rig: the Z axis moves the NA 1.49 objective; the piezo moves the
   "snouty" (NA 1.0, beside an NA 0.95 air lens). On 2026-10-19 they were set to 1.30 and

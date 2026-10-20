@@ -6,6 +6,7 @@ import math
 import random
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 
 from CRISPy.focus_curve import (
@@ -15,6 +16,7 @@ from CRISPy.focus_curve import (
     analyze_focus_curve,
     run_focus_curve,
     scan_offsets,
+    sharpest_position,
     write_curve_csv,
 )
 
@@ -161,6 +163,64 @@ def test_on_point_sees_every_point() -> None:
     seen: list[CurvePoint] = []
     scan = _run(FakeCore(), on_point=seen.append)
     assert seen == scan.points
+
+
+def _snapper(core: FakeCore, best: float):
+    """Snap a 'camera' whose image blurs with the distance from *best* (absolute z)."""
+    from test_imaging import blurred
+
+    def snap() -> dict:
+        return {"Camera-1": blurred(0.5 + 1.5 * abs(core.z - best), size=48)}
+
+    return snap
+
+
+def test_the_scan_scores_an_image_at_each_position() -> None:
+    core = FakeCore(focus=25.0)
+    seen: list = []
+    scan = _run(
+        core,
+        snap=_snapper(core, best=25.8),
+        on_images=lambda p, thumbs: seen.append((p, thumbs)),
+    )
+    assert all(set(p.scores) == {"Camera-1"} for p in scan.points)
+    assert [p for p, _ in seen] == scan.points
+    assert all(t["Camera-1"].dtype == np.uint8 for _, t in seen)
+    sharp = sharpest_position(scan.points, "Camera-1")
+    assert sharp is not None
+    z, inside = sharp
+    assert inside
+    assert z == pytest.approx(0.8, abs=0.15)
+    assert sharpest_position(scan.points, "Camera-2") is None
+
+
+def test_sharpest_at_the_scan_end_is_flagged() -> None:
+    core = FakeCore(focus=25.0)
+    scan = _run(core, half_range_um=1.0, snap=_snapper(core, best=40.0))
+    sharp = sharpest_position(scan.points, "Camera-1")
+    assert sharp == (pytest.approx(1.0), False)
+
+
+def test_a_failed_snap_stops_the_scan_and_returns_the_actuator() -> None:
+    core = FakeCore()
+
+    def snap() -> dict:
+        if core.z > 26.0:
+            raise RuntimeError("camera timed out")
+        return {"Camera-1": np.ones((8, 8))}
+
+    with pytest.raises(FocusCurveError, match="camera timed out"):
+        _run(core, snap=snap)
+    assert core.z == 25.0
+
+
+def test_write_curve_csv_adds_a_sharpness_column_per_camera(tmp_path: Path) -> None:
+    core = FakeCore()
+    scan = _run(core, half_range_um=0.5, snap=_snapper(core, best=25.0))
+    out = tmp_path / "curve.csv"
+    write_curve_csv(out, scan, {})
+    text = out.read_text(encoding="utf-8").splitlines()
+    assert "z_rel_um,z_abs_um,error_counts,error_std,n,sharpness Camera-1" in text
 
 
 def test_the_scan_stays_inside_reported_travel_limits() -> None:

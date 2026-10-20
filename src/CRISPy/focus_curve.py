@@ -10,7 +10,9 @@ LED on) it steps the paired focus actuator through a range around its current po
 reads the error at each step, and always returns the actuator to where it started. The
 scan stays inside the actuator's travel limits when it reports them, and every point is
 placed at the position the actuator reads back, so a stage stopped at its limit can't
-pass for a flat stretch of the curve.
+pass for a flat stretch of the curve. It can also snap an image at each position
+(:mod:`.imaging`); the image's sharpness then shows where the image is in focus, to
+compare with where CRISP would lock (:func:`sharpest_position`).
 
 The analysis reports, from measured data rather than the calibration:
 
@@ -39,12 +41,14 @@ from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
+from .imaging import focus_score, thumbnail
 from .sampling import read_float, read_str
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Mapping
     from pathlib import Path
 
+    import numpy as np
     from pymmcore_plus import CMMCorePlus
 
 ERROR_PROP = "Dither Error"
@@ -87,6 +91,8 @@ class CurvePoint:
     error: float  # mean of the reads
     error_std: float | None  # population std-dev of the reads (None for one read)
     n: int
+    # Image sharpness at this position, per camera (when the scan snapped images).
+    scores: Mapping[str, float] = field(default_factory=dict, hash=False)
 
 
 @dataclass(frozen=True)
@@ -202,6 +208,8 @@ def run_focus_curve(
     reads_per_point: int = DEFAULT_READS,
     should_stop: Callable[[], bool] | None = None,
     on_point: Callable[[CurvePoint], None] | None = None,
+    snap: Callable[[], Mapping[str, np.ndarray]] | None = None,
+    on_images: Callable[[CurvePoint, Mapping[str, np.ndarray]], None] | None = None,
 ) -> CurveScan:
     """Step *actuator* through ±*half_range_um* around its position, reading the error.
 
@@ -233,6 +241,14 @@ def run_focus_curve(
         Polled before each step; return ``True`` to stop early.
     on_point
         Called with each point as it is measured (on the calling thread).
+    snap
+        If given, called at each position after the error is read; returns one image
+        per camera (``{camera: image}``). Each image's :func:`.imaging.focus_score`
+        goes into the point's ``scores``. A snap that raises ends the scan like a
+        failed move.
+    on_images
+        Called with each point and a :func:`.imaging.thumbnail` per camera, when
+        *snap* is given.
 
     Raises
     ------
@@ -297,8 +313,19 @@ def run_focus_curve(
             if not values:
                 continue
             std = statistics.pstdev(values) if len(values) > 1 else None
-            point = CurvePoint(z - z0, statistics.fmean(values), std, len(values))
+            scores: dict[str, float] = {}
+            thumbs: dict[str, np.ndarray] = {}
+            if snap is not None:
+                for camera, img in snap().items():
+                    scores[camera] = focus_score(img)
+                    if on_images is not None:
+                        thumbs[camera] = thumbnail(img)
+            point = CurvePoint(
+                z - z0, statistics.fmean(values), std, len(values), scores
+            )
             points.append(point)
+            if on_images is not None and thumbs:
+                on_images(point, thumbs)
             if on_point is not None:
                 on_point(point)
     except Exception as e:  # noqa: BLE001 - re-raised below after the restore
@@ -571,6 +598,38 @@ def analyze_focus_curve(points: Iterable[CurvePoint]) -> CurveAnalysis:
     )
 
 
+def sharpest_position(
+    points: Iterable[CurvePoint], camera: str
+) -> tuple[float, bool] | None:
+    """Where *camera*'s image was sharpest, as ``(z, inside)``.
+
+    The position is refined with a parabola through the sharpest point and its two
+    neighbours. *inside* is ``False`` when the sharpest image is at an end of the scan:
+    it may get sharper beyond it. ``None`` if no point has a score for *camera*.
+
+    Parameters
+    ----------
+    points
+        The scan's points.
+    camera
+        The camera label, as in ``CurvePoint.scores``.
+    """
+    pts = sorted((p for p in points if camera in p.scores), key=lambda p: p.z_um)
+    if not pts:
+        return None
+    k = max(range(len(pts)), key=lambda i: pts[i].scores[camera])
+    if k == 0 or k == len(pts) - 1:
+        return pts[k].z_um, False
+    (x0, y0), (x1, y1), (x2, y2) = (
+        (pts[i].z_um, pts[i].scores[camera]) for i in (k - 1, k, k + 1)
+    )
+    den = (x1 - x0) * (y1 - y2) - (x1 - x2) * (y1 - y0)
+    if den == 0:
+        return x1, True
+    num = (x1 - x0) ** 2 * (y1 - y2) - (x1 - x2) ** 2 * (y1 - y0)
+    return min(max(x1 - 0.5 * num / den, x0), x2), True
+
+
 def write_curve_csv(path: Path | str, scan: CurveScan, meta: dict[str, str]) -> None:
     """Save a scan as CSV: ``#``-prefixed metadata lines, then one row per point."""
     header = {"actuator": scan.actuator, "z0_um": f"{scan.z0_um:.4f}"}
@@ -586,7 +645,11 @@ def write_curve_csv(path: Path | str, scan: CurveScan, meta: dict[str, str]) -> 
     with open(path, "w", newline="", encoding="utf-8") as fh:
         fh.writelines(f"# {key}: {value}\n" for key, value in header.items())
         writer = csv.writer(fh)
-        writer.writerow(["z_rel_um", "z_abs_um", "error_counts", "error_std", "n"])
+        cameras = sorted({c for p in scan.points for c in p.scores})
+        writer.writerow(
+            ["z_rel_um", "z_abs_um", "error_counts", "error_std", "n"]
+            + [f"sharpness {c}" for c in cameras]
+        )
         for p in scan.points:
             writer.writerow(
                 [
@@ -596,4 +659,5 @@ def write_curve_csv(path: Path | str, scan: CurveScan, meta: dict[str, str]) -> 
                     "" if p.error_std is None else f"{p.error_std:.3f}",
                     p.n,
                 ]
+                + [f"{p.scores[c]:.6g}" if c in p.scores else "" for c in cameras]
             )

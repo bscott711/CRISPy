@@ -37,6 +37,7 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import numpy as np
 from psygnal import Signal
 from qtpy.QtCore import QObject, Qt, QTimer
 from qtpy.QtCore import Signal as QtSignal
@@ -305,6 +306,40 @@ _AXES: dict[str, SimAxis] = {
 _BY_STAGE = {ax.stage: ax for ax in _AXES.values()}
 
 
+class SimCamera:
+    """A camera on a sample of random dots that blur as either axis defocuses.
+
+    The image is sharpest a little away from where the piezo's CRISP locks
+    (``piezo_offset_um``), so the focus curve has an offset to report.
+    """
+
+    def __init__(self, size: int = 256, seed: int = 1) -> None:
+        rng = np.random.default_rng(seed)
+        self.rng = rng
+        self.spectrum = np.fft.fft2(rng.random((size, size)) ** 12 * 3000.0)
+        f = np.fft.fftfreq(size)
+        self.f2 = f[:, None] ** 2 + f[None, :] ** 2
+        self.piezo_offset_um = 0.4
+
+    def snap(self) -> np.ndarray:
+        defocus2 = 0.0
+        for ax in _AXES.values():
+            with ax.lock:
+                best = ax.z_focus + (
+                    self.piezo_offset_um if ax.label.endswith("P:34") else 0.0
+                )
+                defocus2 += (ax.z + ax.own - best) ** 2
+        sigma = 0.7 + 3.0 * math.sqrt(defocus2)  # blur, pixels
+        img = np.real(
+            np.fft.ifft2(self.spectrum * np.exp(-2 * (math.pi * sigma) ** 2 * self.f2))
+        )
+        img = img + 100.0 + self.rng.normal(0, 3.0, img.shape)
+        return np.clip(img, 0, 65535).astype(np.uint16)
+
+
+_CAMERA = SimCamera()
+
+
 # 1. Define the Mocks FIRST
 class MockEvents:
     propertyChanged = Signal(str, str, str)
@@ -385,6 +420,25 @@ class MockCMMCorePlus:
 
     def waitForDevice(self, label):
         time.sleep(0.005)
+
+    # --- camera ------------------------------------------------------------------
+    _image = None
+
+    def snapImage(self):
+        time.sleep(0.02)  # the exposure
+        self._image = _CAMERA.snap()
+
+    def getImage(self, *args):
+        return self._image
+
+    def getCameraDevice(self):
+        return "DemoCamera"
+
+    def getNumberOfCameraChannels(self):
+        return 1
+
+    def isSequenceRunning(self):
+        return False
 
 
 def _install_async_poller_shim() -> None:

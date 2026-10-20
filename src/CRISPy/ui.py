@@ -27,19 +27,20 @@ import threading
 import time
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pymmcore_plus import CMMCorePlus
 from qtpy.QtCore import QEvent, QObject, Qt, Signal
-from qtpy.QtGui import QWheelEvent
+from qtpy.QtGui import QImage, QPixmap, QWheelEvent
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QAbstractScrollArea,
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -49,6 +50,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -82,6 +84,7 @@ from .focus_curve import (
     analyze_focus_curve,
     run_focus_curve,
     scan_offsets,
+    sharpest_position,
     write_curve_csv,
 )
 from .hold import (
@@ -92,18 +95,25 @@ from .hold import (
     HoldTest,
     write_hold_csv,
 )
+from .imaging import snap_images, snap_provider
 from .plot import LinePlot, RefLine, Series
 from .sampling import Sampler, device_present, read_str
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
+    import numpy as np
     from pymmcore_widgets.control._async_poller import AsyncPoller
     from qtpy.QtGui import QCloseEvent, QHideEvent
 
     from .controller import CrispController
 
 _PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
+_CURVE_IMAGE_PX = 220  # the focus curve's image view
+# How long a focus-curve position waits for its snap on the GUI thread.
+_SNAP_TIMEOUT_S = 30.0
+# The summary suggests moving the lock point to the sharpest image beyond this, µm.
+_SHARPEST_OFFSET_UM = 0.3
 
 _POLL_INTERVAL_MS = 750
 # The slow poll reads the fast-changing values every tick and the rest (SNR is fixed
@@ -368,6 +378,46 @@ class CrispSnapshot:
     full: bool = False
 
 
+@dataclass
+class _Job:
+    fn: Callable[[], object]
+    done: threading.Event = field(default_factory=threading.Event)
+    result: object = None
+    error: Exception | None = None
+
+
+class _GuiCall(QObject):
+    """Run a function on the GUI thread for a worker thread, which waits for it.
+
+    The focus curve snaps the way a Snap button would, on the GUI thread (the host's
+    Snap expects it, and image viewers update there); the scan's worker blocks until
+    the frames, or the error, come back.
+    """
+
+    _request = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._request.connect(self._run)
+
+    def call(self, fn: Callable[[], object], timeout: float) -> object:
+        job = _Job(fn)
+        self._request.emit(job)  # queued: this runs on a worker thread
+        if not job.done.wait(timeout):
+            raise TimeoutError(f"no image within {timeout:.0f} s")
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+    def _run(self, job: _Job) -> None:
+        try:
+            job.result = job.fn()
+        except Exception as e:  # noqa: BLE001 - handed back to the waiting worker
+            job.error = e
+        finally:
+            job.done.set()
+
+
 class CrispControlPanel(QWidget):
     """Control + telemetry panel for a single CRISP axis."""
 
@@ -418,6 +468,9 @@ class CrispControlPanel(QWidget):
         self._curve_points: list[CurvePoint] = []
         self._curve_scan: CurveScan | None = None
         self._curve_analysis: CurveAnalysis | None = None
+        # (z, {camera: thumbnail}) per position, when the scan snapped images.
+        self._curve_thumbs: list[tuple[float, dict[str, np.ndarray]]] = []
+        self._gui_call = _GuiCall(self)
         self._hold: HoldTest | None = None
         self._hold_samples: list[HoldSample] = []
         self._hold_results: list[HoldResult] = []
@@ -724,12 +777,50 @@ class CrispControlPanel(QWidget):
         btns.addWidget(self.curve_save_btn)
         btns.addStretch()
         v.addLayout(btns)
+        self.curve_snap = QCheckBox("Snap an image at each position")
+        self.curve_snap.setToolTip(
+            "Snaps the way the host's Snap does (its cameras and illumination), or\n"
+            "with the core's current camera when the host doesn't provide that. Each\n"
+            "position takes an exposure (plus the camera's overhead) longer. The\n"
+            "images show the focus going in and out; their sharpness marks where the\n"
+            "image is in focus, to compare with the lock point."
+        )
+        v.addWidget(self.curve_snap)
 
         self.curve_status = QLabel("Needs the Ready state (LED on, unlocked).")
         self.curve_status.setWordWrap(True)
         v.addWidget(self.curve_status)
         self.curve_plot = LinePlot(x_label="z from start (µm)", y_label="error")
         v.addWidget(self.curve_plot)
+
+        self.curve_images_box = QWidget()
+        img_row = QHBoxLayout(self.curve_images_box)
+        img_row.setContentsMargins(0, 0, 0, 0)
+        self.curve_image = QLabel()
+        self.curve_image.setFixedSize(_CURVE_IMAGE_PX, _CURVE_IMAGE_PX)
+        self.curve_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.curve_image.setStyleSheet("background: black;")
+        img_row.addWidget(self.curve_image)
+        side = QVBoxLayout()
+        self.curve_camera = QComboBox()
+        self.curve_camera.setToolTip("Which camera's images and sharpness to show.")
+        self.curve_camera.currentIndexChanged.connect(self._on_curve_camera)
+        self.curve_image_slider = QSlider(Qt.Orientation.Horizontal)
+        self.curve_image_slider.setToolTip("Step through the images by position.")
+        self.curve_image_slider.valueChanged.connect(self._show_curve_image)
+        self.curve_image_caption = QLabel()
+        self.curve_sharp_plot = LinePlot(
+            x_label="z from start (µm)",
+            y_label="image sharpness (relative)",
+            min_height=110,
+        )
+        side.addWidget(self.curve_camera)
+        side.addWidget(self.curve_image_slider)
+        side.addWidget(self.curve_image_caption)
+        side.addWidget(self.curve_sharp_plot, 1)
+        img_row.addLayout(side, 1)
+        self.curve_images_box.setVisible(False)
+        v.addWidget(self.curve_images_box)
         self.curve_result_lbl = QLabel()
         self.curve_result_lbl.setWordWrap(True)
         self.curve_result_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -1070,6 +1161,8 @@ class CrispControlPanel(QWidget):
             self._on_dither_sample(payload)  # type: ignore[arg-type]
         elif kind == "curve_point":
             self._on_curve_point(payload)  # type: ignore[arg-type]
+        elif kind == "curve_images":
+            self._on_curve_images(payload)  # type: ignore[arg-type]
         elif kind == "curve_done":
             self._on_curve_done(payload)  # type: ignore[arg-type]
         elif kind == "curve_error":
@@ -1268,11 +1361,17 @@ class CrispControlPanel(QWidget):
             return
         half, step = self.curve_range.value(), self.curve_step.value()
         n = len(scan_offsets(half, step))
+        snap = self.curve_snap.isChecked()
+        if snap and snap_provider() is None and self.mmcore.isSequenceRunning():
+            self.curve_status.setText("Stop Live first: the scan snaps its own images.")
+            return
+        also = " and snap an image at each" if snap else ""
         if not self._confirm_move(
             f"Move {actuator} from {-half:g} to +{half:g} µm around its current "
-            f"position in {step:g} µm steps ({n} positions), then return it to the "
-            "start?\n\nThe scan stays inside the actuator's travel limits and leaves "
-            "out positions it can't reach. Don't touch the focus wheel while it runs."
+            f"position in {step:g} µm steps ({n} positions){also}, then return it to "
+            "the start?\n\nThe scan stays inside the actuator's travel limits and "
+            "leaves out positions it can't reach. Don't touch the focus wheel while "
+            "it runs."
         ):
             return
         if not self._begin_tool(_CURVE):
@@ -1280,6 +1379,10 @@ class CrispControlPanel(QWidget):
         self._curve_stop.clear()
         self._curve_points = []
         self._curve_analysis = None
+        self._curve_thumbs = []
+        self.curve_images_box.setVisible(False)
+        self.curve_image.clear()
+        self.curve_sharp_plot.clear()
         self.tools_tabs.setCurrentWidget(self._curve_tab)
         self.curve_status.setStyleSheet("")
         self.curve_status.setText(f"Scanning {n} positions…")
@@ -1293,14 +1396,27 @@ class CrispControlPanel(QWidget):
                 step,
                 self.curve_settle.value() / 1000.0,
                 self.curve_reads.value(),
+                snap,
             ),
             name=f"CRISPy-curve-{self.controller.label}",
             daemon=True,
         ).start()
 
     def _curve_worker(
-        self, actuator: str, half: float, step: float, settle: float, reads: int
+        self,
+        actuator: str,
+        half: float,
+        step: float,
+        settle: float,
+        reads: int,
+        snap: bool,
     ) -> None:
+        def snap_on_gui_thread() -> Mapping[str, np.ndarray]:
+            frames = self._gui_call.call(
+                lambda: snap_images(self.mmcore), _SNAP_TIMEOUT_S
+            )
+            return cast("Mapping[str, np.ndarray]", frames)
+
         try:
             scan = run_focus_curve(
                 self.mmcore,
@@ -1312,6 +1428,8 @@ class CrispControlPanel(QWidget):
                 reads_per_point=reads,
                 should_stop=self._curve_stop.is_set,
                 on_point=lambda p: self._emit("curve_point", p),
+                snap=snap_on_gui_thread if snap else None,
+                on_images=lambda p, t: self._emit("curve_images", (p, t)),
             )
         except Exception as e:  # noqa: BLE001 - reported in the panel
             self._emit("curve_error", str(e))
@@ -1327,6 +1445,55 @@ class CrispControlPanel(QWidget):
         )
         self._paint_curve()
 
+    def _on_curve_images(
+        self, payload: tuple[CurvePoint, Mapping[str, np.ndarray]]
+    ) -> None:
+        if self._active_tool != _CURVE:
+            return
+        point, thumbs = payload
+        self._curve_thumbs.append((point.z_um, dict(thumbs)))
+        for camera in thumbs:
+            if self.curve_camera.findText(camera) < 0:
+                self.curve_camera.addItem(camera)
+        self.curve_images_box.setVisible(True)
+        last = len(self._curve_thumbs) - 1
+        self.curve_image_slider.setRange(0, last)
+        if self.curve_image_slider.value() == last:
+            self._show_curve_image(last)
+        else:
+            self.curve_image_slider.setValue(last)
+
+    def _show_curve_image(self, index: int) -> None:
+        if not 0 <= index < len(self._curve_thumbs):
+            return
+        z, thumbs = self._curve_thumbs[index]
+        camera = self.curve_camera.currentText()
+        img = thumbs.get(camera)
+        if img is None:
+            if not thumbs:
+                return
+            camera, img = next(iter(thumbs.items()))
+        h, w = img.shape
+        qimg = QImage(img.tobytes(), w, h, w, QImage.Format.Format_Grayscale8).copy()
+        self.curve_image.setPixmap(
+            QPixmap.fromImage(qimg).scaled(
+                _CURVE_IMAGE_PX,
+                _CURVE_IMAGE_PX,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.curve_image_caption.setText(
+            f"{camera}: z = {z:+.2f} µm from the start "
+            f"({index + 1} / {len(self._curve_thumbs)})"
+        )
+
+    def _on_curve_camera(self) -> None:
+        self._show_curve_image(self.curve_image_slider.value())
+        self._paint_curve()
+        if self._curve_analysis is not None and self._active_tool != _CURVE:
+            self.curve_result_lbl.setText(self._curve_summary(self._curve_analysis))
+
     def _on_curve_done(self, scan: CurveScan) -> None:
         self._curve_scan = scan
         self._curve_points = list(scan.points)
@@ -1341,6 +1508,14 @@ class CrispControlPanel(QWidget):
         self.curve_result_lbl.setText(self._curve_summary(self._curve_analysis))
         if scan.completed and self._curve_analysis.slope:
             self._set_measured_slope(self._curve_analysis.slope)
+        sharp = sharpest_position(scan.points, self.curve_camera.currentText())
+        if sharp is not None and self._curve_thumbs:
+            # Show the sharpest image to start with.
+            nearest = min(
+                range(len(self._curve_thumbs)),
+                key=lambda i: abs(self._curve_thumbs[i][0] - sharp[0]),
+            )
+            self.curve_image_slider.setValue(nearest)
 
     def _on_curve_error(self, message: str) -> None:
         self.curve_status.setText(message)
@@ -1363,6 +1538,11 @@ class CrispControlPanel(QWidget):
             for pk in (a.peak_low, a.peak_high):
                 if pk is not None:
                     markers.append((pk[0], pk[1], _ORANGE))
+        camera = self.curve_camera.currentText()
+        sharp = sharpest_position(pts, camera) if a is not None and camera else None
+        if sharp is not None:
+            vlines.append(RefLine(sharp[0], _GREEN))
+        self._paint_sharpness(pts, camera, a, sharp)
         scan = self._curve_scan
         if a is not None and scan is not None and scan.limits_um is not None:
             for cut, limit in zip(
@@ -1381,6 +1561,52 @@ class CrispControlPanel(QWidget):
             markers=markers,
         )
 
+    def _paint_sharpness(
+        self,
+        pts: list[CurvePoint],
+        camera: str,
+        a: CurveAnalysis | None,
+        sharp: tuple[float, bool] | None,
+    ) -> None:
+        scored = [(p.z_um, p.scores[camera]) for p in pts if camera in p.scores]
+        if not scored:
+            self.curve_sharp_plot.clear()
+            return
+        top = max(score for _, score in scored) or 1.0
+        vlines = []
+        if sharp is not None:
+            vlines.append(RefLine(sharp[0], _GREEN, "sharpest", label_bottom=True))
+        if a is not None and a.crossing_um is not None:
+            vlines.append(RefLine(a.crossing_um, _BLUE, "lock point", dashed=False))
+        self.curve_sharp_plot.set_data(
+            [Series([z for z, _ in scored], [v / top for _, v in scored], _GREEN, 1.6)],
+            vlines=vlines,
+            x_range=(pts[0].z_um, pts[-1].z_um),
+        )
+
+    def _curve_sharpness_text(self, a: CurveAnalysis) -> str | None:
+        camera = self.curve_camera.currentText()
+        sharp = sharpest_position(self._curve_points, camera) if camera else None
+        if sharp is None:
+            return None
+        z, inside = sharp
+        if not inside:
+            end = "upper" if z > 0 else "lower"
+            return (
+                f"<b>Image sharpness</b> ({camera}) is highest at the {end} end of the "
+                f"scan ({z:+.1f} µm): the sharpest image is beyond it."
+            )
+        text = f"<b>Sharpest image</b> ({camera}, green line) at {z:+.2f} µm"
+        if a.crossing_um is None:
+            return text + " from the start."
+        d = z - a.crossing_um
+        text += f", {d:+.2f} µm from the lock point"
+        if abs(d) >= _SHARPEST_OFFSET_UM:
+            text += (
+                ". To lock at the sharpest image, move there in Ready and Set Offset"
+            )
+        return text + "."
+
     def _curve_summary(self, a: CurveAnalysis) -> str:
         if a.crossing_um is None:
             return (
@@ -1394,6 +1620,9 @@ class CrispControlPanel(QWidget):
                 "Ready at best focus moves it to 0.)"
             )
         ]
+        sharpness = self._curve_sharpness_text(a)
+        if sharpness:
+            lines.append(sharpness)
         res = a.resolution_nm
         slope = f"<b>Slope</b> {_fmt(a.slope, '+.1f')} counts/µm of the error readout"
         if res is not None:
