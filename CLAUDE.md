@@ -29,7 +29,7 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
   calibration gain/range/sensitivity (`counts_per_um()`), the paired
   `actuator_label`, joystick lockout, lock-offset setpoint
 - `ui.py` — `CrispControlPanel`: Qt-native control/calibration/telemetry panel with
-  the Dither / Focus curve / Hold test tabs
+  the Dither / Focus curve / Hold test tabs in a separate `_ToolsWindow`
 - `dither.py` — Qt-free Dither assistant: `read_dither_sample`, `DitherTracker`
   (median |Err|, steady-only peak-hold, Sum band check)
 - `focus_curve.py` — Qt-free `run_focus_curve` (step the actuator, read the error,

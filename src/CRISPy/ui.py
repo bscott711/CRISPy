@@ -59,6 +59,7 @@ from qtpy.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -555,6 +556,99 @@ class _CurveImagesWindow(QWidget):
         )
 
 
+class _Section(QWidget):
+    """A titled section whose body shows or hides when the title is clicked.
+
+    Parameters
+    ----------
+    title
+        The clickable title.
+    body
+        The widget shown when the section is expanded.
+    expanded
+        Whether the section starts expanded.
+    parent
+        Optional parent widget.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        body: QWidget,
+        *,
+        expanded: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._body = body
+        self.toggle_btn = QToolButton()
+        self.toggle_btn.setText(title)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle_btn.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; }"
+        )
+        self.toggle_btn.toggled.connect(self._set_expanded)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.toggle_btn)
+        v.addWidget(body)
+        self.toggle_btn.setChecked(expanded)
+        self._set_expanded(expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.toggle_btn.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._body.setVisible(expanded)
+
+
+class _ToolsWindow(QWidget):
+    """The diagnostic tools (Dither, Focus curve, Hold test) in a window of their own.
+
+    Not part of the panel: with their plots and the hold table they would make the
+    dock too big to leave room for the images. Closing the window stops a running
+    tool, as hiding the panel does.
+
+    Parameters
+    ----------
+    title
+        The window title.
+    tabs
+        The tools' tab widget.
+    on_close
+        Called when the window is closed.
+    parent
+        The panel; the window is closed and deleted with it.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        tabs: QTabWidget,
+        on_close: Callable[[], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(title)
+        self._tabs = tabs
+        self._on_close = on_close
+        QVBoxLayout(self).addWidget(tabs)
+        self.resize(640, 780)
+
+    def show_tab(self, tab: QWidget | None = None) -> None:
+        """Select *tab* (if given) and bring the window up."""
+        if tab is not None:
+            self._tabs.setCurrentWidget(tab)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        self._on_close()
+        super().closeEvent(event)
+
+
 class CrispControlPanel(QWidget):
     """Control + telemetry panel for a single CRISP axis."""
 
@@ -720,6 +814,7 @@ class CrispControlPanel(QWidget):
             "different, internal scale (on the rig ~300× the measured slope), so it\n"
             "is not used for conversions."
         )
+        self.sensitivity_lbl.setWordWrap(True)
         grid.addWidget(self.sensitivity_lbl, next_row, 0, 1, 4)
         self.stability_lbl = QLabel("In-loop error: --")
         self.stability_lbl.setToolTip(
@@ -728,6 +823,7 @@ class CrispControlPanel(QWidget):
             "This is the error inside the feedback loop: it can look quiet while\n"
             "the actuator moves. Use the Hold test to measure the focus motion."
         )
+        self.stability_lbl.setWordWrap(True)
         grid.addWidget(self.stability_lbl, next_row + 1, 0, 1, 4)
         layout.addWidget(ro_box)
 
@@ -760,7 +856,8 @@ class CrispControlPanel(QWidget):
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
-        cal_box = QGroupBox("Calibration  (1. Log Cal → 2. Dither → 3. Set Gain)")
+        cal_box = QGroupBox("Calibration")
+        cal_box.setToolTip("In order: 1. Log Cal → 2. Dither → 3. Set Gain.")
         cal = QHBoxLayout(cal_box)
         self.btn_log = QPushButton("1. Log Cal")
         self.btn_log.clicked.connect(self._on_log_cal_clicked)
@@ -772,7 +869,7 @@ class CrispControlPanel(QWidget):
             cal.addWidget(b)
         layout.addWidget(cal_box)
 
-        # --- diagnostics --------------------------------------------------
+        # --- diagnostics (in a window of their own; see _ToolsWindow) -----
         self.tools_tabs = QTabWidget()
         self._dither_tab = self._build_dither_tab()
         self._curve_tab = self._build_curve_tab()
@@ -780,13 +877,32 @@ class CrispControlPanel(QWidget):
         self.tools_tabs.addTab(self._dither_tab, "Dither")
         self.tools_tabs.addTab(self._curve_tab, "Focus curve")
         self.tools_tabs.addTab(self._hold_tab, "Hold test")
-        layout.addWidget(self.tools_tabs)
+        self.tools_window = _ToolsWindow(
+            f"CRISP diagnostics: {self.controller.label}",
+            self.tools_tabs,
+            self._stop_tools,
+            parent=self,
+        )
+        tools_row = QHBoxLayout()
+        self.tools_btn = QPushButton("Diagnostics…")
+        self.tools_btn.setToolTip(
+            "Opens the Dither assistant, the Focus curve and the Hold test in a\n"
+            "window of their own. Closing it stops a running tool."
+        )
+        self.tools_btn.clicked.connect(lambda: self.tools_window.show_tab())
+        self.tools_running_lbl = QLabel()
+        self.tools_running_lbl.setStyleSheet(f"color: {_ORANGE}; font-weight: bold;")
+        tools_row.addWidget(self.tools_btn)
+        tools_row.addWidget(self.tools_running_lbl)
+        tools_row.addStretch()
+        layout.addLayout(tools_row)
 
         # --- parameters (reused pymmcore-widgets property controls) -------
-        param_box = QGroupBox("Parameters")
-        form = QFormLayout(param_box)
+        param_body = QWidget()
+        form = QFormLayout(param_body)
         self._add_parameter_widgets(form)
-        layout.addWidget(param_box)
+        self.params_section = _Section("Parameters", param_body)
+        layout.addWidget(self.params_section)
 
         layout.addStretch()
         self._sync_tool_controls()
@@ -1187,6 +1303,7 @@ class CrispControlPanel(QWidget):
         # slow poll's refresh.
         self._do(self.controller.set_dither, refresh=False)
         self._start_dither()
+        self.tools_window.show_tab(self._dither_tab)
 
     def _on_joystick_toggled(self, checked: bool) -> None:
         """Manual joystick override; independent of the auto lock/unlock logic."""
@@ -1232,6 +1349,7 @@ class CrispControlPanel(QWidget):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_tools()
+        self.tools_window.close()
         if self._curve_images is not None:
             self._curve_images.close()
         if self._curve_frames is not None:
@@ -1273,6 +1391,9 @@ class CrispControlPanel(QWidget):
     def _sync_tool_controls(self) -> None:
         tool = self._active_tool
         curve = tool == _CURVE
+        self.tools_running_lbl.setText(
+            f"{_TOOL_TITLES[tool]} running" if tool is not None else ""
+        )
         # The focus curve moves the actuator; nothing else may change state meanwhile.
         for b in (
             self.btn_idle_ready,
