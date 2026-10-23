@@ -15,7 +15,9 @@ diagnostic tools behave the way they should on hardware:
 * in Dither the error reads the change across the dither move (slope x cal_range),
   with large temporary values for a moment after the screw moves;
 * while locked, the actuator jitters by roughly error noise / slope, less with more
-  averaging and lower loop gain, and follows a slow thermal drift of the sample.
+  averaging and lower loop gain, and follows a slow thermal drift of the sample;
+* unlocked, each actuator only wanders by itself (the piezo by ~20 nm, the stage by
+  ~2 nm), so an unlocked hold test shows the actuator's own noise.
 
 A **Demo controls** dock lets you turn each axis's screw and change Averages and Loop
 Gain. The piezo starts badly aligned (like this rig's 2026-08-14 log), the stage well
@@ -35,6 +37,7 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
+import numpy as np
 from psygnal import Signal
 from qtpy.QtCore import QObject, Qt, QTimer
 from qtpy.QtCore import Signal as QtSignal
@@ -69,13 +72,16 @@ class SimAxis:
         slope_max: float,
         sign: int,
         noise: float,
+        actuator_noise_um: float,
         cal_range: float,
         snr: float,
         agc: int,
         max_lock_range: str,
+        travel_um: tuple[float, float],
     ) -> None:
         self.lock = threading.RLock()
         self.label, self.stage = label, stage
+        self.travel_um = travel_um  # the actuator's firmware limits; moves clamp there
         self.z = z  # actuator position, µm
         self.z_focus = z  # actuator position at which the surface is in focus
         self.screw = screw  # detector lateral adjustment screw, 0..1
@@ -84,6 +90,8 @@ class SimAxis:
         self.sign = sign
         self.width = 2.0  # µm from the lock point to the curve's peaks
         self.noise = noise  # error noise per read, counts rms
+        self.actuator_noise_um = actuator_noise_um  # the actuator's own wander
+        self.own = 0.0  # current own-wander offset, µm
         self.cal_range = cal_range
         self.snr = snr
         self.agc = agc
@@ -201,7 +209,12 @@ class SimAxis:
             self._advance(now)
             dt, self.t_last = now - self.t_last, now
             if self.state not in _LOCKED:
-                return self.z
+                # Not driven by CRISP: only the actuator's own slow wander (1 s memory).
+                a = math.exp(-dt / 1.0)
+                self.own = a * self.own + math.sqrt(1 - a * a) * random.gauss(
+                    0, self.actuator_noise_um
+                )
+                return self.z + self.own
             # The servo chasing sensor noise: correlated jitter with a 0.3 s memory.
             a = math.exp(-dt / 0.3)
             self.jitter = a * self.jitter + math.sqrt(1 - a * a) * random.gauss(
@@ -226,7 +239,7 @@ class SimAxis:
                 n = int(self.props["Number of Averages"])
                 return random.gauss(0, self.noise / math.sqrt(2**n))
             return (
-                self.diff(self.z - self.z_focus)
+                self.diff(self.z + self.own - self.z_focus)  # the actuator's own wander
                 - self.lock_offset
                 + random.gauss(0, self.noise)
             )
@@ -264,10 +277,12 @@ _AXES: dict[str, SimAxis] = {
         slope_max=3800.0,
         sign=-1,
         noise=3.0,
+        actuator_noise_um=0.002,
         cal_range=0.677,
         snr=4.6,
         agc=41,
         max_lock_range="0.1000",
+        travel_um=(-5000.0, 5000.0),
     ),
     "CRISPAFocus:P:34": SimAxis(
         "CRISPAFocus:P:34",
@@ -279,13 +294,50 @@ _AXES: dict[str, SimAxis] = {
         slope_max=450.0,
         sign=-1,
         noise=6.0,
+        actuator_noise_um=0.02,
         cal_range=0.675,
         snr=7.1,
         agc=60,
         max_lock_range="2.0000",
+        # A 150 µm piezo with focus 2.2 µm above its lower limit.
+        travel_um=(-22.0, 128.0),
     ),
 }
 _BY_STAGE = {ax.stage: ax for ax in _AXES.values()}
+
+
+class SimCamera:
+    """A camera on a sample of random dots that blur as either axis defocuses.
+
+    The image is sharpest a little away from where the piezo's CRISP locks
+    (``piezo_offset_um``), so the focus curve has an offset to report.
+    """
+
+    def __init__(self, size: int = 256, seed: int = 1) -> None:
+        rng = np.random.default_rng(seed)
+        self.rng = rng
+        self.spectrum = np.fft.fft2(rng.random((size, size)) ** 12 * 3000.0)
+        f = np.fft.fftfreq(size)
+        self.f2 = f[:, None] ** 2 + f[None, :] ** 2
+        self.piezo_offset_um = 0.4
+
+    def snap(self) -> np.ndarray:
+        defocus2 = 0.0
+        for ax in _AXES.values():
+            with ax.lock:
+                best = ax.z_focus + (
+                    self.piezo_offset_um if ax.label.endswith("P:34") else 0.0
+                )
+                defocus2 += (ax.z + ax.own - best) ** 2
+        sigma = 1.2 + 3.0 * math.sqrt(defocus2)  # blur, pixels (optics: > 1 px)
+        img = np.real(
+            np.fft.ifft2(self.spectrum * np.exp(-2 * (math.pi * sigma) ** 2 * self.f2))
+        )
+        img = img + 100.0 + self.rng.normal(0, 3.0, img.shape)
+        return np.clip(img, 0, 65535).astype(np.uint16)
+
+
+_CAMERA = SimCamera()
 
 
 # 1. Define the Mocks FIRST
@@ -337,6 +389,10 @@ class MockCMMCorePlus:
     # --- property access ---------------------------------------------------
     def getProperty(self, label, prop):
         time.sleep(_SERIAL_LATENCY_S)  # one simulated serial round trip
+        if label in _BY_STAGE:
+            lo, hi = _BY_STAGE[label].travel_um
+            limits = {"LowerLim(mm)": lo / 1000, "UpperLim(mm)": hi / 1000}
+            return f"{limits[prop]:.6f}"  # KeyError -> caller suppresses
         return _AXES[label].get(prop)  # KeyError -> caller suppresses
 
     def setProperty(self, label, prop, value):
@@ -359,10 +415,30 @@ class MockCMMCorePlus:
         with ax.lock:
             if ax.state in _LOCKED:
                 raise RuntimeError("COD 47: the focus axis is locked")
-            ax.z = float(z)
+            lo, hi = ax.travel_um
+            ax.z = min(max(float(z), lo), hi)  # stops at the limit, no error
 
     def waitForDevice(self, label):
         time.sleep(0.005)
+
+    # --- camera ------------------------------------------------------------------
+    _image = None
+
+    def snapImage(self):
+        time.sleep(0.02)  # the exposure
+        self._image = _CAMERA.snap()
+
+    def getImage(self, *args):
+        return self._image
+
+    def getCameraDevice(self):
+        return "DemoCamera"
+
+    def getNumberOfCameraChannels(self):
+        return 1
+
+    def isSequenceRunning(self):
+        return False
 
 
 def _install_async_poller_shim() -> None:
