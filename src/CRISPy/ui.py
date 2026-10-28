@@ -13,14 +13,17 @@ the ASITiger device-adapter properties:
 * derived metrics -> actuator-type badge, error *sensitivity* (counts/µm) from the
                      calibration, the focus error expressed in microns, and the
                      in-loop error fluctuation while locked
-* diagnostics     -> the Dither assistant (:mod:`CRISPy.dither`), the focus curve
+* diagnostics     -> the Dither assistant (:mod:`CRISPy.dither`, a collapsible
+                     section of the panel), the focus curve
                      (:mod:`CRISPy.focus_curve`) and the hold test (:mod:`CRISPy.hold`)
+                     (the last two in a window of their own)
 * parameters      -> reused ``pymmcore_widgets.PropertyWidget`` controls
 """
 
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import re
 import statistics
@@ -34,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import QEvent, QObject, Qt, Signal
+from qtpy.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from qtpy.QtGui import QColor, QImage, QPixmap, QWheelEvent
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -64,7 +67,13 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .controller import CAL_GAIN_PROP, CAL_RANGE_PROP, counts_per_um
+from .controller import (
+    CAL_GAIN_PROP,
+    CAL_RANGE_PROP,
+    LED_PROP,
+    counts_per_um,
+    should_reapply_led,
+)
 from .dither import (
     DEFAULT_WINDOW_S,
     DITHER_STATES,
@@ -114,6 +123,9 @@ if TYPE_CHECKING:
 
     from .controller import CrispController
 
+logger = logging.getLogger(__name__)
+
+_LED_REAPPLY_DELAY_MS = 200  # debounce after a LED Intensity edit
 _PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
 # How long a focus-curve position waits for its snap on the GUI thread.
 _SNAP_TIMEOUT_S = 30.0
@@ -152,7 +164,7 @@ _READOUTS: list[tuple[str, str, str]] = [
         (
             "In the Dither state: the change in focus error across the dither move.\n"
             "Turn the detector lateral adjustment screw for the largest absolute\n"
-            "value (ASI: at least ±100; > 200 is plenty). See the Dither tab.\n"
+            "value (ASI: at least ±100; > 200 is plenty). See the Dither section.\n"
             "In other states: the focus error, measured inside the feedback loop."
         ),
     ),
@@ -220,7 +232,10 @@ _PARAMS: list[tuple[str, str, str]] = [
         "LED Intensity (%)",
         (
             "UL X. More light improves signal-to-noise (ASI default 50%).\n"
-            "Redo Log Cal after changing it."
+            "Redo Log Cal after changing it.\n"
+            "A new intensity takes effect when the LED is relit: in Idle (LED on)\n"
+            "or Ready the panel relights it for you. While locked, unlock and\n"
+            "re-lock to apply it (the panel does not relight a locked axis)."
         ),
     ),
     (
@@ -604,18 +619,18 @@ class _Section(QWidget):
 
 
 class _ToolsWindow(QWidget):
-    """The diagnostic tools (Dither, Focus curve, Hold test) in a window of their own.
+    """The Focus curve and Hold test in a window of their own.
 
     Not part of the panel: with their plots and the hold table they would make the
     dock too big to leave room for the images. Closing the window stops a running
-    tool, as hiding the panel does.
+    tool, as hiding the panel does. (The small Dither assistant stays in the panel.)
 
     Parameters
     ----------
     title
         The window title.
     tabs
-        The tools' tab widget.
+        The tab widget holding the tools.
     on_close
         Called when the window is closed.
     parent
@@ -634,7 +649,7 @@ class _ToolsWindow(QWidget):
         self._tabs = tabs
         self._on_close = on_close
         QVBoxLayout(self).addWidget(tabs)
-        self.resize(640, 780)
+        self.resize(540, 520)  # min. 506 x 435 (offscreen); the plots take the rest
 
     def show_tab(self, tab: QWidget | None = None) -> None:
         """Select *tab* (if given) and bring the window up."""
@@ -842,6 +857,28 @@ class CrispControlPanel(QWidget):
         op.addWidget(self.btn_lock, 0, 1)
         op.addWidget(self.btn_offset, 1, 0)
         op.addWidget(self.btn_save, 1, 1)
+        self.btn_led = QPushButton("LED On")
+        self.btn_led.setCheckable(True)
+        self.btn_led.setToolTip(
+            "Turn this axis's LED on or off by itself (no recalibration, no lock).\n"
+            "Addressed to this axis's own card, so the Z and P axes are independent.\n"
+            "A new LED Intensity takes effect when the LED is relit: in Idle (LED on)\n"
+            "or Ready the panel relights it after you change it; while locked, unlock\n"
+            "and re-lock to apply it (the panel does not relight a locked axis)."
+        )
+        self.btn_led.clicked.connect(self._on_led_clicked)
+        op.addWidget(self.btn_led, 2, 0, 1, 2)
+        # Shown only while the last LED write failed; cleared on the next success.
+        self.led_error_lbl = QLabel()
+        self.led_error_lbl.setWordWrap(True)
+        self.led_error_lbl.setStyleSheet(f"color: {_RED};")
+        self.led_error_lbl.hide()
+        op.addWidget(self.led_error_lbl, 3, 0, 1, 2)
+        # Debounces LED Intensity edits into one relight (see _on_led_intensity_edited).
+        self._led_timer = QTimer(self)
+        self._led_timer.setSingleShot(True)
+        self._led_timer.setInterval(_LED_REAPPLY_DELAY_MS)
+        self._led_timer.timeout.connect(self._reapply_led)
         self.joystick_chk = QCheckBox("Joystick enabled")
         self.joystick_chk.setChecked(True)
         self.joystick_chk.setToolTip(
@@ -852,7 +889,7 @@ class CrispControlPanel(QWidget):
             " locked."
         )
         self.joystick_chk.toggled.connect(self._on_joystick_toggled)
-        op.addWidget(self.joystick_chk, 2, 0, 1, 2)
+        op.addWidget(self.joystick_chk, 4, 0, 1, 2)
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
@@ -869,25 +906,29 @@ class CrispControlPanel(QWidget):
             cal.addWidget(b)
         layout.addWidget(cal_box)
 
-        # --- diagnostics (in a window of their own; see _ToolsWindow) -----
+        # --- Dither assistant (compact, in the panel; collapsed until used) ---
+        self.dither_section = _Section("Dither", self._build_dither_body())
+        self.dither_section.toggle_btn.toggled.connect(self._on_dither_section_toggled)
+        layout.addWidget(self.dither_section)
+
+        # --- Focus curve / Hold test (in a window of their own; _ToolsWindow) -
         self.tools_tabs = QTabWidget()
-        self._dither_tab = self._build_dither_tab()
         self._curve_tab = self._build_curve_tab()
         self._hold_tab = self._build_hold_tab()
-        self.tools_tabs.addTab(self._dither_tab, "Dither")
         self.tools_tabs.addTab(self._curve_tab, "Focus curve")
         self.tools_tabs.addTab(self._hold_tab, "Hold test")
         self.tools_window = _ToolsWindow(
-            f"CRISP diagnostics: {self.controller.label}",
+            f"CRISP focus curve / hold test: {self.controller.label}",
             self.tools_tabs,
-            self._stop_tools,
+            self._stop_window_tools,
             parent=self,
         )
         tools_row = QHBoxLayout()
-        self.tools_btn = QPushButton("Diagnostics…")
+        self.tools_btn = QPushButton("Focus curve / Hold test…")
         self.tools_btn.setToolTip(
-            "Opens the Dither assistant, the Focus curve and the Hold test in a\n"
-            "window of their own. Closing it stops a running tool."
+            "Opens the Focus curve and the Hold test in a window of their own.\n"
+            "Closing it stops a running tool. (The Dither assistant is the\n"
+            "Dither section above.)"
         )
         self.tools_btn.clicked.connect(lambda: self.tools_window.show_tab())
         self.tools_running_lbl = QLabel()
@@ -907,15 +948,18 @@ class CrispControlPanel(QWidget):
         layout.addStretch()
         self._sync_tool_controls()
 
-    def _build_dither_tab(self) -> QWidget:
-        tab = QWidget()
-        v = QVBoxLayout(tab)
+    def _build_dither_body(self) -> QWidget:
+        """Build the Dither assistant's widgets (kept narrow: it sits in the panel)."""
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(0, 0, 0, 0)
         self.dither_status = QLabel()
         self.dither_status.setWordWrap(True)
         v.addWidget(self.dither_status)
 
         row = QHBoxLayout()
         self.dither_level_lbl = QLabel("|Err| --")
+        self.dither_level_lbl.setWordWrap(True)
         self.dither_level_lbl.setStyleSheet("font-weight: bold; font-size: 22px;")
         self.dither_level_lbl.setToolTip(
             "Median of |Dither Err| over the smoothing window, so the brief jumps\n"
@@ -929,7 +973,9 @@ class CrispControlPanel(QWidget):
         v.addLayout(row)
 
         self.dither_sum_lbl = QLabel("Sum --")
+        self.dither_sum_lbl.setWordWrap(True)
         self.dither_detail_lbl = QLabel()
+        self.dither_detail_lbl.setWordWrap(True)
         self.dither_detail_lbl.setToolTip(
             "Scatter: the standard deviation of |Err| over the smoothing window, in\n"
             "counts and as % of |Err|. Counts compare directly between axes; a large\n"
@@ -938,7 +984,9 @@ class CrispControlPanel(QWidget):
         v.addWidget(self.dither_sum_lbl)
         v.addWidget(self.dither_detail_lbl)
 
-        self.dither_plot = LinePlot(x_label="seconds ago", y_label="|Err|")
+        self.dither_plot = LinePlot(
+            x_label="seconds ago", y_label="|Err|", min_height=120
+        )
         v.addWidget(self.dither_plot)
 
         ctl = QHBoxLayout()
@@ -967,11 +1015,13 @@ class CrispControlPanel(QWidget):
         ctl.addWidget(self.dither_watch_btn)
         ctl.addWidget(self.dither_reset_btn)
         ctl.addStretch()
-        ctl.addWidget(QLabel("Smoothing:"))
+        smooth_lbl = QLabel("Smooth:")  # short: the row must stay narrow
+        smooth_lbl.setToolTip(self.dither_window.toolTip())
+        ctl.addWidget(smooth_lbl)
         ctl.addWidget(self.dither_window)
         v.addLayout(ctl)
         self._paint_dither(force=True)
-        return tab
+        return body
 
     def _build_curve_tab(self) -> QWidget:
         tab = QWidget()
@@ -1251,6 +1301,10 @@ class CrispControlPanel(QWidget):
             wdg.setMaximumWidth(_PARAM_MAX_WIDTH)
             wdg.setToolTip(tip)
             self._install_wheel_guard(wdg)
+            if prop == LED_PROP:
+                # Emitted after the widget wrote the property, for user edits only
+                # (a refresh from the core blocks the value widget's signals).
+                wdg.valueChanged.connect(self._on_led_intensity_edited)
             name = QLabel(friendly)
             name.setToolTip(tip)
             form.addRow(name, wdg)
@@ -1284,6 +1338,54 @@ class CrispControlPanel(QWidget):
         else:
             self._do(self.controller.set_idle)
 
+    def _set_led_button(self, on: bool) -> None:
+        self.btn_led.blockSignals(True)
+        self.btn_led.setChecked(on)
+        self.btn_led.blockSignals(False)
+        self.btn_led.setText("LED Off" if on else "LED On")
+
+    def _led_write(self, on: bool) -> bool:
+        """Light or darken this axis's LED; show the error in the panel if it fails.
+
+        Unlike `_do`, a failure is logged and shown (not swallowed): the LED button
+        used to flip to "on" even when nothing was sent. Returns True on success.
+        """
+        self._stop_hold()  # changing the state ends a hold test
+        ok = True
+        try:
+            self.controller.set_led(on)
+        except (RuntimeError, ValueError) as exc:
+            ok = False
+            logger.warning("CRISP %s: LED write failed: %s", self.controller.label, exc)
+            self.led_error_lbl.setText(f"LED command failed: {exc}")
+            self.led_error_lbl.show()
+        else:
+            self.led_error_lbl.clear()
+            self.led_error_lbl.hide()
+        self._full_read_due = True
+        if self._active_tool is None:
+            self._poller.poll_now(force=True)
+        return ok
+
+    def _on_led_clicked(self, checked: bool) -> None:
+        ok = self._led_write(checked)
+        self._set_led_button(checked if ok else not checked)
+
+    def _on_led_intensity_edited(self, _value: object = None) -> None:
+        """A new LED Intensity only lights up once the LED is relit: debounce it."""
+        self._led_timer.start()
+
+    def _reapply_led(self) -> None:
+        """Relight the LED so a new intensity takes effect (Idle with LED on, Ready).
+
+        Guarded on the cached state (no serial read on the GUI thread); never sent
+        while locked, calibrating or dithering, or while a diagnostic tool runs.
+        """
+        if self._active_tool is not None:
+            return
+        if should_reapply_led(self._last_state, self.btn_led.isChecked()):
+            self._led_write(True)
+
     def _on_lock(self) -> None:
         if self.controller.get_state() in _LOCKED_STATES:
             self._do(self.controller.set_unlock)
@@ -1303,7 +1405,6 @@ class CrispControlPanel(QWidget):
         # slow poll's refresh.
         self._do(self.controller.set_dither, refresh=False)
         self._start_dither()
-        self.tools_window.show_tab(self._dither_tab)
 
     def _on_joystick_toggled(self, checked: bool) -> None:
         """Manual joystick override; independent of the auto lock/unlock logic."""
@@ -1383,6 +1484,10 @@ class CrispControlPanel(QWidget):
 
     def _stop_tools(self) -> None:
         self._stop_dither()
+        self._stop_window_tools()
+
+    def _stop_window_tools(self) -> None:
+        """Stop the tools of the Focus curve / Hold test window (not the Dither)."""
         self._stop_hold()
         if self._active_tool == _CURVE:
             # The worker returns the actuator to its start, then reports back.
@@ -1438,6 +1543,11 @@ class CrispControlPanel(QWidget):
             self._on_hold_done(payload)  # type: ignore[arg-type]
 
     # ------------------------------------------------------- dither assistant
+    def _on_dither_section_toggled(self, expanded: bool) -> None:
+        """Collapsing the section stops a running assistant (as hiding the panel)."""
+        if not expanded:
+            self._stop_dither()
+
     def _on_dither_watch_toggled(self, checked: bool) -> None:
         if checked:
             self._start_dither()
@@ -1453,7 +1563,7 @@ class CrispControlPanel(QWidget):
         self._dither_outside = 0
         self._dither_last_in = float("-inf")
         self._dither_next_state = 0.0
-        self.tools_tabs.setCurrentWidget(self._dither_tab)
+        self.dither_section.toggle_btn.setChecked(True)  # show it, no pop-up
         label = self.controller.label
         self._dither_sampler = Sampler(
             self._read_dither,
@@ -2418,6 +2528,7 @@ class CrispControlPanel(QWidget):
         self.stability_lbl.setText(f"{text} rms · pk-pk {ptp:.0f} cts")
 
     def _update_state(self, state: str) -> None:
+        previous_state = self._last_state
         if state != self._last_state:
             # Errors from different states aren't comparable (Dither shows its swing).
             self._error_history.clear()
@@ -2437,6 +2548,13 @@ class CrispControlPanel(QWidget):
         led_on = bool(state) and state != "Idle"
         self.btn_idle_ready.setText("Set Idle (LED off)" if led_on else "Set Ready")
         locked = state in _LOCKED_STATES
+        # A direct LED-on leaves the state at "Idle", so there the button keeps the
+        # user's choice; entering or leaving Idle resets it (every other state is lit).
+        if state and state != "Idle":
+            self._set_led_button(True)
+        elif state == "Idle" and previous_state != "Idle":
+            self._set_led_button(False)
+        self.btn_led.setEnabled(not locked)
         self.btn_lock.setText("Unlock" if locked else "Lock")
 
         # Auto joystick lockout: only act on a lock/unlock *transition*, so a

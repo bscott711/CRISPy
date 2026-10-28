@@ -29,7 +29,8 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
   calibration gain/range/sensitivity (`counts_per_um()`), the paired
   `actuator_label`, joystick lockout, lock-offset setpoint
 - `ui.py` — `CrispControlPanel`: Qt-native control/calibration/telemetry panel with
-  the Dither / Focus curve / Hold test tabs in a separate `_ToolsWindow`
+  a collapsible Dither section in the panel and the Focus curve / Hold test tabs in
+  a separate `_ToolsWindow`
 - `dither.py` — Qt-free Dither assistant: `read_dither_sample`, `DitherTracker`
   (median |Err|, steady-only peak-hold, Sum band check)
 - `focus_curve.py` — Qt-free `run_focus_curve` (step the actuator, read the error,
@@ -75,6 +76,18 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
 Sources: the ASI CRISP manual (docs.asiimaging.com/crisp_manual), ASI's CRISP plugin
 page, and the ASITiger adapter source (`DeviceAdapters/ASITiger/ASICRISP.cpp` in
 micro-manager/mmCoreAndDevices).
+
+- **The per-axis LED button sends a raw addressed `LK F=90` (rig, 2026-10-28).** The
+  adapter has no `CRISP State` for "LED on", and Set Ready from Idle leaves the LED
+  dark. So `set_led(True)` writes `<card char>LK F=90` to the hub's `SerialCommand`
+  property (card hex 32 -> `2` for Z, 34 -> `4` for P; an unprefixed command hits the
+  default card), and Off sends `<c>LK F=79`. The hub drops a command identical to its
+  last one unless `OnlySendSerialCommandOnChange` is No, so the write forces that and
+  restores it. The rig config has no `Parent,` lines for the CRISP devices, so
+  `getParentLabel` is empty and the hub is found by library + `SerialCommand` property.
+  The firmware applies `LED Intensity` (`UL X=`) only when the LED is (re)lit, so an
+  intensity change re-sends `F=90` after a debounce, only in Idle/Ready with no tool
+  running; never while locked or calibrating.
 
 - **The knob is the detector lateral adjustment screw, turned in Dither** for the
   largest *absolute* dither Err (≥ 100 per ASI's plugin, > 200 plenty), with Sum in

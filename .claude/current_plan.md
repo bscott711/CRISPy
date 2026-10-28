@@ -1,32 +1,95 @@
-# Compact panel: diagnostics in their own window
+# Dither back in the panel; Set Ready and the LED
 
-**Status: implemented; tests and an offscreen render of the demo panel pass. Not yet
-seen on the rig** (CRISPy branch `feat/crisp-unlocked-hold-and-na`).
+**Status: Dither layout implemented; 141 tests pass, ruff format clean, no new ruff
+errors. Not yet seen on the rig.** LED: researched, no code change (needs a bench probe
+and the user's choice). Branch `feat/crisp-unlocked-hold-and-na`.
 
-## Why
+## 1. Dither inside the panel (implemented)
 
-The Dither / Focus curve / Hold test tabs, with their plots, intro text and 13-column
-hold table, sat inside each axis's panel. A tab widget is as large as its largest
-page, so with two axes side by side the CRISPy dock took most of the main window and
-left little room to see the cells.
+The user: Dither "pops a giant window up"; they preferred it in the plugin, just not so
+wide. Commit `cc12c60` had moved all three tools into `_ToolsWindow` because a tab widget
+is as large as its largest page (Focus curve, Hold table). Dither alone is small.
 
-## What changed (`ui.py`)
+- `ui.py`: Dither is a collapsible `_Section("Dither")` right after the Calibration box,
+  collapsed by default. **2. Dither** expands it and starts the assistant; no window pops
+  up. Collapsing the section stops a running Dither.
+- `_ToolsWindow` holds only Focus curve and Hold test (button "Focus curve / Hold
+  test…"); closing it stops only those two. Default size `resize(540, 520)` (was
+  640×780).
+- The Dither body is narrow: word-wrapped labels, plot `min_height=120`, "Smooth:" label.
+  Its minimum width (412 px offscreen) is below the Calibration box's (438), so the
+  panel's minimum width is unchanged (460 px offscreen; Windows fonts measured 304 px in
+  `cc12c60`).
+- Hide, close and MDA start still stop every tool (`_stop_tools` = Dither + window tools).
 
-- The tools' `QTabWidget` moved into `_ToolsWindow`, a top-level window owned by the
-  panel (`CRISP diagnostics: <label>`). The panel has a **Diagnostics…** button and an
-  orange `<tool> running` label.
-- **2. Dither** opens the window on the Dither tab (the assistant is what you watch
-  while turning the screw). A Dither state seen by the poll only selects the tab; it
-  doesn't pop a window up unasked.
-- Closing the window stops a running tool, as hiding the panel already did.
-- **Parameters** is a collapsible `_Section`, collapsed by default.
-- The Calibration box title is just "Calibration" (the order is in its tooltip and the
-  button numbers); the Sensitivity and In-loop labels word-wrap. Both had set the
-  panel's minimum width.
+## 2. Set Ready after Set Idle leaves the LED dark (research; no change)
 
-## Checked
+CRISPy writes exactly what ASI's adapter and plugin expect: "Ready" makes the adapter
+send `LK F=85` and "Idle" `LK F=79` (`ASICRISP.cpp:373-378`, unconditional write). The
+manual's state table calls code 85 **Unlock** and lists Ready as "LED on - @ button
+locks"; the documented way from Idle to Ready is a short press of the `@` button, and it
+warns that `LK F=` "out-of-sequence events are not necessarily handled smoothly". What the
+firmware does with 85 while Idle is undocumented. ASI's own adapter only sends 85 from
+Idle immediately followed by Lock (83), and ASI's plugin has no Ready button.
 
-Measured with real Windows fonts (`WA_DontShowOnScreen`), per panel: minimum size
-460×897 → 304×477 px, size hint 517×1033 → 304×493. Two axes side by side now fit in
-about 670×500. 141 CRISPy tests and the host's `test_crisp_snap_provider.py` pass;
-ruff clean; mypy at the 12 errors `ui.py` already had.
+Next step is a bench probe, then the user picks an option:
+
+1. Idle → Set Ready: does Sum stay near 0 (LED dark)?
+2. In that state, rewrite `LED Intensity` with its current value (adapter sends
+   `UL X=n`): does Sum come back?
+3. Lock → Unlock: Sum back (the user says yes)?
+
+If (2) relights it, Set Ready from Idle can also rewrite `LED Intensity` with the value
+it read (property through the Core; a direct effect of the user's button). If not, the
+options are a label/tooltip change (the button text assumes any non-Idle state means
+LED on, `ui.py` `_update_state`) plus a hint to use Lock/Unlock, or `LK F=90` (LED On)
+through the hub's `SerialCommand` (raw serial; failed before on this rig for the
+joystick, needs the user's OK).
+
+---
+
+## LED On button and LED Intensity apply (separate feature)
+
+Separate feature, appended (the Dither plan above is uncommitted, so it is kept here
+rather than replaced). Rig-unverified.
+
+### Root cause: LED On never relit the LED
+
+- The rig config `20260630-OPM.cfg` has `Parent,` lines for the stages only, none for
+  `CRISPAFocus:Z:32` / `CRISPAFocus:P:34`. The adapter still finds its hub through
+  MMCore's same-module inference (`DeviceManager.cpp:256-278`), but
+  `getParentLabel` returns the stored parent ID, `""` (`MMCore.cpp:1280-1288`).
+- `set_led(True)` then read `getProperty("", "OnlySendSerialCommandOnChange")`, which
+  raises ("No device with label"), and `ui.py` `_do` swallowed it with
+  `suppress(Exception)` while the button still flipped to "on".
+- Second bug: the adapter skips a `CRISP State` write equal to its cached state
+  (`ASICRISP.cpp:409-413`), and a raw `LK F=90` from Idle still reads back Idle, so
+  LED Off through `set_idle()` would have been a no-op. (Section 2 above calls the
+  state write "unconditional"; in this adapter version only `ForceSetFocusState` is.)
+
+### Changes
+
+1. `controller.py`: `_hub_label()` uses the parent label, else the single loaded
+   `HubDevice` of the same library with a `SerialCommand` property (else a clear
+   `RuntimeError`), cached. `_send_addressed()` writes `<card char>LK F=..` with
+   `OnlySendSerialCommandOnChange` forced to No and restored. `set_led(True)` sends
+   `LK F=90`, `set_led(False)` sends `LK F=79`. `set_idle()` unchanged.
+   `should_reapply_led(state, led_on)`: True only for Idle/Ready with the LED on.
+2. `ui.py`: `_led_write()` shows failures in a red label under the LED button and in
+   the log, and reverts the button. An LED Intensity edit (PropertyWidget
+   `valueChanged`) restarts a 200 ms single-shot timer; on timeout the panel relights
+   the LED if `should_reapply_led(_last_state, button on)` and no tool is running.
+   Never while locked, calibrating or dithering; the tooltips say to unlock and re-lock.
+3. Tests: hub fallback (none/one/two hubs), caching, raw Off, guard table (163 pass).
+
+### Bench check
+
+1. P axis: Set Idle, then LED On: lit? LED Off: dark? On again: lit? Repeat on Z, and
+   check the other axis does not change.
+2. Idle with LED on: drag LED Intensity; the power meter follows about 0.2 s after you
+   stop.
+3. Ready: change the intensity. Does it apply, and does the state still read Ready
+   (F=90 in Ready is undocumented)?
+4. Locked: change the intensity. Nothing is sent and the state stays locked; Unlock
+   and re-lock apply it.
+5. Error path: no red message under the LED button during 1-4.
