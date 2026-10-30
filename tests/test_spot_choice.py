@@ -1,4 +1,4 @@
-"""Which panel gets the Spot lock section (pure logic, no Qt)."""
+"""Which panel is the camera lock panel (pure logic, no Qt)."""
 
 from CRISPy.spot_choice import choose_spot_index
 

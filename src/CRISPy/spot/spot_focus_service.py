@@ -36,24 +36,14 @@ from .spot_frame_shm import FrameBuffer, unlink_by_name
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from ..controller import CrispController
     from .spot_focus import EdgeCalibration, FocusCalibration, SpotLoopParams
     from .spot_frame_shm import LiveFrame
 
 logger = logging.getLogger(__name__)
 
 PIEZO_P_LABEL = "PiezoStage:P:34"
-CRISP_STATE_PROP = "CRISP State"
 CRISP_LED_PROP = "LED Intensity"
-#: Settable CRISP state that stands in for a reported "locked" state on restore.
-_LOCKED_STATES = frozenset({"Lock", "In Focus", "Focusing"})
-#: CRISP states in which the LED is already lit; ``led_on`` leaves them alone.
-_LIT_STATES = _LOCKED_STATES | {
-    "Ready",
-    "Dither",
-    "loG_cal",
-    "gain_Cal",
-    "Calibrating",
-}
 DEFAULT_SOURCE_SPEC: dict[str, Any] = {"kind": "toupcam"}
 
 
@@ -66,19 +56,11 @@ def _edge_text(reason: str) -> str:
     return f"edge not measurable: {reason or 'no usable frames'}"
 
 
-def _as_boxes(boxes: Sequence[Any]) -> list[tuple[int, int, int, int]]:
-    """One box ``(x, y, w, h)`` or a list of 1-2 boxes, as a list of boxes."""
-    seq = list(boxes)
-    if seq and not hasattr(seq[0], "__len__"):  # numbers: a single box
-        seq = [seq]
-    if not 1 <= len(seq) <= 2:
-        raise ValueError(f"need one or two edge boxes, got {len(seq)}")
-    out = []
-    for box in seq:
-        if len(box) != 4:
-            raise ValueError(f"an edge box is (x, y, w, h), not {box!r}")
-        out.append(tuple(int(v) for v in box))
-    return out  # type: ignore[return-value]
+def _as_box(box: Sequence[Any]) -> tuple[int, int, int, int]:
+    """One edge box ``(x, y, w, h)`` as a tuple of ints."""
+    if len(box) != 4:
+        raise ValueError(f"an edge box is (x, y, w, h), not {box!r}")
+    return tuple(int(v) for v in box)  # type: ignore[return-value]
 
 
 class SpotFocusService:
@@ -92,14 +74,23 @@ class SpotFocusService:
     piezo_label : str
         The piezo the loop drives (default ``"PiezoStage:P:34"``).
     crisp_label : str or None
-        The CRISP device. When set, :meth:`led_on` (and :meth:`start`) put it
-        in ``Ready``, which lights the LED; the previous state is restored
-        when the last user (preview, lock, manual) lets go.
+        The CRISP device. When set (and no *crisp* is given) an
+        :class:`~CRISPy.controller.ASICrispController` is built for it on first
+        use. :meth:`led_on` then lights the LED with a raw serial command
+        (``set_led``) while some user (preview, lock, manual) holds it, and
+        :meth:`led_off` switches it off when the last one lets go. The CRISP
+        state is never touched.
     source_spec : dict
         Passed to ``make_source`` in the worker (``{"kind": "toupcam"}`` or
         ``{"kind": "fake", ...}``).
     led_intensity : float or None
         CRISP LED intensity to set on :meth:`start` (``None`` leaves it).
+    ready_timeout_s : float
+        How long :meth:`wait_ready` waits for the worker by default.
+    crisp : CrispController or None
+        The CRISP controller for the LED and the piezo joystick. The panel
+        passes the host's own; None builds one from *crisp_label*, or means no
+        LED / joystick handling.
     """
 
     telemetry = Signal(dict)
@@ -118,10 +109,15 @@ class SpotFocusService:
         *,
         led_intensity: float | None = None,
         ready_timeout_s: float = 30.0,
+        crisp: CrispController | None = None,
     ) -> None:
         self._mmc = mmc
         self._piezo = piezo_label
-        self._crisp = crisp_label
+        self._crisp_label = crisp_label
+        self._crisp_ctl: CrispController | None = crisp
+        #: The lazy build of the controller from the label was tried and failed.
+        self._crisp_failed = False
+        self._crisp_build_lock = threading.Lock()
         self._led = led_intensity
         self._ready_timeout = ready_timeout_s
         self._spec = dict(source_spec or DEFAULT_SOURCE_SPEC)
@@ -147,11 +143,13 @@ class SpotFocusService:
         self._fb_name: str | None = None
         self._fb_lock = threading.Lock()
         self._meas: Queue[dict] = Queue()
-        self._prev_crisp: str | None = None
-        #: Who needs the LED lit ("preview", "lock", "manual", ...). CRISP is
-        #: restored when the last one lets go.
+        #: Who needs the LED lit ("preview", "lock", "manual", ...). It goes off
+        #: when the last one lets go.
         self._led_owners: set[str] = set()
         self._led_lock = threading.RLock()
+        #: The piezo joystick is off (the lock runs); see ``_set_joystick_locked``.
+        self._joystick_locked = False
+        self._joystick_lock = threading.Lock()
         self._last_fault: str | None = None
         self._moves: list[float] = []  # setPosition durations (ms)
         self._move_times: list[float] = []  # wall times of moves
@@ -179,6 +177,11 @@ class SpotFocusService:
     def current_state(self) -> str:
         """The service state: idle, preview, running, stopped or fault."""
         return self._state
+
+    @property
+    def joystick_locked(self) -> bool:
+        """True while the piezo joystick is disabled for the running lock."""
+        return self._joystick_locked
 
     @property
     def preview_active(self) -> bool:
@@ -231,7 +234,7 @@ class SpotFocusService:
         calibration: FocusCalibration | EdgeCalibration,
         led_intensity: float | None = None,
     ) -> None:
-        """Set CRISP to Ready, read P once, and start the loop.
+        """Light the CRISP LED, read P once, and start the loop.
 
         *calibration* is a :class:`~.spot_focus.FocusCalibration`; a single
         :class:`~.spot_focus.EdgeCalibration` is wrapped into a one-edge one.
@@ -256,7 +259,7 @@ class SpotFocusService:
             raise RuntimeError("spot focus worker did not become ready")
         p_start = float(self._mmc.getPosition(self._piezo))
         params = self._with_travel_limits(params, p_start)
-        self.led_on(led_intensity, owner="lock", force_ready=True)
+        self.led_on(led_intensity, owner="lock")
         self._last_fault = None
         self._moves.clear()
         self._move_times.clear()
@@ -312,13 +315,14 @@ class SpotFocusService:
         return params
 
     def stop(self) -> None:
-        """Stop the loop and restore CRISP. Never moves P.
+        """Stop the loop, release the LED and the joystick. Never moves P.
 
         Back to ``preview`` if the live view was on, else ``stopped``.
         """
         self._send({"type": "stop"})
         if self._state != "fault":
             self._set_state("preview" if self._preview else "stopped")
+        self._set_joystick_locked(False)
         self.led_off("lock")
 
     def start_preview(self) -> None:
@@ -352,25 +356,14 @@ class SpotFocusService:
     def set_edge_box(self, box: Sequence[float] | None) -> None:
         """Set the edge box ``(x, y, w, h)`` the preview measures; None removes it.
 
-        While the lock runs the calibration's own box is measured instead.
+        While the lock runs the calibration's own box is measured instead. When
+        it is the held calibration's box (see :meth:`set_calibration`) the
+        preview telemetry also carries the focus error ``along_um``.
         """
         self._send(
             {
                 "type": "set_edge_box",
                 "box": None if box is None else [int(v) for v in box],
-            }
-        )
-
-    def set_edge_boxes(self, boxes: Sequence[Sequence[float]]) -> None:
-        """Set the 0-2 edge boxes the preview measures; empty removes them.
-
-        When they are the held calibration's boxes (see :meth:`set_calibration`)
-        the preview telemetry also carries the fused error ``along_um``.
-        """
-        self._send(
-            {
-                "type": "set_edge_boxes",
-                "boxes": [[int(v) for v in box] for box in boxes],
             }
         )
 
@@ -437,12 +430,15 @@ class SpotFocusService:
         if self._shutting_down:
             return
         self._shutting_down = True
-        # Restore whenever start() changed CRISP, not only once the worker has
+        # Release whenever start() lit the LED, not only once the worker has
         # reported "running": Stop or close right after Start used to leave
-        # CRISP in Ready (seen on the rig PC, 2026-10-27).
+        # the LED on (seen on the rig PC, 2026-10-27).
         with self._led_lock:
+            had_led = bool(self._led_owners)
             self._led_owners.clear()
-            self._restore_crisp()
+            if had_led:
+                self._send_led(False)
+        self._set_joystick_locked(False)
         self._send({"type": "shutdown"})
         # The reader keeps draining meanwhile: a worker blocked on a full pipe
         # would never read ``shutdown``.
@@ -466,79 +462,132 @@ class SpotFocusService:
     @property
     def crisp_label(self) -> str | None:
         """The CRISP device label, ``None`` when there is no CRISP device."""
-        return self._crisp or None
+        if self._crisp_ctl is not None:
+            return self._crisp_ctl.label
+        return self._crisp_label or None
 
     @property
     def led_is_on(self) -> bool:
         """True while some user holds the LED lit (always False with no CRISP)."""
-        return bool(self._crisp) and bool(self._led_owners)
+        return bool(self._led_owners)
 
-    def crisp_state(self) -> str | None:
-        """The CRISP device's current ``CRISP State`` (``None`` if unreadable)."""
-        if not self._crisp:
-            return None
-        try:
-            return str(self._mmc.getProperty(self._crisp, CRISP_STATE_PROP))
-        except Exception:
-            logger.warning("could not read the CRISP state", exc_info=True)
-            return None
+    def _controller(self) -> CrispController | None:
+        """The CRISP controller, built from the label on first use; None if none.
 
-    def led_on(
-        self,
-        intensity: float | None = None,
-        *,
-        owner: str = "manual",
-        force_ready: bool = False,
-    ) -> None:
-        """Light the CRISP LED: put CRISP in ``Ready`` and set the intensity.
-
-        The state CRISP was in is remembered once, when the first *owner*
-        arrives, and restored when the last one calls :meth:`led_off`. A state
-        in which the LED is already lit (Ready, Lock, Dither, ...) is left
-        alone unless *force_ready*. *intensity* (else the one given at
-        construction) is set every call. Does nothing without a CRISP device.
+        A failing build is logged once and the service then runs without one.
         """
-        if not self._crisp:
+        if self._crisp_ctl is not None or self._crisp_failed:
+            return self._crisp_ctl
+        if not self._crisp_label:
+            return None
+        with self._crisp_build_lock:
+            if self._crisp_ctl is None and not self._crisp_failed:
+                try:
+                    from ..controller import ASICrispController
+
+                    self._crisp_ctl = ASICrispController(self._crisp_label, self._mmc)
+                except Exception:
+                    self._crisp_failed = True
+                    logger.warning(
+                        "could not build the CRISP controller for %r; the LED and "
+                        "the joystick are left alone",
+                        self._crisp_label,
+                        exc_info=True,
+                    )
+        return self._crisp_ctl
+
+    def _send_led(self, on: bool) -> None:
+        """Switch the LED with a raw command; errors are logged, never raised."""
+        ctl = self._controller()
+        if ctl is None:
+            return
+        try:
+            ctl.set_led(on)
+        except Exception:
+            logger.warning(
+                "could not switch the CRISP LED %s",
+                "on" if on else "off",
+                exc_info=True,
+            )
+
+    def _write_led_intensity(self) -> None:
+        ctl = self._controller()
+        if ctl is None or self._led is None:
+            return
+        try:
+            self._mmc.setProperty(ctl.label, CRISP_LED_PROP, self._led)
+        except Exception:
+            logger.warning("could not set the CRISP LED intensity", exc_info=True)
+
+    def led_on(self, intensity: float | None = None, *, owner: str = "manual") -> None:
+        """Light the CRISP LED for *owner*: set the intensity, then switch it on.
+
+        The raw ``set_led(True)`` is sent when the first *owner* arrives; later
+        owners only join. *intensity* (else the one given at construction) is
+        set every call. Never raises (errors are logged) and does nothing
+        without a CRISP controller.
+        """
+        if self._controller() is None:
             return
         with self._led_lock:
             first = not self._led_owners
             self._led_owners.add(owner)
-            try:
-                if first:
-                    cur = str(self._mmc.getProperty(self._crisp, CRISP_STATE_PROP))
-                    self._prev_crisp = None
-                    if cur != "Ready" and (force_ready or cur not in _LIT_STATES):
-                        self._prev_crisp = cur
-                        self._mmc.setProperty(self._crisp, CRISP_STATE_PROP, "Ready")
-                if intensity is not None:
-                    self._led = intensity
-                if self._led is not None:
-                    self._mmc.setProperty(self._crisp, CRISP_LED_PROP, self._led)
-            except Exception:
-                self._led_owners.discard(owner)
-                if not self._led_owners:
-                    self._restore_crisp()
-                raise
+            if intensity is not None:
+                self._led = intensity
+            self._write_led_intensity()
+            if first:
+                self._send_led(True)
 
     def led_off(self, owner: str = "manual") -> None:
-        """Let go of the LED; restores CRISP once no owner is left."""
+        """Let go of the LED; it goes off once no owner is left.
+
+        Idempotent and never raises. Does nothing for an *owner* that does not
+        hold the LED.
+        """
         with self._led_lock:
+            if owner not in self._led_owners:
+                return
             self._led_owners.discard(owner)
             if not self._led_owners:
-                self._restore_crisp()
+                self._send_led(False)
 
     def set_led_intensity(self, value: float) -> None:
         """Change the LED intensity; applied at once if the LED is lit."""
         self._led = value
         if self.led_is_on:
             with self._led_lock:
-                self._mmc.setProperty(self._crisp, CRISP_LED_PROP, self._led)
+                self._write_led_intensity()
+
+    # -- piezo joystick ---------------------------------------------------
+
+    def _set_joystick_locked(self, locked: bool) -> None:
+        """Disable (*locked*) or restore the piezo joystick; once per transition.
+
+        Called on entering and leaving ``running`` and on every stop / fault /
+        shutdown path, so a crash cannot leave the wheel dead. Idempotent, never
+        raises (errors are logged), and does nothing without a CRISP controller.
+        """
+        ctl = self._controller()
+        if ctl is None:
+            return
+        with self._joystick_lock:
+            if locked == self._joystick_locked:
+                return
+            self._joystick_locked = locked
+            try:
+                ctl.set_joystick_enabled(not locked)
+            except Exception:
+                logger.warning(
+                    "could not %s the piezo joystick",
+                    "disable" if locked else "restore",
+                    exc_info=True,
+                )
 
     # -- calibration ------------------------------------------------------
 
     def calibrate(
         self,
-        boxes: Sequence[Any],
+        box: Sequence[Any],
         *,
         span_um: float = 2.0,
         steps: int = 9,
@@ -546,19 +595,15 @@ class SpotFocusService:
         settle_s: float = 0.25,
         record_path: str | Path | None = None,
     ) -> FocusCalibration:
-        """Sweep P around its current value, measure one or two edges and fit them.
+        """Sweep P around its current value, measure the edge and fit it.
 
         The user has focused on the cells, so the current P is the zero (best
         focus). The sweep goes in increasing P over ``+-span_um / 2``; at each
         step the worker snaps *n_frames* fresh frames (it drops stale ones) and
-        measures the edge in every box **on the same frames**. P goes back to
-        the start, the edges are measured once more (a drift / hysteresis
-        check) and each edge is fitted on its own: its own slope and sign, zero
-        (mean of the start and end measurement), noise, angle and contrast.
-
-        An edge that cannot be measured, leaves its box or does not fit is
-        dropped with a warning ``"edge K dropped: <message>"`` (K counts the
-        boxes from 1); the calibration fails only if no edge survives.
+        measures the edge in the box. P goes back to the start, the edge is
+        measured once more (a drift / hysteresis check) and fitted: its slope
+        and sign, zero (mean of the start and end measurement), noise, angle
+        and contrast.
 
         Only while the loop is stopped and no acquisition runs. Uses
         ``waitForDevice`` (this polls the Tiger, which is fine for a short,
@@ -569,9 +614,8 @@ class SpotFocusService:
 
         Parameters
         ----------
-        boxes : Sequence
-            One edge box ``(x, y, w, h)`` or a list of one or two boxes, in
-            sensor pixels. Box 1 is the main edge.
+        box : Sequence
+            The edge box ``(x, y, w, h)`` in sensor pixels.
         span_um : float
             Total sweep span in um of P.
         steps : int
@@ -584,24 +628,23 @@ class SpotFocusService:
         record_path : str | Path | None
             If given, save the sweep there with ``numpy.savez_compressed``
             (``.npz`` is appended): ``p_um``, ``edge_px`` of shape
-            ``(steps, n_boxes)`` (nan where an edge was not measured), ``boxes``,
-            ``axes``, ``polarities``, ``frames`` (one raw frame per step) and
-            ``p_c``, ``e_start``, ``e_end``, ``noise_px`` (one value per box).
+            ``(steps, 1)`` (nan where the edge was not measured), ``boxes``
+            ``(1, 4)``, ``axes``, ``polarities``, ``frames`` (one raw frame per
+            step) and ``p_c``, ``e_start``, ``e_end``, ``noise_px`` (one value).
 
         Returns
         -------
         FocusCalibration
-            One or two edges with a common zero P (the start P). Its
-            ``warnings`` list the dropped edges and the edges' own warnings
-            (prefixed with the edge number when there are two boxes).
+            The edge with its zero P (the start P). Its ``warnings`` list the
+            edge's own warnings.
 
         Raises
         ------
         RuntimeError
             If the loop or an acquisition is running, or the worker is dead.
         ValueError
-            With a plain message (edge 1's first) if no edge can be measured,
-            stays in its box and gives a usable line.
+            With a plain message if the edge cannot be measured, leaves its box
+            or gives no usable line.
         """
         import numpy as np
 
@@ -615,73 +658,52 @@ class SpotFocusService:
         if not self.wait_ready():
             raise RuntimeError("spot focus worker did not become ready")
         mmc = self._mmc
-        sboxes = [snap_box(b) for b in _as_boxes(boxes)]
-        nb = len(sboxes)
+        sbox = snap_box(_as_box(box))
         # Every measurement of the sweep (and so the stored calibration) uses the
         # detector setting as it is now.
         det = self.detector_setting
         p_c = float(mmc.getPosition(self._piezo))
         ps = p_c + np.linspace(-span_um / 2.0, span_um / 2.0, steps)
         n_zero = max(2 * n_frames, 10)
-        self.led_on(owner="calibrate", force_ready=True)
+        self.led_on(owner="calibrate")
         resume_preview = self._preview
         if resume_preview:  # pause Live without touching the service state
             self._send({"type": "preview_stop"})
         centred = False
         try:
-            m0 = self._snap_edges(
-                n_zero, p_c, [(b, None, None) for b in sboxes], False, [det] * nb
-            )
-            ent0 = m0["edges"]
-            errors: dict[int, str] = {}  # box index -> why it is dropped
-            for k, ent in enumerate(ent0):
-                if ent["n"] == 0:
-                    errors[k] = _edge_text(ent.get("reason", ""))
-            axes = [e.get("axis") for e in ent0]
-            pols = [e.get("polarity") for e in ent0]
-            alive = [k for k in range(nb) if k not in errors]
-            if not alive:
-                raise ValueError(errors[min(errors)])
-            specs = [(sboxes[k], axes[k], pols[k]) for k in alive]
-            spec_dets = [det] * len(alive)
-            edge_px = np.full((len(ps), nb), np.nan)
+            m0 = self._snap_edge(n_zero, p_c, sbox, None, None, False, det)
+            if m0["n"] == 0:
+                raise ValueError(_edge_text(m0.get("reason", "")))
+            axis, pol = m0.get("axis"), m0.get("polarity")
+            edge_px = np.full(len(ps), np.nan)
             frames: list[Any] = []
             for s, p in enumerate(ps):
                 mmc.setPosition(self._piezo, float(p))
                 mmc.waitForDevice(self._piezo)
                 time.sleep(settle_s)
-                m = self._snap_edges(n_frames, float(p), specs, True, spec_dets)
-                for k, ent in zip(alive, m["edges"], strict=True):
-                    if ent["n"]:
-                        edge_px[s, k] = float(ent["edge_mean"])
-                    elif "left the box" in str(ent.get("reason", "")):
-                        errors.setdefault(k, _edge_text(ent["reason"]))
+                m = self._snap_edge(n_frames, float(p), sbox, axis, pol, True, det)
+                if m["n"]:
+                    edge_px[s] = float(m["edge_mean"])
+                elif "left the box" in str(m.get("reason", "")):
+                    raise ValueError(_edge_text(m["reason"]))
                 frames.append(m.get("frame"))
-                if all(k in errors for k in alive):
-                    raise ValueError(errors[min(errors)])
             mmc.setPosition(self._piezo, p_c)
             mmc.waitForDevice(self._piezo)
             time.sleep(settle_s)
-            m1 = self._snap_edges(n_zero, p_c, specs, False, spec_dets)
+            m1 = self._snap_edge(n_zero, p_c, sbox, axis, pol, False, det)
             centred = True
-            e_start = np.full(nb, np.nan)
-            e_end = np.full(nb, np.nan)
-            noise = np.zeros(nb)
-            for k in alive:
-                e_start[k] = float(ent0[k]["edge_mean"])
-                noise[k] = float(ent0[k]["edge_sd"])
-            for k, ent in zip(alive, m1["edges"], strict=True):
-                if ent["n"]:
-                    e_end[k] = float(ent["edge_mean"])
+            e_start = float(m0["edge_mean"])
+            e_end = float(m1["edge_mean"]) if m1["n"] else math.nan
+            noise = float(m0["edge_sd"])
             warns: list[str] = []
             saved = self._save_record(
                 record_path,
                 p_um=ps,
-                edge_px=edge_px,
+                edge_px=edge_px[:, None],
                 frames=frames,
-                boxes=np.asarray(sboxes),
-                axes=np.asarray([a or "" for a in axes]),
-                polarities=np.asarray([int(p or 0) for p in pols]),
+                boxes=np.asarray([sbox]),
+                axes=np.asarray([axis or ""]),
+                polarities=np.asarray([int(pol or 0)]),
                 p_c=p_c,
                 e_start=e_start,
                 e_end=e_end,
@@ -689,55 +711,40 @@ class SpotFocusService:
             )
             if record_path is not None and saved is None:
                 warns.append("could not save the calibration record")
-            fitted: dict[int, Any] = {}
-            for k in alive:
-                if k in errors:
-                    continue
-                own: list[str] = []
-                if math.isfinite(e_end[k]):
-                    e0 = 0.5 * (e_start[k] + e_end[k])
-                else:
-                    e0 = float(e_start[k])
-                    own.append("could not re-measure the edge at the start position")
-                try:
-                    edge = fit_edge_calibration(
-                        ps.tolist(),
-                        edge_px[:, k].tolist(),
-                        box=sboxes[k],
-                        axis=str(axes[k]),
-                        polarity=int(pols[k]),
-                        p0_um=p_c,
-                        e0_px=e0,
-                        noise_px=float(noise[k]),
-                        angle_deg=float(ent0[k]["angle_mean"]),
-                        contrast=float(ent0[k]["contrast_mean"]),
-                        linear_range_um=span_um / 2.0,
-                        detector=det[0],
-                        detector_sigma_px=det[1],
-                        edge_width_px=float(ent0[k].get("edge_width_mean", math.nan)),
-                    )
-                except ValueError as exc:
-                    errors[k] = str(exc)
-                    continue
-                drift = abs(e_end[k] - e_start[k])
-                if math.isfinite(drift) and drift > max(
-                    3.0 * noise[k], 0.05 * abs(edge.slope_px_per_um)
-                ):
-                    own.append(
-                        f"the edge moved {drift:.2f} px between the start and the "
-                        "end of the sweep (drift or hysteresis)"
-                    )
-                edge.warnings.extend(own)
-                fitted[k] = edge
-            if not fitted:
-                raise ValueError(errors[min(errors)])
-            for k in sorted(errors):
-                warns.append(f"edge {k + 1} dropped: {errors[k]}")
-            for k, edge in fitted.items():
-                prefix = f"edge {k + 1}: " if nb > 1 else ""
-                warns.extend(prefix + w for w in edge.warnings)
+            own: list[str] = []
+            if math.isfinite(e_end):
+                e0 = 0.5 * (e_start + e_end)
+            else:
+                e0 = e_start
+                own.append("could not re-measure the edge at the start position")
+            edge = fit_edge_calibration(
+                ps.tolist(),
+                edge_px.tolist(),
+                box=sbox,
+                axis=str(axis),
+                polarity=int(pol),
+                p0_um=p_c,
+                e0_px=e0,
+                noise_px=noise,
+                angle_deg=float(m0["angle_mean"]),
+                contrast=float(m0["contrast_mean"]),
+                linear_range_um=span_um / 2.0,
+                detector=det[0],
+                detector_sigma_px=det[1],
+                edge_width_px=float(m0.get("edge_width_mean", math.nan)),
+            )
+            drift = abs(e_end - e_start)
+            if math.isfinite(drift) and drift > max(
+                3.0 * noise, 0.05 * abs(edge.slope_px_per_um)
+            ):
+                own.append(
+                    f"the edge moved {drift:.2f} px between the start and the "
+                    "end of the sweep (drift or hysteresis)"
+                )
+            edge.warnings.extend(own)
+            warns.extend(edge.warnings)
             return FocusCalibration(
-                edges=list(fitted.values()),
+                edge=edge,
                 p0_um=p_c,
                 created=datetime.now().isoformat(timespec="seconds"),
                 record_path="" if saved is None else str(saved),
@@ -754,7 +761,7 @@ class SpotFocusService:
                                 "type": "measure",
                                 "n_frames": 1,
                                 "p_um": p_c,
-                                "boxes": [{"box": list(sboxes[0])}],
+                                "box": list(sbox),
                                 "timeout_s": 0.5,
                             },
                             1,
@@ -765,31 +772,30 @@ class SpotFocusService:
                     self._send({"type": "preview_start"})
 
     def zero(self, cal: FocusCalibration, *, n_frames: int = 8) -> FocusCalibration:
-        """Make the present edge positions the zero (best focus) of *cal*.
+        """Make the present edge position the zero (best focus) of *cal*.
 
-        Reads P once, measures every edge in its box with its axis and
-        polarity on the same frames, and returns :meth:`FocusCalibration.rezeroed`
-        of them. The slopes and the range are kept. Only while the loop is
-        stopped; sends no move.
+        Reads P once, measures the edge in its box with its axis and polarity,
+        and returns :meth:`FocusCalibration.rezeroed` of it. The slope and the
+        range are kept. Only while the loop is stopped; sends no move.
 
         Parameters
         ----------
         cal : FocusCalibration
-            The calibration to re-zero (one or two edges).
+            The calibration to re-zero.
         n_frames : int
             Good frames to average.
 
         Returns
         -------
         FocusCalibration
-            *cal* with every ``e0_px`` and ``p0_um`` at the present edges and P.
+            *cal* with ``e0_px`` and ``p0_um`` at the present edge and P.
 
         Raises
         ------
         RuntimeError
             If the loop is running or the worker is dead.
         ValueError
-            If any edge cannot be measured (the reason is in the message).
+            If the edge cannot be measured (the reason is in the message).
         """
         if self._state == "running":
             raise RuntimeError("stop the loop before zeroing")
@@ -798,22 +804,21 @@ class SpotFocusService:
         p = float(self._mmc.getPosition(self._piezo))
         self.led_on(owner="zero")
         try:
-            m = self._snap_edges(
+            e = cal.edge
+            m = self._snap_edge(
                 n_frames,
                 p,
-                [(e.box, e.axis, e.polarity) for e in cal.edges],
+                e.box,
+                e.axis,
+                e.polarity,
                 False,
-                [(e.detector, e.detector_sigma_px) for e in cal.edges],
+                (e.detector, e.detector_sigma_px),
             )
         finally:
             self.led_off("zero")
-        for k, ent in enumerate(m["edges"]):
-            if ent["n"] == 0:
-                text = _edge_text(ent.get("reason", ""))
-                raise ValueError(
-                    f"edge {k + 1}: {text}" if len(cal.edges) > 1 else text
-                )
-        return cal.rezeroed([float(ent["edge_mean"]) for ent in m["edges"]], p)
+        if m["n"] == 0:
+            raise ValueError(_edge_text(m.get("reason", "")))
+        return cal.rezeroed(float(m["edge_mean"]), p)
 
     def measure(
         self,
@@ -821,8 +826,8 @@ class SpotFocusService:
         p_um: float | None = None,
         *,
         box: Sequence[Any],
-        axis: str | Sequence[str | None] | None = None,
-        polarity: int | Sequence[int | None] | None = None,
+        axis: str | None = None,
+        polarity: int | None = None,
         return_frame: bool = False,
     ) -> dict:
         """One averaged edge measurement from the worker (loop stopped).
@@ -830,84 +835,60 @@ class SpotFocusService:
         Parameters
         ----------
         n_frames : int
-            Good frames to average per box; all were exposed after the request.
+            Good frames to average; all were exposed after the request.
         p_um : float | None
             P the fake camera should follow (a real camera ignores it).
         box : Sequence
-            One edge box ``(x, y, w, h)`` in sensor pixels, or a list of one or
-            two boxes, all measured on the same frames.
-        axis : str | Sequence[str | None] | None
+            The edge box ``(x, y, w, h)`` in sensor pixels.
+        axis : str | None
             ``"x"`` / ``"y"`` edge normal; detected on the first good frame
-            when None. A list gives one per box.
-        polarity : int | Sequence[int | None] | None
-            +1 / -1 bright side; detected when None. A list gives one per box.
+            when None.
+        polarity : int | None
+            +1 / -1 bright side; detected when None.
         return_frame : bool
             Also return one raw full-ROI frame under ``"frame"``.
 
         Returns
         -------
         dict
-            ``p_um, edges, roi`` (and ``frame``). ``edges`` holds, per box,
-            ``n, edge_mean, edge_sd, x_mean, y_mean, contrast_mean, angle_mean,
-            residual_mean, axis, polarity, reason``; the first box's fields are
-            repeated at the top level. ``reason`` is why the last frame was bad
-            when ``n`` is 0.
+            ``p_um, n, edge_mean, edge_sd, x_mean, y_mean, contrast_mean,
+            angle_mean, residual_mean, axis, polarity, reason, roi`` (and
+            ``frame``). ``reason`` is why the last frame was bad when ``n`` is 0.
         """
         if self._state == "running":
             raise RuntimeError("stop the loop before measuring")
-        sboxes = _as_boxes(box)
+        return self._snap_edge(
+            n_frames, p_um, _as_box(box), axis, polarity, return_frame
+        )
 
-        def per_box(value: Any) -> list[Any]:
-            if isinstance(value, list | tuple):
-                if len(value) != len(sboxes):
-                    raise ValueError("axis / polarity need one value per box")
-                return list(value)
-            if len(sboxes) > 1 and value is not None:
-                raise ValueError("pass axis / polarity as lists for two boxes")
-            return [value] + [None] * (len(sboxes) - 1)
-
-        specs = list(zip(sboxes, per_box(axis), per_box(polarity), strict=True))
-        return self._snap_edges(n_frames, p_um, specs, return_frame)
-
-    def _snap_edges(
+    def _snap_edge(
         self,
         n_frames: int,
         p_um: float | None,
-        specs: Sequence[tuple[Sequence[float], str | None, int | None]],
+        box: Sequence[float],
+        axis: str | None,
+        polarity: int | None,
         return_frame: bool,
-        detectors: Sequence[tuple[str, float]] | None = None,
+        detector: tuple[str, float] | None = None,
     ) -> dict:
-        """Ask the worker for *n_frames* fresh fixes of every box; wait for the reply.
+        """Ask the worker for *n_frames* fresh fixes of *box*; wait for the reply.
 
-        *specs* are ``(box, axis, polarity)``; axis and polarity None are
-        detected. *detectors* gives ``(detector, sigma_px)`` per spec (a
-        calibration's own); None uses the worker's detector setting. The reply
-        has an ``edges`` entry per spec, naming the detector it was measured
-        with.
+        *axis* and *polarity* None are detected. *detector* is
+        ``(detector, sigma_px)`` (a calibration's own); None uses the worker's
+        detector setting. The reply names the detector it was measured with.
         """
-        extra: list[dict[str, Any]] = (
-            [{} for _ in specs]
-            if detectors is None
-            else [{"detector": d, "detector_sigma_px": s} for d, s in detectors]
-        )
-        return self._request_measurement(
-            {
-                "type": "measure",
-                "n_frames": int(n_frames),
-                "p_um": p_um,
-                "boxes": [
-                    {
-                        "box": [int(v) for v in box],
-                        "axis": axis,
-                        "polarity": pol,
-                        **more,
-                    }
-                    for (box, axis, pol), more in zip(specs, extra, strict=True)
-                ],
-                "return_frame": return_frame,
-            },
-            int(n_frames),
-        )
+        msg: dict[str, Any] = {
+            "type": "measure",
+            "n_frames": int(n_frames),
+            "p_um": p_um,
+            "box": [int(v) for v in box],
+            "axis": axis,
+            "polarity": polarity,
+            "return_frame": return_frame,
+        }
+        if detector is not None:
+            msg["detector"], msg["detector_sigma_px"] = detector
+        return self._request_measurement(msg, int(n_frames))
 
     def _request_measurement(self, msg: dict, n_frames: int) -> dict:
         self._flush_measurements()
@@ -1012,20 +993,16 @@ class SpotFocusService:
                 self._worker_died()
             return False
 
-    def _restore_crisp(self) -> None:
-        prev, self._prev_crisp = self._prev_crisp, None
-        if not self._crisp or prev is None or prev == "Ready":
-            return
-        target = "Lock" if prev in _LOCKED_STATES else prev
-        try:
-            self._mmc.setProperty(self._crisp, CRISP_STATE_PROP, target)
-        except Exception:
-            logger.warning("could not restore CRISP state %r", target, exc_info=True)
-
     def _set_state(self, state: str) -> None:
         if state == self._state:
             return
-        self._state = state
+        prev, self._state = self._state, state
+        # The wheel is off exactly while the lock runs (calibrate / zero are not
+        # states, so they never touch it).
+        if state == "running":
+            self._set_joystick_locked(True)
+        elif prev == "running":
+            self._set_joystick_locked(False)
         self._emit(self.state, state)
 
     def _emit(self, signal: Any, *args: Any) -> None:
@@ -1036,12 +1013,14 @@ class SpotFocusService:
 
     def _fault(self, reason: str) -> None:
         self._set_state("fault")
+        self._set_joystick_locked(False)
         if reason != self._last_fault:
             self._last_fault = reason
             logger.warning("spot focus fault: %s", reason)
             self._emit(self.fault, reason)
 
     def _worker_died(self) -> None:
+        self._set_joystick_locked(False)
         if self._shutting_down or self._last_fault == "worker died":
             return
         self._fault("worker died")

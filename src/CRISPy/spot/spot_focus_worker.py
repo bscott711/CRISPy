@@ -13,14 +13,14 @@ code itself uses neither Qt nor pymmcore and creates no QApplication).
 Wire protocol: two one-way :func:`multiprocessing.Pipe` s (commands in, events
 out; see :class:`Link`); every message is a ``dict`` with a ``"type"``.
 Main to worker: ``start``, ``stop``, ``preview_start``, ``preview_stop``,
-``update_params``, ``set_camera``, ``set_edge_boxes`` (``set_edge_box`` is the
-one-box alias), ``set_calibration``, ``measure``, ``moved``, ``shutdown``.
+``update_params``, ``set_camera``, ``set_edge_box``, ``set_calibration``,
+``measure``, ``moved``, ``shutdown``.
 Worker to main: ``ready``, ``move``, ``telemetry``, ``camera``, ``fault``,
 ``status``, ``measurement``, ``error``.
 
-One or two edge boxes are measured on every frame and fused into one focus
-error (:func:`~.spot_focus.fuse_edges`); a ``set_calibration`` lets the preview
-show that error before the lock starts.
+One edge box is measured on every frame and turned into the focus error
+(:func:`~.spot_focus.loop_error`); a ``set_calibration`` lets the preview show
+that error before the lock starts.
 
 Frames never travel on the pipe (except the one raw frame a ``measure`` with
 ``return_frame`` returns): while previewing, running or measuring every frame
@@ -72,8 +72,6 @@ SPOT_MAX_AGE_S = 0.5
 FRAME_WAIT_S = 0.05
 #: Camera channels ``set_camera`` accepts.
 CHANNELS = ("sum", "red")
-#: At most this many edge boxes are measured at once.
-MAX_EDGES = 2
 
 
 def settle_time_s(exposure_ms: float, fps: float) -> float:
@@ -325,23 +323,18 @@ class _Worker:
         self.last_ts: float | None = None
         self.last_frame_wall = time.monotonic()
         self.fps = 0.0
-        #: The edge boxes of the preview overlay (sensor px, 0-2), set by the panel.
-        self.edge_boxes: list[tuple[int, ...]] = []
-        #: The newest fix of every measured box; ``last_fix`` is the first.
-        self.fixes: list[Any] = []
+        #: The edge box of the preview overlay (sensor px), set by the panel.
+        self.edge_box: tuple[int, ...] | None = None
+        #: The newest fix of the measured box.
         self.last_fix: Any = None
-        #: The fusion of ``fixes`` (None when no calibration applies to them).
-        self.fused: Any = None
+        #: The loop error of ``last_fix`` (None when no calibration applies).
+        self.err: Any = None
         self.fix_time = -math.inf
         self.t_fit = -math.inf
-        #: The fused error in um (offset applied); None when unusable.
+        #: The focus error in um (offset applied); None when unusable.
         self.last_along: float | None = None
         #: Why the newest measurement is unusable for control ("" when fine).
         self.last_reason = ""
-        #: Informational (not a strike), e.g. "edge 2 lost (...); using edge 1".
-        self.last_note = ""
-        #: Per box: why that edge is not used ("" when it is).
-        self.edge_reasons: list[str] = []
         self.last_max = 0
         self.last_sat_frac = 0.0
         self.t_telemetry = 0.0
@@ -468,103 +461,75 @@ class _Worker:
 
     def clear_fix(self) -> None:
         """Forget the newest measurement (no overlay, no telemetry)."""
-        self.fixes = []
         self.last_fix = None
-        self.fused = None
+        self.err = None
         self.last_along = None
         self.last_reason = ""
-        self.last_note = ""
-        self.edge_reasons = []
 
-    def set_fixes(
-        self,
-        fixes: list[Any],
-        now: float,
-        fused: Any = None,
-        params: Any = None,
-    ) -> None:
-        """Record the newest fixes (one per box) and, if any, their fusion.
+    def set_fix(self, fix: Any, now: float, err: Any = None) -> None:
+        """Record the newest fix and, if a calibration applies, its loop error.
 
         Parameters
         ----------
-        fixes : list
-            The :class:`~.spot_focus.EdgeFix` of each measured box, box 1 first.
+        fix : EdgeFix
+            The measurement of the edge box.
         now : float
-            When they were measured.
-        fused : FusedError or None
-            ``fuse_edges`` of *fixes*; None when no calibration applies, so
-            there is no focus error.
-        params : SpotLoopParams or None
-            The parameters *fused* was computed with.
+            When it was measured.
+        err : EdgeError or None
+            ``loop_error`` of *fix*; None when no calibration applies, so there
+            is no focus error.
         """
-        self.fixes = fixes
-        self.last_fix = fixes[0] if fixes else None
+        self.last_fix = fix
         self.fix_time = now
-        self.fused = fused
-        if fused is None:
-            self.edge_reasons = [
-                ("" if f.ok else (f.reason or "edge lost")) for f in fixes
-            ]
+        self.err = err
+        if err is None:
             self.last_along = None
-            self.last_reason = self.edge_reasons[0] if fixes else ""
-            self.last_note = ""
+            self.last_reason = "" if fix.ok else (fix.reason or "edge lost")
             return
-        from .spot_focus import check_fix
-
-        self.edge_reasons = [
-            check_fix(f, e, params) for f, e in zip(fixes, self.cal.edges, strict=True)
-        ]
-        self.last_along = fused.along_um
-        self.last_reason = fused.reason
-        self.last_note = fused.note
+        self.last_along = err.along_um
+        self.last_reason = err.reason
 
     def measure_current(self, frame: Any, roi: Any, now: float) -> None:
-        """Measure the live edges and fuse them into the focus error.
+        """Measure the live edge and turn it into the focus error.
 
-        While running these are the calibration's boxes. In preview they are the
-        preview boxes, and only when those are the calibration's boxes (after
+        While running this is the calibration's box. In preview it is the
+        preview box, and only when that is the calibration's box (after
         ``snap_box``) is the error computed, from the calibration held by the
         worker (``SpotLoopParams()`` until params have been sent). With no box
         there is nothing to measure and no overlay.
         """
-        from .spot_focus import SpotLoopParams, fuse_edges, snap_box
+        from .spot_focus import SpotLoopParams, loop_error, snap_box
 
         cal = self.cal
         if self.running and cal is not None:
-            boxes: list[Any] = list(cal.boxes)
-            fuse = True
+            box: Any = cal.box
+            use_cal = True
         else:
-            boxes = list(self.edge_boxes)
-            fuse = (
-                cal is not None
-                and len(boxes) == len(cal.edges)
-                and [snap_box(b) for b in boxes] == list(cal.boxes)
-            )
-        if not boxes:
+            box = self.edge_box
+            use_cal = cal is not None and box is not None and snap_box(box) == cal.box
+        if box is None:
             self.clear_fix()
             return
-        # Axis and polarity are the calibration's when these are its boxes.
-        specs = (
-            [(e.axis, e.polarity) for e in cal.edges]
-            if fuse
-            else [(None, None)] * len(boxes)
-        )
-        # A calibration is only valid for the detector it was made with, so its
-        # boxes are measured with that one, whatever the setting says now.
-        dets: list[tuple[str, float] | None] = (
-            [(e.detector, e.detector_sigma_px) for e in cal.edges]
-            if fuse
-            else [None] * len(boxes)
-        )
-        fixes = [
-            self.edge(frame, roi, box, axis, polarity, det)
-            for box, (axis, polarity), det in zip(boxes, specs, dets, strict=True)
-        ]
-        fused = None
-        params = self.params if self.params is not None else SpotLoopParams()
-        if fuse:
-            fused = fuse_edges(fixes, cal, params)
-        self.set_fixes(fixes, now, fused, params)
+        # Axis, polarity and detector are the calibration's when this is its box;
+        # a calibration is only valid for the detector it was made with, so its
+        # box is measured with that one, whatever the setting says now.
+        if use_cal:
+            edge = cal.edge
+            fix = self.edge(
+                frame,
+                roi,
+                box,
+                edge.axis,
+                edge.polarity,
+                (edge.detector, edge.detector_sigma_px),
+            )
+        else:
+            fix = self.edge(frame, roi, box)
+        err = None
+        if use_cal:
+            params = self.params if self.params is not None else SpotLoopParams()
+            err = loop_error(fix, cal, params)
+        self.set_fix(fix, now, err)
 
     def frame_roi(self, frame: Any) -> tuple[int, int, int, int] | None:
         """The sensor ROI of *frame*, or None if it is stale.
@@ -643,8 +608,6 @@ class _Worker:
             self.on_set_camera(msg)
         elif kind == "set_edge_box":
             self.on_set_edge_box(msg)
-        elif kind == "set_edge_boxes":
-            self.on_set_edge_boxes(msg)
         elif kind == "set_calibration":
             self.on_set_calibration(msg)
         elif kind == "measure":
@@ -690,26 +653,16 @@ class _Worker:
             self.window.clear()  # errors averaged so far used the old offset
 
     def on_set_edge_box(self, msg: dict) -> None:
-        """Set (or clear) one preview edge box; alias of ``set_edge_boxes``."""
-        box = msg.get("box")
-        self.apply_edge_boxes([] if box is None else [box], "set_edge_box")
-
-    def on_set_edge_boxes(self, msg: dict) -> None:
-        """Set the preview edge boxes (0-2); an empty list removes the overlay."""
-        self.apply_edge_boxes(msg.get("boxes") or [], "set_edge_boxes")
-
-    def apply_edge_boxes(self, boxes: Any, who: str) -> None:
-        """Validate and take the preview *boxes*; a bad list is reported, not set."""
+        """Set (or clear) the preview edge box; a bad box is reported, not set."""
+        raw = msg.get("box")
         try:
-            new = [tuple(int(v) for v in box) for box in boxes]
-            if any(len(box) != 4 for box in new):
-                raise ValueError(f"a box must be (x, y, w, h), not {boxes!r}")
-            if len(new) > MAX_EDGES:
-                raise ValueError(f"at most {MAX_EDGES} edge boxes, got {len(new)}")
+            new = None if raw is None else tuple(int(v) for v in raw)
+            if new is not None and len(new) != 4:
+                raise ValueError(f"a box must be (x, y, w, h), not {raw!r}")
         except (TypeError, ValueError) as exc:
-            self.error(f"{who}: {exc}")
+            self.error(f"set_edge_box: {exc}")
             return
-        self.edge_boxes = new
+        self.edge_box = new
         if not self.running:
             self.clear_fix()
             self.t_fit = -math.inf
@@ -809,64 +762,46 @@ class _Worker:
         self.arm_settle()
 
     def on_measure(self, msg: dict) -> None:
-        """Average *n_frames* fresh edge fixes per box at P = *p_um* (loop stopped).
+        """Average *n_frames* fresh edge fixes of one box at P = *p_um* (stopped).
 
-        ``boxes`` is a list of ``{"box", "axis", "polarity"}`` (the old single
-        ``box`` / ``axis`` / ``polarity`` keys make one entry; neither means the
-        preview boxes), each optionally with ``"detector"`` and
-        ``"detector_sigma_px"`` (a calibration's own; the detector setting
-        otherwise). All boxes are measured on the same frames. Only frames
-        that pass the settle are used (they were exposed after the request, a
-        "snap") and only those go to the shared buffer, so the live view shows
-        what was measured. A box's *axis* / *polarity* (None = detect on its
-        first good frame) are then held for the rest of the measurement.
+        The message has ``box``, ``axis`` and ``polarity`` (None detects them
+        on the first good frame; no ``box`` means the preview box) and
+        optionally ``detector`` / ``detector_sigma_px`` (a calibration's own;
+        the detector setting otherwise). Only frames that pass the settle are
+        used (they were exposed after the request, a "snap") and only those go
+        to the shared buffer, so the live view shows what was measured. The
+        *axis* / *polarity* are then held for the rest of the measurement.
 
-        The reply has ``edges``, one summary per box, and the first summary's
-        fields at the top level. It ends when every box has *n_frames* good
-        frames, has found no good frame in ``n_frames + 6`` settled frames, or at
-        the deadline.
+        The reply holds the box's summary at the top level (see
+        :func:`_edge_summary`). It ends when the box has *n_frames* good
+        frames, has found no good frame in ``n_frames + 6`` settled frames, or
+        at the deadline.
         """
         import numpy as np
 
         n = max(1, int(msg.get("n_frames", 10)))
         p_um = msg.get("p_um")
-        raw = msg.get("boxes")
-        if raw is None:
-            if msg.get("box") is not None:
-                raw = [
-                    {
-                        "box": msg["box"],
-                        "axis": msg.get("axis"),
-                        "polarity": msg.get("polarity"),
-                    }
-                ]
-            else:  # the preview boxes; axis / polarity, if any, are for the first
-                raw = [
-                    {"box": b, "axis": msg.get("axis"), "polarity": msg.get("polarity")}
-                    if i == 0
-                    else {"box": b}
-                    for i, b in enumerate(self.edge_boxes)
-                ]
-        boxes = [d["box"] for d in raw]
-        axes = [d.get("axis") for d in raw]
-        pols = [d.get("polarity") for d in raw]
-        dets = [
-            (str(d["detector"]), float(d["detector_sigma_px"]))
-            if d.get("detector")
+        box = msg.get("box")
+        if box is None:
+            box = self.edge_box
+        axis = msg.get("axis")
+        pol = msg.get("polarity")
+        det = (
+            (str(msg["detector"]), float(msg["detector_sigma_px"]))
+            if msg.get("detector")
             else self.detector_setting
-            for d in raw
-        ]
+        )
         want_frame = bool(msg.get("return_frame", False))
         if p_um is not None:
             self.source.set_actuator_um(float(p_um))
         t0 = time.monotonic()
         self.arm_settle(t0)
-        # Per box and good frame: edge, x, y, contrast, angle, residual, width.
-        rows: list[list[tuple[float, ...]]] = [[] for _ in boxes]
-        reasons = ["" for _ in boxes]
+        # Per good frame: edge, x, y, contrast, angle, residual, width.
+        rows: list[tuple[float, ...]] = []
+        reason = ""
         kept: Any = None
         seen: float | None = None
-        bad_run = [0] * len(boxes)  # settled frames in a row with no edge
+        bad_run = 0  # settled frames in a row with no edge
         give_up = n + SETTLE_MIN_FRAMES + 2
         frame_s = max(
             1.0 / self.fps if self.fps > 0 else 0.1, self.exposure_ms / 1000.0
@@ -878,13 +813,10 @@ class _Worker:
         )
         deadline = t0 + float(msg.get("timeout_s", default_timeout))
 
-        def finished(i: int) -> bool:
-            # Complete, or no edge at all in this box: give up on it.
-            return len(rows[i]) >= n or (not rows[i] and bad_run[i] >= give_up)
-
         while (
-            boxes
-            and not all(finished(i) for i in range(len(boxes)))
+            box is not None
+            # Complete, or no edge at all in the box: give up on it.
+            and not (len(rows) >= n or (not rows and bad_run >= give_up))
             and time.monotonic() < deadline
             and not self.exit
         ):
@@ -901,45 +833,38 @@ class _Worker:
                 continue
             if not self.settle.frame(now):
                 continue
-            fixes = [
-                self.edge(frame, roi, box, axes[i], pols[i], dets[i])
-                for i, box in enumerate(boxes)
-            ]
-            self.set_fixes(fixes, now)
+            fix = self.edge(frame, roi, box, axis, pol, det)
+            self.set_fix(fix, now)
             self.write_frame(frame, ts, roi, now)
-            for i, fix in enumerate(fixes):
-                if len(rows[i]) >= n:
-                    continue  # complete: later frames do not change its mean
-                if not fix.ok:
-                    reasons[i] = fix.reason
-                    bad_run[i] += 1
-                    continue
-                bad_run[i] = 0
-                if axes[i] is None:
-                    axes[i], pols[i] = fix.axis, fix.polarity
-                rows[i].append(
-                    (
-                        fix.position,
-                        fix.x,
-                        fix.y,
-                        fix.contrast,
-                        fix.angle_deg,
-                        fix.residual_px,
-                        fix.edge_width_px,
-                    )
+            if not fix.ok:
+                reason = fix.reason
+                bad_run += 1
+                continue
+            bad_run = 0
+            if axis is None:
+                axis, pol = fix.axis, fix.polarity
+            rows.append(
+                (
+                    fix.position,
+                    fix.x,
+                    fix.y,
+                    fix.contrast,
+                    fix.angle_deg,
+                    fix.residual_px,
+                    fix.edge_width_px,
                 )
-                if want_frame:
-                    kept = np.array(frame)
-        entries = [
-            _edge_summary(rows[i], axes[i], pols[i], reasons[i], *dets[i])
-            for i in range(len(boxes))
-        ]
-        head = entries[0] if entries else _edge_summary([], None, None, "no edge box")
+            )
+            if want_frame:
+                kept = np.array(frame)
+        head = (
+            _edge_summary(rows, axis, pol, reason, *det)
+            if box is not None
+            else _edge_summary([], None, None, "no edge box")
+        )
         reply: dict[str, Any] = {
             "type": "measurement",
             "p_um": p_um,
             **head,
-            "edges": entries,
             "roi": tuple(self.roi),
         }
         if kept is not None:
@@ -1005,22 +930,8 @@ class _Worker:
             return
         if now - self.t_telemetry >= TELEMETRY_PERIOD_S:
             self.t_telemetry = now
-            fused = self.fused
-            per_edge = fused.per_edge_um if fused is not None else ()
-            edges = [
-                {
-                    "edge_px": f.position,
-                    "x": f.x,
-                    "y": f.y,
-                    "ok": bool(f.ok and not why),
-                    "reason": why,
-                    "along_um": per_edge[i] if i < len(per_edge) else None,
-                }
-                for i, (f, why) in enumerate(
-                    zip(self.fixes, self.edge_reasons, strict=True)
-                )
-            ]
-            sigma = None if fused is None else fused.sigma_um
+            err = self.err
+            sigma = None if err is None else err.sigma_um
             self.send(
                 {
                     "type": "telemetry",
@@ -1033,21 +944,16 @@ class _Worker:
                     "angle_deg": fix.angle_deg,
                     "residual_px": fix.residual_px,
                     "valid_fraction": fix.valid_fraction,
-                    "edges": edges,
                     "sigma_um": sigma
                     if sigma is not None and math.isfinite(sigma)
                     else None,
-                    "disagreement_um": None if fused is None else fused.disagreement_um,
-                    # 0-based index into "edges" (panel "Edge 1" is 0); None
-                    # unless the two edges disagreed and one was held alone.
-                    "held_edge": None if fused is None else fused.held_edge,
-                    "note": self.last_note,
+                    "note": "",
                     "fps": self.fps,
                     "p_cmd_um": self.p_cmd if self.ctl is None else self.ctl.p_cmd_um,
                     "n_moves": 0 if self.ctl is None else self.ctl.n_moves,
                     "ok": (
-                        fused.along_um is not None
-                        if fused is not None
+                        err.along_um is not None
+                        if err is not None
                         else bool(fix.ok and not self.last_reason)
                     ),
                     "reason": self.last_reason,

@@ -1,7 +1,7 @@
-"""Which CRISPy panel gets the "Spot lock" section (Qt-free, so it is unit-tested).
+"""Which CRISPy panel is the camera lock panel (Qt-free, so it is unit-tested).
 
-The spot lock drives one piezo and one camera, so only one panel per process may hold
-it. Nothing here imports Qt.
+The camera lock drives one piezo and one camera, so only one panel per process may
+be the camera lock panel. Nothing here imports Qt.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from collections.abc import Sequence
 def choose_spot_index(
     actuators: Sequence[tuple[str, str | None]], piezo_override: str | None
 ) -> int | None:
-    """Index of the panel that gets the Spot lock section, or ``None`` for none.
+    """Index of the panel that is the camera lock panel, or ``None`` for none.
 
     Parameters
     ----------

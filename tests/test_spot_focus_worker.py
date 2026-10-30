@@ -1,7 +1,7 @@
 """The spot focus lock's subprocess and service, with a real spawned worker.
 
-The metric is the position of one or two straight edges of the LED patch, each
-inside its own edge box, fused into one focus error. Covers the live view too:
+The metric is the position of one straight edge of the LED patch inside its edge
+box, turned into the focus error. Covers the live view too:
 preview frames through shared memory, the edge overlay, live camera settings,
 ROI changes in sensor coordinates and the time-based settle.
 
@@ -59,11 +59,6 @@ CAL = {
 #: Across the left edge; clear of the rounded corners and of the ghost.
 BOX = (232, 210, 80, 60)
 BOX_CENTER_Y = 240.0
-#: Across the top edge (y = 194), also clear of the corners and of the ghost.
-BOX_TOP = (288, 154, 64, 80)
-#: A diagonal image motion, so that both the left and the top edge move.
-UX, UY = 0.8, 0.6
-CAL_DIAG = {**CAL, "ux": UX, "uy": UY}
 #: A box on the dark background: no edge in it.
 BOX_EMPTY = (20, 20, 80, 60)
 
@@ -118,19 +113,6 @@ def _e0() -> float:
     return float(np.mean([f.position for f in fixes]))
 
 
-@functools.cache
-def _e0s_diag() -> tuple[float, float]:
-    """The left and top edge positions the diagonal fake shows at P0."""
-    src = make_source(_spec(cal_like=dict(CAL_DIAG)))
-    frames = [src.render(0.0) for _ in range(5)]  # type: ignore[attr-defined]
-    out = []
-    for box in (BOX, BOX_TOP):
-        fixes = [measure_edge(f, box) for f in frames]
-        assert all(f.ok for f in fixes)
-        out.append(float(np.mean([f.position for f in fixes])))
-    return out[0], out[1]
-
-
 def _edge_cal(**kw: object) -> EdgeCalibration:
     base: dict[str, Any] = {
         "box": BOX,
@@ -154,21 +136,9 @@ def _edge_cal(**kw: object) -> EdgeCalibration:
 
 
 def _cal(**kw: object) -> FocusCalibration:
-    """A one-edge calibration of the left edge (the fake moves along x only)."""
+    """A calibration of the left edge (the fake moves along x only)."""
     edge = _edge_cal(**kw)
-    return FocusCalibration(edges=[edge], p0_um=edge.p0_um, created=edge.created)
-
-
-def _cal2(**kw: object) -> FocusCalibration:
-    """Left + top edge of the diagonal fake: they move by 0.8 and 0.6 x SLOPE."""
-    e_left, e_top = _e0s_diag()
-    left = _edge_cal(slope_px_per_um=SLOPE * UX, e0_px=e_left, **kw)
-    top = _edge_cal(
-        box=BOX_TOP, axis="y", slope_px_per_um=SLOPE * UY, e0_px=e_top, **kw
-    )
-    return FocusCalibration(
-        edges=[left, top], p0_um=left.p0_um, created="2026-10-28T00:00:00"
-    )
+    return FocusCalibration(edge=edge, p0_um=edge.p0_um, created=edge.created)
 
 
 def _params(**kw: object) -> SpotLoopParams:
@@ -202,8 +172,46 @@ def _child_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHONPATH", src + (os.pathsep + old if old else ""))
 
 
-def _service(mmc: FakeMMC, **spec_kw: object) -> SpotFocusService:
-    return SpotFocusService(mmc, P_LABEL, CRISP, _spec(**spec_kw), ready_timeout_s=20.0)
+class FakeCrisp:
+    """A ``CrispController`` stand-in that records the LED and joystick calls."""
+
+    label = CRISP
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, bool]] = []
+        self.fail_led = False
+        self.fail_joystick = False
+
+    @property
+    def leds(self) -> list[bool]:
+        return [v for k, v in self.calls if k == "led"]
+
+    @property
+    def joystick(self) -> list[bool]:
+        return [v for k, v in self.calls if k == "joystick"]
+
+    def set_led(self, on: bool) -> None:
+        self.calls.append(("led", on))
+        if self.fail_led:
+            raise RuntimeError("serial write failed")
+
+    def set_joystick_enabled(self, enabled: bool) -> None:
+        self.calls.append(("joystick", enabled))
+        if self.fail_joystick:
+            raise RuntimeError("property write failed")
+
+
+def _service(
+    mmc: FakeMMC, *, crisp: FakeCrisp | None = None, **spec_kw: object
+) -> SpotFocusService:
+    return SpotFocusService(
+        mmc,
+        P_LABEL,
+        CRISP,
+        _spec(**spec_kw),
+        ready_timeout_s=20.0,
+        crisp=crisp or FakeCrisp(),  # type: ignore[arg-type]
+    )
 
 
 # One shared closed-loop run feeds the convergence and the rate tests.
@@ -450,14 +458,13 @@ def test_calibration_recovers_slope_sign_and_zero(sign: float, tmp_path: Path) -
         cal = svc.calibrate(
             BOX, span_um=2.0, steps=7, n_frames=3, settle_s=0.0, record_path=rec
         )
-        assert len(cal.edges) == 1
-        (edge,) = cal.edges
+        edge = cal.edge
         assert edge.slope_px_per_um == pytest.approx(sign * SLOPE, rel=0.1)
         assert edge.r2 > 0.98
         assert edge.e0_px == pytest.approx(_e0(), abs=0.3)
         assert cal.p0_um == pytest.approx(P0) and edge.p0_um == pytest.approx(P0)
         assert (edge.axis, edge.polarity, edge.box) == ("x", 1, BOX)
-        assert cal.boxes == [BOX]
+        assert cal.box == BOX
         assert cal.linear_range_um == pytest.approx(1.0)
         assert edge.n_points == 7
         assert edge.noise_px < 0.2
@@ -465,7 +472,7 @@ def test_calibration_recovers_slope_sign_and_zero(sign: float, tmp_path: Path) -
         # P is back where it started, the LED claim is gone, Live is still on.
         assert mmc.pos[P_LABEL] == pytest.approx(P0)
         assert mmc.waits >= 8  # a calibration (lock stopped) may wait
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        assert not svc.led_is_on
         assert svc.preview_active and svc.current_state == "preview"
         assert _next_frame(svc, first.seq).seq > first.seq
     # The record holds one raw frame per step, in sweep order.
@@ -492,9 +499,9 @@ def test_calibration_works_while_previewing_in_an_roi() -> None:
         first = _next_frame(svc, None)
         svc.set_camera(roi=(100, 80, 400, 320))  # the sweep also works in an ROI
         cal = svc.calibrate(BOX, span_um=2.0, steps=7, n_frames=3, settle_s=0.0)
-        assert cal.edges[0].slope_px_per_um == pytest.approx(SLOPE, rel=0.1)
+        assert cal.edge.slope_px_per_um == pytest.approx(SLOPE, rel=0.1)
         # Positions are in sensor pixels, not ROI pixels.
-        assert cal.edges[0].e0_px == pytest.approx(_e0(), abs=0.3)
+        assert cal.edge.e0_px == pytest.approx(_e0(), abs=0.3)
         assert cal.record_path == ""
         assert svc.preview_active and svc.current_state == "preview"
         assert _next_frame(svc, first.seq).seq > first.seq
@@ -505,22 +512,20 @@ def test_calibration_that_loses_the_edge_raises_and_cleans_up() -> None:
     with _service(mmc) as svc:
         assert svc.wait_ready()
         svc.start_preview()
-        real = svc._snap_edges
+        real = svc._snap_edge
         calls: list[float] = []
 
-        def snap(n, p, specs, return_frame, detectors=None):
+        def snap(n, p, box, axis, pol, return_frame, detector=None):
             calls.append(p)
             if len(calls) >= 4:  # the zero and two steps are fine
-                lost = {"n": 0, "reason": "edge left the box"}
-                return {"edges": [lost] * len(specs), "p_um": p}
-            return real(n, p, specs, return_frame, detectors)
+                return {"n": 0, "reason": "edge left the box", "p_um": p}
+            return real(n, p, box, axis, pol, return_frame, detector)
 
-        svc._snap_edges = snap  # type: ignore[method-assign]
+        svc._snap_edge = snap  # type: ignore[method-assign]
         with pytest.raises(ValueError, match="edge left the box: widen the box"):
             svc.calibrate(BOX, span_um=2.0, steps=7, n_frames=3, settle_s=0.0)
         assert mmc.pos[P_LABEL] == pytest.approx(P0)  # P is back
         assert not svc.led_is_on
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
         assert svc.preview_active and svc.current_state == "preview"
 
 
@@ -561,18 +566,12 @@ def test_zero_makes_the_present_edge_the_setpoint() -> None:
         mmc.pos[P_LABEL] = P0 + 0.4  # the user refocused by 0.4 um
         z = svc.zero(cal, n_frames=5)
         assert z.p0_um == pytest.approx(P0 + 0.4)
-        assert z.edges[0].e0_px == pytest.approx(
-            cal.edges[0].e0_px + SLOPE * 0.4, abs=0.3
-        )
-        assert z.edges[0].slope_px_per_um == cal.edges[0].slope_px_per_um
-        assert z.boxes == cal.boxes
-        assert (z.edges[0].axis, z.edges[0].polarity) == (
-            cal.edges[0].axis,
-            cal.edges[0].polarity,
-        )
+        assert z.edge.e0_px == pytest.approx(cal.edge.e0_px + SLOPE * 0.4, abs=0.3)
+        assert z.edge.slope_px_per_um == cal.edge.slope_px_per_um
+        assert z.box == cal.box
+        assert (z.edge.axis, z.edge.polarity) == (cal.edge.axis, cal.edge.polarity)
         assert z.linear_range_um == cal.linear_range_um
         assert mmc.sets == [] and mmc.waits == 0  # reads P once, moves nothing
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
         # The lock on the new zero holds the new P.
         svc.start(_params(), z)
         time.sleep(1.0)
@@ -599,15 +598,17 @@ def test_offset_via_update_params_moves_the_held_p() -> None:
         svc.stop()
 
 
-def test_stop_restores_crisp_and_never_moves_p() -> None:
+def test_stop_releases_the_led_and_never_moves_p() -> None:
     mmc = FakeMMC()
-    with _service(mmc, drift_um_per_s=0.5) as svc:
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp, drift_um_per_s=0.5) as svc:
         svc.start(_params(), _cal(), led_intensity=30)
-        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        assert crisp.leds == [True]
         assert mmc.props[(CRISP, "LED Intensity")] == "30"
         assert _wait(lambda: len(mmc.sets) >= 1, 8.0)
         svc.stop()
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        assert crisp.leds == [True, False]
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"  # never written
         assert svc.current_state == "stopped"
         time.sleep(0.3)  # let any in-flight request drain
         n = len(mmc.sets)
@@ -686,79 +687,109 @@ def test_shutdown_reaches_a_worker_whose_reader_is_late() -> None:
         conn.close()
 
 
-def test_shutdown_right_after_start_restores_crisp() -> None:
+def test_shutdown_right_after_start_releases_the_led() -> None:
     """Regression (rig PC, 2026-10-27): shutdown before the worker reported
-    "running" skipped the CRISP restore and left CRISP in Ready."""
+    "running" skipped the LED release and left the LED on."""
     mmc = FakeMMC()
-    svc = _service(mmc)
+    crisp = FakeCrisp()
+    svc = _service(mmc, crisp=crisp)
     assert svc.wait_ready()
     svc.start(_params(), _cal())
-    assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+    assert crisp.leds == [True]
     svc.shutdown()  # no wait for the worker's "running"
-    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    assert crisp.leds == [True, False]
+    assert not svc.joystick_locked  # whatever the worker had reached
 
 
 # --------------------------------------------------------------------------
-# CRISP LED: lit only in Ready (or Lock...), off in Idle
+# CRISP LED: raw serial on / off, owned by preview, lock, manual ...
 # --------------------------------------------------------------------------
 
 
-def test_led_on_sets_ready_and_intensity_and_led_off_restores_idle() -> None:
+def test_led_on_sets_intensity_and_led_off_switches_it_off() -> None:
     mmc = FakeMMC()
-    with _service(mmc) as svc:
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp) as svc:
         assert not svc.led_is_on
         svc.led_on(40)
         assert svc.led_is_on
-        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        assert crisp.leds == [True]
         assert mmc.props[(CRISP, "LED Intensity")] == "40"
         svc.set_led_intensity(70)  # live
         assert mmc.props[(CRISP, "LED Intensity")] == "70"
+        assert crisp.leds == [True]  # no second switch-on
         svc.led_off()
         assert not svc.led_is_on
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        assert crisp.leds == [True, False]
+        svc.led_off()  # idempotent
+        assert crisp.leds == [True, False]
+        assert mmc.props[(CRISP, "CRISP State")] == "Idle"  # never written
 
 
-def test_led_on_leaves_a_lit_state_alone() -> None:
+def test_led_on_is_sent_once_for_several_owners() -> None:
     mmc = FakeMMC()
-    mmc.props[(CRISP, "CRISP State")] = "Lock"
-    with _service(mmc) as svc:
-        svc.led_on(20)
-        assert mmc.props[(CRISP, "CRISP State")] == "Lock"
-        svc.led_off()
-        assert mmc.props[(CRISP, "CRISP State")] == "Lock"
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp) as svc:
+        svc.led_on(20, owner="a")
+        svc.led_on(20, owner="a")
+        svc.led_on(20, owner="b")
+        assert crisp.leds == [True]
+        svc.led_off("a")
+        assert crisp.leds == [True] and svc.led_is_on
+        svc.led_off("b")
+        assert crisp.leds == [True, False]
 
 
 def test_preview_and_lock_overlap_keep_the_led_on_until_both_are_gone() -> None:
     mmc = FakeMMC()
-    with _service(mmc) as svc:
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp) as svc:
         svc.led_on(30, owner="preview")
         svc.start(_params(), _cal(), led_intensity=30)  # the lock joins
-        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        assert crisp.leds == [True]
         svc.stop()  # lock gone, preview still on
         assert svc.led_is_on
-        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        assert crisp.leds == [True]
         svc.led_off("preview")
         assert not svc.led_is_on
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
-    # And the other order: preview leaves first, the lock's stop restores.
+        assert crisp.leds == [True, False]
+    # And the other order: preview leaves first, the lock's stop switches it off.
     mmc = FakeMMC()
-    with _service(mmc) as svc:
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp) as svc:
         svc.led_on(30, owner="preview")
         svc.start(_params(), _cal())
         svc.led_off("preview")
-        assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+        assert crisp.leds == [True]
         svc.stop()
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+        assert crisp.leds == [True, False]
 
 
-def test_shutdown_restores_a_lit_led() -> None:
+def test_shutdown_switches_a_lit_led_off() -> None:
     mmc = FakeMMC()
-    svc = _service(mmc)
+    crisp = FakeCrisp()
+    svc = _service(mmc, crisp=crisp)
     svc.led_on(30, owner="preview")
     svc.led_on(30, owner="manual")
-    assert mmc.props[(CRISP, "CRISP State")] == "Ready"
+    assert crisp.leds == [True]
     svc.shutdown()
-    assert mmc.props[(CRISP, "CRISP State")] == "Idle"
+    assert crisp.leds == [True, False]
+    svc.shutdown()  # idempotent
+    assert crisp.leds == [True, False]
+
+
+def test_a_raising_set_led_does_not_propagate() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    crisp.fail_led = True
+    with _service(mmc, crisp=crisp) as svc:
+        svc.led_on(30)  # must not raise
+        assert svc.led_is_on
+        svc.led_off()  # nor this
+        assert not svc.led_is_on
+        assert crisp.leds == [True, False]
+        svc.start(_params(), _cal())  # nor start / stop
+        svc.stop()
 
 
 def test_led_calls_are_a_no_op_without_a_crisp_device() -> None:
@@ -770,9 +801,187 @@ def test_led_calls_are_a_no_op_without_a_crisp_device() -> None:
         svc.set_led_intensity(60)
         svc.led_off()
         assert svc.crisp_label is None
-        assert svc.crisp_state() is None
         assert mmc.props[(CRISP, "CRISP State")] == "Idle"
         assert mmc.props[(CRISP, "LED Intensity")] == "0"
+
+
+def test_a_crisp_label_that_cannot_build_a_controller_is_treated_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import CRISPy.controller
+
+    built: list[str] = []
+
+    def broken(label: str, mmcore: object = None) -> None:
+        built.append(label)
+        raise RuntimeError("no such device")
+
+    monkeypatch.setattr(CRISPy.controller, "ASICrispController", broken)
+    mmc = FakeMMC()
+    svc = SpotFocusService(mmc, P_LABEL, CRISP, _spec(), ready_timeout_s=20.0)
+    with svc:
+        svc.led_on(50)
+        svc.led_off()
+        svc.start(_params(), _cal())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        assert not svc.joystick_locked
+        svc.stop()
+        assert not svc.led_is_on
+        assert svc.crisp_label == CRISP
+        assert mmc.props[(CRISP, "LED Intensity")] == "0"
+    assert built == [CRISP]  # tried once, then treated as no controller
+
+
+def test_crisp_label_comes_from_an_injected_controller() -> None:
+    mmc = FakeMMC()
+    svc = SpotFocusService(
+        mmc,
+        P_LABEL,
+        None,
+        _spec(),
+        ready_timeout_s=20.0,
+        crisp=FakeCrisp(),  # type: ignore[arg-type]
+    )
+    with svc:
+        assert svc.crisp_label == CRISP
+
+
+def test_the_real_controller_writes_the_raw_led_commands() -> None:
+    """Through ``ASICrispController``: ``LK F=90`` / ``LK F=79`` to the hub."""
+    from unittest.mock import MagicMock
+
+    from pymmcore_plus import DeviceType
+
+    props = {"TigerHexAddress": "34", "OnlySendSerialCommandOnChange": "Yes"}
+    core = MagicMock()
+    core.getProperty.side_effect = lambda label, prop: props[prop]
+    core.getParentLabel.return_value = ""  # the rig config has no Parent lines
+    core.getLoadedDevicesOfType.side_effect = lambda t: (
+        ["TigerCommHub"] if t == DeviceType.HubDevice else []
+    )
+    core.getDeviceLibrary.return_value = "ASITiger"
+    core.hasProperty.return_value = True
+    core.getConfigData.side_effect = RuntimeError("no preset in test")
+    svc = SpotFocusService(
+        core, P_LABEL, "CRISPAFocus:P:34", _spec(), ready_timeout_s=20.0
+    )
+    with svc:
+        svc.led_on(owner="lock")
+        svc.led_on(owner="preview")  # a second owner adds no command
+        svc.led_off("lock")
+        svc.led_off("preview")
+    calls = core.setProperty.call_args_list
+    hub_writes = [(c.args[1], c.args[2]) for c in calls if c.args[0] == "TigerCommHub"]
+    assert hub_writes == [
+        ("OnlySendSerialCommandOnChange", "No"),
+        ("SerialCommand", "4LK F=90"),
+        ("OnlySendSerialCommandOnChange", "Yes"),
+        ("OnlySendSerialCommandOnChange", "No"),
+        ("SerialCommand", "4LK F=79"),
+        ("OnlySendSerialCommandOnChange", "Yes"),
+    ]
+    # The CRISP State is never written.
+    assert not [c for c in calls if c.args[1] == "CRISP State"]
+
+
+# --------------------------------------------------------------------------
+# Piezo joystick: off while the lock runs, restored on every way out
+# --------------------------------------------------------------------------
+
+
+def test_joystick_is_off_while_running_and_restored_on_stop() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp) as svc:
+        assert not svc.joystick_locked
+        svc.start(_params(), _cal())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        assert svc.joystick_locked
+        assert crisp.joystick == [False]  # one write for the transition
+        time.sleep(0.3)
+        assert crisp.joystick == [False]
+        svc.stop()
+        assert not svc.joystick_locked
+        assert crisp.joystick == [False, True]
+        svc.stop()  # idempotent: no second restore
+        assert crisp.joystick == [False, True]
+
+
+def test_joystick_is_restored_when_the_lock_faults() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    faults: list[str] = []
+    with _service(mmc, crisp=crisp) as svc:
+        svc.fault.connect(faults.append)
+        svc.start(_params(min_contrast=100.0), _cal())
+        assert _wait(lambda: svc.joystick_locked, 5.0)
+        svc.set_camera(exposure_ms=0.105)  # the patch goes dark: edge lost fault
+        assert _wait(lambda: faults, 8.0)
+        assert _wait(lambda: not svc.joystick_locked, 5.0)
+        assert crisp.joystick == [False, True]
+
+
+def test_joystick_is_restored_when_the_worker_dies() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    faults: list[str] = []
+    with _service(mmc, crisp=crisp) as svc:
+        svc.fault.connect(faults.append)
+        svc.start(_params(), _cal())
+        assert _wait(lambda: svc.joystick_locked, 5.0)
+        svc._proc.kill()
+        assert _wait(lambda: faults, 5.0)
+        assert not svc.joystick_locked
+        assert crisp.joystick == [False, True]
+
+
+def test_joystick_is_restored_on_shutdown() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    svc = _service(mmc, crisp=crisp)
+    svc.start(_params(), _cal())
+    assert _wait(lambda: svc.joystick_locked, 5.0)
+    svc.shutdown()
+    assert not svc.joystick_locked
+    assert crisp.joystick == [False, True]
+    svc.shutdown()
+    assert crisp.joystick == [False, True]
+
+
+def test_joystick_is_not_touched_by_preview_calibrate_or_zero() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    with _service(mmc, crisp=crisp) as svc:
+        assert svc.wait_ready()
+        svc.start_preview()
+        svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
+        svc.zero(_cal(), n_frames=3)
+        svc.stop_preview()
+        assert crisp.joystick == []
+        assert not svc.joystick_locked
+
+
+def test_a_raising_joystick_write_is_swallowed() -> None:
+    mmc = FakeMMC()
+    crisp = FakeCrisp()
+    crisp.fail_joystick = True
+    with _service(mmc, crisp=crisp) as svc:
+        svc.start(_params(), _cal())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        assert svc.joystick_locked
+        svc.stop()  # the failing restore does not raise either
+        assert not svc.joystick_locked
+        assert crisp.joystick == [False, True]
+
+
+def test_joystick_calls_are_a_no_op_without_a_crisp_controller() -> None:
+    mmc = FakeMMC()
+    svc = SpotFocusService(mmc, P_LABEL, None, _spec(), ready_timeout_s=20.0)
+    with svc:
+        svc.start(_params(), _cal())
+        assert _wait(lambda: svc.current_state == "running", 5.0)
+        assert not svc.joystick_locked
+        svc.stop()
 
 
 # --------------------------------------------------------------------------
@@ -975,13 +1184,9 @@ def test_measure_reply_has_the_documented_fields() -> None:
             "reason",
             "frame",
             "roi",
-            "edges",
         ]:
             assert key in m, key
-        # The top level mirrors the first (here only) box.
-        (first,) = m["edges"]
-        for key in ("n", "edge_mean", "edge_sd", "axis", "polarity", "reason"):
-            assert first[key] == m[key]
+        assert "edges" not in m
         assert m["n"] == 4 and m["p_um"] == P0
         assert (m["axis"], m["polarity"], m["reason"]) == ("x", 1, "")
         assert m["edge_mean"] == pytest.approx(_e0(), abs=0.3)
@@ -1049,7 +1254,7 @@ def test_stop_returns_to_preview_and_frames_keep_flowing_while_running() -> None
         svc.stop_preview()
         svc.start(_params(), _cal())
         svc.stop()
-        assert svc.current_state == "stopped"
+        assert _wait(lambda: svc.current_state == "stopped", 3.0)
 
 
 def test_closed_loop_works_inside_an_roi() -> None:
@@ -1239,9 +1444,9 @@ def test_no_box_means_no_overlay_and_a_box_outside_the_roi_is_not_ok() -> None:
         w.on_frame(w.source.render(0.0), 2.0, 2.0)
         assert w.last_fix.ok
         w.on_set_edge_box({"box": None})
-        assert w.last_fix is None and w.edge_boxes == []
+        assert w.last_fix is None and w.edge_box is None
         w.on_set_edge_box({"box": [1, 2, 3]})  # malformed: reported, box unchanged
-        assert w.edge_boxes == []
+        assert w.edge_box is None
         assert [m for m in _messages(pipes) if m["type"] == "error"]
     finally:
         _close(w, pipes)
@@ -1270,91 +1475,11 @@ def test_measure_uses_only_settled_frames_and_returns_one() -> None:
 
 
 # --------------------------------------------------------------------------
-# Two edges: left + top of a patch that moves diagonally
+# One edge box: the error, the held calibration, the telemetry
 # --------------------------------------------------------------------------
 
-
-def _service2(mmc: FakeMMC, **spec_kw: object) -> SpotFocusService:
-    return _service(mmc, cal_like=dict(CAL_DIAG), **spec_kw)
-
-
-@pytest.mark.parametrize("sign", [1.0, -1.0])
-def test_two_box_calibration_recovers_both_slopes(sign: float, tmp_path: Path) -> None:
-    mmc = FakeMMC()
-    cal_like = {**CAL_DIAG, "slope_px_per_um": sign * SLOPE}
-    rec = tmp_path / "sweep2"
-    with _service(mmc, cal_like=cal_like) as svc:
-        assert svc.wait_ready()
-        svc.start_preview()
-        first = _next_frame(svc, None)
-        cal = svc.calibrate(
-            [BOX, BOX_TOP],
-            span_um=2.0,
-            steps=7,
-            n_frames=3,
-            settle_s=0.0,
-            record_path=rec,
-        )
-        assert isinstance(cal, FocusCalibration) and len(cal.edges) == 2
-        left, top = cal.edges
-        assert left.slope_px_per_um == pytest.approx(sign * SLOPE * UX, rel=0.1)
-        assert top.slope_px_per_um == pytest.approx(sign * SLOPE * UY, rel=0.1)
-        assert (left.axis, left.polarity, left.box) == ("x", 1, BOX)
-        assert (top.axis, top.polarity, top.box) == ("y", 1, BOX_TOP)
-        e_left, e_top = _e0s_diag()
-        assert left.e0_px == pytest.approx(e_left, abs=0.3)
-        assert top.e0_px == pytest.approx(e_top, abs=0.3)
-        assert cal.p0_um == pytest.approx(P0)
-        assert left.p0_um == pytest.approx(P0) and top.p0_um == pytest.approx(P0)
-        assert left.r2 > 0.98 and top.r2 > 0.98
-        assert cal.boxes == [BOX, BOX_TOP]
-        assert cal.linear_range_um == pytest.approx(1.0)
-        # P is back where it started, the LED claim is gone, Live is still on.
-        assert mmc.pos[P_LABEL] == pytest.approx(P0)
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
-        assert svc.preview_active and svc.current_state == "preview"
-        assert _next_frame(svc, first.seq).seq > first.seq
-    assert FocusCalibration.from_dict(cal.to_dict()) == cal
-    # The record has per-edge arrays and the shared frames.
-    assert cal.record_path == str(tmp_path / "sweep2.npz")
-    with np.load(cal.record_path) as z:
-        assert z["p_um"].shape == (7,) and np.all(np.diff(z["p_um"]) > 0)
-        assert z["edge_px"].shape == (7, 2)
-        assert z["boxes"].tolist() == [list(BOX), list(BOX_TOP)]
-        assert z["axes"].tolist() == ["x", "y"]
-        assert z["polarities"].tolist() == [1, 1]
-        assert z["frames"].shape == (7, 480, 640)
-        assert z["e_start"].shape == (2,) and z["noise_px"].shape == (2,)
-        # Each frame shows its own step: both edges moved with it.
-        for k, box in enumerate((BOX, BOX_TOP)):
-            e = [measure_edge(f, box).position for f in z["frames"]]
-            assert e == pytest.approx(z["edge_px"][:, k], abs=0.5)
-        assert np.ptp(z["edge_px"][:, 0]) > 2.0 and np.ptp(z["edge_px"][:, 1]) > 1.5
-
-
-@pytest.mark.parametrize("bad_first", [False, True])
-def test_a_box_without_an_edge_is_dropped_with_a_warning(bad_first: bool) -> None:
-    mmc = FakeMMC()
-    boxes = [BOX_EMPTY, BOX_TOP] if bad_first else [BOX_TOP, BOX_EMPTY]
-    with _service2(mmc) as svc:
-        assert svc.wait_ready()
-        cal = svc.calibrate(boxes, span_um=2.0, steps=7, n_frames=2, settle_s=0.0)
-    assert len(cal.edges) == 1 and cal.edges[0].box == BOX_TOP
-    k = 1 if bad_first else 2
-    assert any(w.startswith(f"edge {k} dropped: ") for w in cal.warnings), cal.warnings
-    assert cal.edges[0].slope_px_per_um == pytest.approx(SLOPE * UY, rel=0.1)
-    assert mmc.pos[P_LABEL] == pytest.approx(P0)
-
-
-def test_calibration_with_no_edge_in_any_box_names_edge_1_first() -> None:
-    mmc = FakeMMC()
-    with _service2(mmc) as svc:
-        assert svc.wait_ready()
-        with pytest.raises(ValueError, match="edge not measurable"):
-            svc.calibrate([BOX_EMPTY, (400, 20, 80, 60)], steps=7, n_frames=2)
-        assert mmc.pos[P_LABEL] == pytest.approx(P0)
-        with pytest.raises(ValueError, match="one or two"):
-            svc.calibrate([BOX, BOX_TOP, BOX_EMPTY])
+#: A box that is not the calibration's, but still holds the left edge.
+BOX_WIDE = (224, 210, 96, 60)
 
 
 def test_start_accepts_a_single_edge_calibration() -> None:
@@ -1368,142 +1493,44 @@ def test_start_accepts_a_single_edge_calibration() -> None:
     assert mmc.sets == []
 
 
-def test_two_edge_closed_loop_holds_under_drift() -> None:
-    mmc = FakeMMC()
-    tele: list[dict] = []
-    faults: list[str] = []
-    with _service2(mmc, drift_um_per_s=DRIFT_UM_S) as svc:
-        svc.telemetry.connect(tele.append)
-        svc.fault.connect(faults.append)
-        assert svc.wait_ready()
-        svc.start(_params(max_rate_hz=RATE_CAP_HZ), _cal2())
-        time.sleep(RUN_S)
-        state = svc.current_state
-        svc.stop()
-    assert not faults, faults
-    assert state == "running"
-    late = sorted(
-        abs(t["along_um"]) for t in tele[len(tele) // 2 :] if t["along_um"] is not None
-    )
-    assert late and late[len(late) // 2] < 0.12, late
-    # P was pulled against the drift, as with one edge.
-    assert mmc.sets[-1][1] == pytest.approx(P0 - DRIFT_UM_S * RUN_S, abs=0.35)
-    assert mmc.waits == 0 and mmc.max_active == 1
-    t = tele[-1]
-    assert len(t["edges"]) == 2
-    assert all(e["ok"] and e["reason"] == "" for e in t["edges"])
-    assert t["edges"][0]["x"] == t["x"] and t["edges"][0]["edge_px"] == t["edge_px"]
-    assert t["edges"][1]["y"] == pytest.approx(194.0, abs=6.0)  # the top edge point
-    assert t["note"] == "" and t["reason"] == "" and t["ok"]
-    assert t["sigma_um"] is not None and t["sigma_um"] > 0
-    assert t["disagreement_um"] is not None and t["disagreement_um"] < 0.1
-    for e in t["edges"]:
-        assert e["along_um"] is not None and abs(e["along_um"]) < 0.3
-
-
-def test_lateral_drift_makes_the_edges_disagree_and_nothing_moves() -> None:
-    mmc = FakeMMC()
-    faults: list[str] = []
-    tele: list[dict] = []
-    # The image walks sideways: left and top edge both move, but not by what a
-    # focus change of either would do, so the two um estimates part.
-    with _service2(mmc, lateral_px_per_s=80.0) as svc:
-        svc.fault.connect(faults.append)
-        svc.telemetry.connect(tele.append)
-        assert svc.wait_ready()
-        svc.start(_params(), _cal2())
-        assert _wait(lambda: bool(faults), 8.0)
-        time.sleep(0.4)
-        n_moves = svc.stats()["n_moves"]
-    assert "edges disagree" in faults[0]
-    assert n_moves == 0 and mmc.sets == []  # P is held
-    # Telemetry goes out at most every 0.1 s and not after the fault, while the
-    # strikes that raise the fault take only a few frames: the disagreeing frames
-    # may never get a telemetry message (this used to be asserted and flaked
-    # under load). What is guaranteed: no message ever called such a frame ok.
-    limit = _params().max_edge_disagreement_um
-    assert not any(t["ok"] and (t["disagreement_um"] or 0.0) > limit for t in tele)
-
-
-def test_a_held_frame_reports_held_edge_and_never_faults() -> None:
-    """Edge 1 at target, edge 2 pushed off by a sideways shift: hold on edge 1."""
-    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+def test_telemetry_has_the_single_edge_fields_only() -> None:
+    w, pipes = _inproc_worker()
     try:
         w.on_start(
             {
                 "params": _params(strikes=3, avg_frames=2).to_dict(),
-                "calibration": _cal2().to_dict(),
+                "calibration": _cal().to_dict(),
                 "p_start_um": P0,
             }
         )
-        good = w.source.render(0.0)
-        w.on_frame(good, 0.0, 1.0)
+        w.on_frame(w.source.render(0.0), 0.0, 1.0)
         w.publish(50.0)
         tele = [m for m in _messages(pipes) if m["type"] == "telemetry"][-1]
-        assert tele["held_edge"] is None
-        # Shift the patch sideways by 4 px and refocus so that the left edge is
-        # back at its zero: only the top edge is then off (by ~1.7 um).
-        lateral = 4.0
-        w.source.lateral_px_per_s = lateral
-        w.source._p = P0 + UY * lateral / (UX * SLOPE)  # type: ignore[attr-defined]
-        shifted = w.source.render(1.0)
-        for k in range(8):  # far more than the 3 strikes
-            w.on_frame(shifted, 1.0 + k, 2.0 + k)
-        assert w.state == "running" and not w.ctl.fault
-        assert w.fused.reason == "" and w.fused.held_edge == 0
-        assert w.fused.disagreement_um is not None and w.fused.disagreement_um > 1.0
-        assert "holding on edge 1" in w.fused.note
-        w.publish(100.0)
-        tele = [m for m in _messages(pipes) if m["type"] == "telemetry"][-1]
-        assert tele["ok"] and tele["reason"] == ""
-        assert tele["held_edge"] == 0  # 0-based, an index into "edges"
-        assert "holding on edge 1" in tele["note"]
-        assert tele["disagreement_um"] > 1.0
-        e1, e2 = tele["edges"]
-        assert e1["ok"] and e2["ok"]  # both passed their own checks
-        assert tele["along_um"] == pytest.approx(e1["along_um"], abs=0.05)
+        for key in ("along_um", "edge_px", "x", "y", "contrast", "p_cmd_um", "fps"):
+            assert key in tele, key
+        for key in ("ok", "reason", "note", "sigma_um", "t"):
+            assert key in tele, key
+        for key in ("edges", "disagreement_um", "held_edge"):
+            assert key not in tele, key
+        assert tele["ok"] and tele["reason"] == "" and tele["note"] == ""
+        assert abs(tele["along_um"]) < 0.1 and tele["sigma_um"] > 0
     finally:
         _close(w, pipes)
 
 
-def test_a_lost_edge_is_a_note_and_the_lock_continues_on_the_other() -> None:
-    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+def test_a_lost_edge_is_a_strike_and_the_loop_faults() -> None:
+    w, pipes = _inproc_worker()
     try:
         w.on_start(
             {
                 "params": _params(strikes=3, avg_frames=2).to_dict(),
-                "calibration": _cal2().to_dict(),
+                "calibration": _cal().to_dict(),
                 "p_start_um": P0,
             }
         )
         good = w.source.render(0.0)
-        # The top edge is lost: its box shows only the pedestal (the part it
-        # shares with the left box is put back, so the left edge is untouched).
-        x, y, bw, bh = BOX_TOP
-        lost = good.copy()
-        lost[y : y + bh, x : x + bw] = 100
-        lost[210 : y + bh, x : BOX[0] + BOX[2]] = good[
-            210 : y + bh, x : BOX[0] + BOX[2]
-        ]
         w.on_frame(good, 0.0, 1.0)
-        assert w.fused.note == "" and w.edge_reasons == ["", ""]
-        for k in range(8):  # far more than the 3 strikes
-            w.on_frame(lost, 1.0 + k, 2.0 + k)
-        assert w.state == "running" and not w.ctl.fault
-        assert w.fused.reason == "" and "edge 2 lost" in w.fused.note
-        assert "using edge 1" in w.fused.note
-        assert w.last_along is not None and abs(w.last_along) < 0.1
-        assert w.edge_reasons[0] == "" and "edge lost" in w.edge_reasons[1]
-        w.publish(100.0)
-        tele = [m for m in _messages(pipes) if m["type"] == "telemetry"][-1]
-        assert tele["ok"] and tele["reason"] == ""
-        assert "edge 2 lost" in tele["note"]
-        assert tele["along_um"] == pytest.approx(w.last_along)
-        e1, e2 = tele["edges"]
-        assert e1["ok"] and e1["along_um"] is not None and e1["reason"] == ""
-        assert not e2["ok"] and e2["along_um"] is None and "edge lost" in e2["reason"]
-        assert tele["disagreement_um"] is None
-        # Both edges lost is a strike: the loop faults after 3 of them.
+        assert w.last_reason == "" and w.last_along is not None
         blank = np.full_like(good, 100)
         for k in range(3):
             w.on_frame(blank, 20.0 + k, 30.0 + k)
@@ -1513,197 +1540,163 @@ def test_a_lost_edge_is_a_note_and_the_lock_continues_on_the_other() -> None:
         _close(w, pipes)
 
 
-def test_zero_re_zeroes_both_edges() -> None:
+def test_zero_refuses_an_edge_that_cannot_be_measured() -> None:
     mmc = FakeMMC()
-    cal = _cal2()
-    with _service2(mmc) as svc:
+    with _service(mmc) as svc:
         assert svc.wait_ready()
-        mmc.pos[P_LABEL] = P0 + 0.4  # the user refocused by 0.4 um
-        z = svc.zero(cal, n_frames=5)
-        assert z.p0_um == pytest.approx(P0 + 0.4)
-        assert len(z.edges) == 2
-        for new, old, u in zip(z.edges, cal.edges, (UX, UY), strict=True):
-            assert new.p0_um == pytest.approx(P0 + 0.4)
-            assert new.e0_px == pytest.approx(old.e0_px + SLOPE * u * 0.4, abs=0.3)
-            assert new.slope_px_per_um == old.slope_px_per_um
-            assert new.box == old.box
-        assert z.boxes == cal.boxes and z.linear_range_um == cal.linear_range_um
-        assert mmc.sets == [] and mmc.waits == 0  # reads P once, moves nothing
-        assert mmc.props[(CRISP, "CRISP State")] == "Idle"
-        # The lock on the new zero holds the new P.
-        svc.start(_params(), z)
-        time.sleep(1.0)
-        svc.stop()
-        assert mmc.sets == []
-        # An edge that cannot be measured refuses the zero.
-        bad = FocusCalibration(edges=[cal.edges[0], _edge_cal(box=BOX_EMPTY)], p0_um=P0)
-        with pytest.raises(ValueError, match="edge 2: edge not measurable"):
+        bad = FocusCalibration(edge=_edge_cal(box=BOX_EMPTY), p0_um=P0)
+        with pytest.raises(ValueError, match="edge not measurable"):
             svc.zero(bad, n_frames=3)
 
 
 def test_set_calibration_gives_the_preview_an_error() -> None:
     mmc = FakeMMC()
-    cal = _cal2()
-    with _service2(mmc) as svc:
+    cal = _cal()
+    with _service(mmc) as svc:
         assert svc.wait_ready()
         svc.start_preview()
-        svc.set_edge_boxes([BOX, BOX_TOP])
+        svc.set_edge_box(BOX)
 
         def tele_with(pred) -> bool:
             t = svc.last_telemetry
-            return t is not None and len(t["edges"]) == 2 and pred(t)
+            return t is not None and pred(t)
 
-        # No calibration: the edges are measured, but there is no error.
+        # No calibration: the edge is measured, but there is no error.
         assert _wait(lambda: tele_with(lambda t: t["along_um"] is None), 5.0)
-        assert all(e["along_um"] is None for e in svc.last_telemetry["edges"])
         assert svc.last_telemetry["ok"]
-        # With one: the fused error, and a per-edge one, at the zero (about 0).
+        # With one: the error at the zero (about 0).
         svc.set_calibration(cal)
         assert _wait(lambda: tele_with(lambda t: t["along_um"] is not None), 5.0)
         t = svc.last_telemetry
         assert abs(t["along_um"]) < 0.1 and t["sigma_um"] > 0
-        assert all(abs(e["along_um"]) < 0.2 for e in t["edges"])
         assert t["note"] == "" and t["reason"] == ""
-        # Other boxes than the calibration's: measured, no error.
-        svc.set_edge_boxes([BOX])
-        assert _wait(
-            lambda: (
-                (t := svc.last_telemetry) is not None
-                and len(t["edges"]) == 1
-                and t["along_um"] is None
-            ),
-            5.0,
-        )
-        svc.set_edge_boxes([BOX, BOX_TOP])
+        assert "edges" not in t
+        # Another box than the calibration's: measured, no error.
+        svc.set_edge_box(BOX_WIDE)
+        assert _wait(lambda: tele_with(lambda t: t["along_um"] is None), 5.0)
+        svc.set_edge_box(BOX)
         assert _wait(lambda: tele_with(lambda t: t["along_um"] is not None), 5.0)
         # Clearing it removes the error again.
         svc.set_calibration(None)
         assert _wait(lambda: tele_with(lambda t: t["along_um"] is None), 5.0)
-        svc.set_edge_boxes([])
+        svc.set_edge_box(None)
         _poll_frame(svc, lambda fr: fr.spot is None)
     assert mmc.sets == []
 
 
 def test_stop_keeps_the_calibration_for_the_preview() -> None:
     mmc = FakeMMC()
-    with _service2(mmc) as svc:
+    with _service(mmc) as svc:
         assert svc.wait_ready()
         svc.start_preview()
-        svc.start(_params(), _cal2())
+        svc.start(_params(), _cal())
         assert _wait(lambda: svc.current_state == "running", 5.0)
         svc.stop()
         assert _wait(lambda: svc.current_state == "preview", 5.0)
-        svc.set_edge_boxes([BOX, BOX_TOP])  # the same boxes: error from the held cal
+        svc.set_edge_box(BOX)  # the same box: error from the held calibration
         assert _wait(
-            lambda: (
-                (t := svc.last_telemetry) is not None
-                and len(t["edges"]) == 2
-                and t["along_um"] is not None
-            ),
+            lambda: (t := svc.last_telemetry) is not None and t["along_um"] is not None,
             5.0,
         )
 
 
-def test_measure_with_two_boxes_returns_both_edges() -> None:
+def test_measure_takes_one_box_only() -> None:
     mmc = FakeMMC()
-    with _service2(mmc) as svc:
+    with _service(mmc) as svc:
         assert svc.wait_ready()
-        m = svc.measure(4, P0, box=[BOX, BOX_TOP], return_frame=True)
-        assert m["frame"].shape == (480, 640) and m["roi"] == (0, 0, 640, 480)
-        left, top = m["edges"]
-        e_left, e_top = _e0s_diag()
-        for ent, expect, axis in ((left, e_left, "x"), (top, e_top, "y")):
-            assert ent["n"] == 4 and ent["reason"] == ""
-            assert (ent["axis"], ent["polarity"]) == (axis, 1)
-            assert ent["edge_mean"] == pytest.approx(expect, abs=0.3)
-            assert 0.0 <= ent["edge_sd"] < 0.3
-            assert ent["contrast_mean"] > 300
-        assert left["x_mean"] == pytest.approx(left["edge_mean"])
-        assert top["y_mean"] == pytest.approx(top["edge_mean"])
-        # The top level mirrors the first box.
-        assert m["n"] == 4 and m["edge_mean"] == left["edge_mean"]
-        assert (m["axis"], m["polarity"]) == ("x", 1)
-        # Given axes and polarities, one per box.
-        both = svc.measure(2, box=[BOX, BOX_TOP], axis=["x", "y"], polarity=[1, 1])
-        assert [e["n"] for e in both["edges"]] == [2, 2]
-        with pytest.raises(ValueError):
-            svc.measure(2, box=[BOX, BOX_TOP], axis="x")
-        # A box with no edge gives up on its own and the other still completes.
+        m = svc.measure(4, P0, box=BOX, return_frame=True)
+        assert "edges" not in m
+        assert m["n"] == 4 and m["reason"] == ""
+        assert m["x_mean"] == pytest.approx(m["edge_mean"])
+        with pytest.raises(ValueError, match="edge box"):
+            svc.measure(2, box=[BOX, BOX_WIDE])  # type: ignore[list-item]
+        # A box with no edge gives up on its own.
         t0 = time.monotonic()
-        part = svc.measure(3, box=[BOX, BOX_EMPTY])
+        none = svc.measure(3, box=BOX_EMPTY)
         assert time.monotonic() - t0 < 4.0
-        assert part["edges"][0]["n"] == 3
-        assert part["edges"][1]["n"] == 0 and part["edges"][1]["reason"]
-        assert part["n"] == 3 and part["reason"] == ""
+        assert none["n"] == 0 and none["reason"]
 
 
-def test_measure_message_with_the_old_single_box_keys_still_works() -> None:
+def test_measure_message_uses_the_box_else_the_preview_box() -> None:
     w, pipes = _inproc_worker()
     try:
         w.on_measure(
             {"n_frames": 3, "p_um": P0, "box": list(BOX), "axis": "x", "polarity": 1}
         )
         (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
-        assert m["n"] == 3 and len(m["edges"]) == 1
-        assert m["edges"][0]["edge_mean"] == pytest.approx(_e0(), abs=0.3)
-        # No boxes in the message: the preview boxes are measured.
-        w.on_set_edge_boxes({"boxes": [list(BOX), list(BOX_EMPTY)]})
+        assert m["n"] == 3 and "edges" not in m
+        assert m["edge_mean"] == pytest.approx(_e0(), abs=0.3)
+        # No box in the message: the preview box is measured.
+        w.on_set_edge_box({"box": list(BOX_EMPTY)})
         w.on_measure({"n_frames": 2})
         (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
-        assert [e["n"] for e in m["edges"]] == [2, 0]
+        assert m["n"] == 0
+        w.on_set_edge_box({"box": list(BOX)})
+        w.on_measure({"n_frames": 2})
+        (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
+        assert m["n"] == 2
     finally:
         _close(w, pipes)
 
 
-def test_preview_boxes_messages_and_the_one_box_alias() -> None:
-    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+def test_the_preview_box_message_and_the_removed_boxes_message() -> None:
+    w, pipes = _inproc_worker()
     try:
         w.preview = True
-        w.on_set_edge_boxes({"boxes": [list(BOX), list(BOX_TOP)]})
-        assert w.edge_boxes == [BOX, BOX_TOP]
+        w.on_set_edge_box({"box": list(BOX)})
+        assert w.edge_box == BOX
         w.on_frame(w.source.render(0.0), 1.0, 1.0)
-        assert len(w.fixes) == 2 and w.last_fix is w.fixes[0]
-        assert all(f.ok for f in w.fixes) and w.fused is None and w.last_along is None
-        assert (w.fixes[0].axis, w.fixes[1].axis) == ("x", "y")
-        w.on_set_edge_boxes({"boxes": [list(BOX)] * 3})  # too many: reported
-        assert w.edge_boxes == [BOX, BOX_TOP]
-        w.on_set_edge_box({"box": list(BOX_TOP)})  # the alias sets one box
-        assert w.edge_boxes == [BOX_TOP] and w.fixes == []
-        w.on_set_edge_boxes({"boxes": []})
-        assert w.edge_boxes == []
+        assert w.last_fix.ok and w.err is None and w.last_along is None
+        assert w.last_fix.axis == "x"
+        w.on_set_edge_box({"box": [1, 2, 3]})  # malformed: reported, box unchanged
+        assert w.edge_box == BOX
+        w.on_set_edge_box({"box": None})
+        assert w.edge_box is None and w.last_fix is None
         errors = [m for m in _messages(pipes) if m["type"] == "error"]
-        assert len(errors) == 1 and "at most 2" in errors[0]["message"]
+        assert len(errors) == 1 and "set_edge_box" in errors[0]["message"]
+        # The multi-box message is gone: it is ignored, not handled.
+        w.handle({"type": "set_edge_boxes", "boxes": [list(BOX), list(BOX_WIDE)]})
+        assert w.edge_box is None
+        assert not hasattr(w, "on_set_edge_boxes")
     finally:
         _close(w, pipes)
 
 
 def test_set_calibration_in_process_and_while_running() -> None:
-    w, pipes = _inproc_worker(cal_like=dict(CAL_DIAG))
+    w, pipes = _inproc_worker()
     try:
         w.preview = True
-        w.on_set_edge_boxes({"boxes": [list(BOX), list(BOX_TOP)]})
-        w.on_set_calibration({"calibration": _cal2().to_dict()})
+        w.on_set_edge_box({"box": list(BOX)})
+        w.on_set_calibration({"calibration": _cal().to_dict()})
         assert w.params is None  # no params sent yet: the default ones are used
         w.on_frame(w.source.render(0.0), 1.0, 1.0)
-        assert w.fused is not None and w.last_along == pytest.approx(0.0, abs=0.1)
+        assert w.err is not None and w.last_along == pytest.approx(0.0, abs=0.1)
         assert w.params is None
-        # A single-edge dict (the format saved before two-edge fusion) is accepted.
+        # A bare single-edge dict (an older format) is accepted.
         w.on_set_calibration({"calibration": _edge_cal().to_dict()})
-        assert len(w.cal.edges) == 1
+        assert w.cal.box == BOX
+        # So is the two-edge format: the first edge is kept.
+        old = {
+            "kind": "edges",
+            "edges": [_edge_cal().to_dict(), _edge_cal(box=BOX_EMPTY).to_dict()],
+            "p0_um": P0,
+        }
+        w.on_set_calibration({"calibration": old})
+        assert w.cal.box == BOX
         # Garbage is reported and the calibration kept.
         w.on_set_calibration({"calibration": {"kind": "gauss"}})
-        assert len(w.cal.edges) == 1
+        assert w.cal.box == BOX
         assert [m for m in _messages(pipes) if m["type"] == "error"]
         # While the lock runs the calibration is not swapped under the controller.
         w.on_start(
             {
                 "params": _params().to_dict(),
-                "calibration": _cal2().to_dict(),
+                "calibration": _cal().to_dict(),
                 "p_start_um": P0,
             }
         )
         w.on_set_calibration({"calibration": None})
-        assert w.cal is not None and len(w.cal.edges) == 2
+        assert w.cal is not None and w.cal.box == BOX
     finally:
         _close(w, pipes)
 
@@ -1720,7 +1713,7 @@ def test_calibration_stores_the_detector_setting() -> None:
         assert svc.detector_setting == ("gaussderiv", 6.0)  # the default
         svc.start_preview()
         cal = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
-        (edge,) = cal.edges
+        edge = cal.edge
         assert (edge.detector, edge.detector_sigma_px) == ("gaussderiv", 6.0)
         assert edge.box_normal_px == BOX[2]
         assert 3.0 < edge.edge_width_px < 12.0  # the fake edge has sigma 2 px
@@ -1729,16 +1722,16 @@ def test_calibration_stores_the_detector_setting() -> None:
         svc.set_camera(detector="halfmax")
         assert svc.detector_setting == ("halfmax", 6.0)
         cal2 = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
-        assert cal2.edges[0].detector == "halfmax"
+        assert cal2.edge.detector == "halfmax"
         svc.set_camera(detector="gaussderiv", detector_sigma_px=8.0)
         cal3 = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
-        assert (cal3.edges[0].detector, cal3.edges[0].detector_sigma_px) == (
+        assert (cal3.edge.detector, cal3.edge.detector_sigma_px) == (
             "gaussderiv",
             8.0,
         )
         # It survives the settings round trip.
         again = FocusCalibration.from_dict(cal3.to_dict())
-        assert again == cal3 and again.edges[0].detector_sigma_px == 8.0
+        assert again == cal3 and again.edge.detector_sigma_px == 8.0
         with pytest.raises(ValueError, match="detector"):
             svc.set_camera(detector="sobel")
         assert svc.detector_setting == ("gaussderiv", 8.0)  # unchanged
@@ -1753,7 +1746,7 @@ def test_calibration_from_the_analysis_setting() -> None:
         assert svc.camera_info["detector"] == "halfmax"
         svc.start_preview()
         cal = svc.calibrate(BOX, span_um=2.0, steps=5, n_frames=2, settle_s=0.0)
-        assert (cal.edges[0].detector, cal.edges[0].detector_sigma_px) == (
+        assert (cal.edge.detector, cal.edge.detector_sigma_px) == (
             "halfmax",
             4.0,
         )
@@ -1811,13 +1804,13 @@ def test_a_running_lock_measures_with_the_calibration_detector() -> None:
         )
         assert w.running
         w.on_frame(w.source.render(0.0), 1.0, 1.0)
-        assert [f.detector for f in w.fixes] == ["halfmax"]
+        assert w.last_fix.detector == "halfmax"
         # The setting changes under the running lock: the lock keeps its detector.
         w.on_set_camera({"detector": "gaussderiv"})
         assert w.detector_setting == ("gaussderiv", 6.0) and w.running
         w.on_frame(w.source.render(0.0), 2.0, 2.0)
-        assert [f.detector for f in w.fixes] == ["halfmax"]
-        assert w.fixes[0].ok
+        assert w.last_fix.detector == "halfmax"
+        assert w.last_fix.ok
     finally:
         _close(w, pipes)
 
@@ -1826,53 +1819,39 @@ def test_the_preview_marker_follows_the_calibration_then_the_setting() -> None:
     w, pipes = _inproc_worker()
     try:
         w.preview = True
-        w.on_set_edge_boxes({"boxes": [list(BOX)]})
+        w.on_set_edge_box({"box": list(BOX)})
         # No calibration: the setting (gaussderiv by default).
         w.on_frame(w.source.render(0.0), 1.0, 1.0)
-        assert w.fixes[0].detector == "gaussderiv"
+        assert w.last_fix.detector == "gaussderiv"
         # A held halfmax calibration for these boxes: its detector wins.
         w.on_set_calibration({"calibration": _cal(detector="halfmax").to_dict()})
         w.on_frame(w.source.render(0.0), 2.0, 2.0)
-        assert w.fixes[0].detector == "halfmax" and w.last_along is not None
-        # Other preview boxes than the calibration: no error, the setting.
-        w.on_set_edge_boxes({"boxes": [list(BOX_TOP)]})
+        assert w.last_fix.detector == "halfmax" and w.last_along is not None
+        # Another preview box than the calibration's: no error, the setting.
+        w.on_set_edge_box({"box": list(BOX_WIDE)})
         w.on_frame(w.source.render(0.0), 3.0, 3.0)
-        assert w.fixes[0].detector == "gaussderiv" and w.last_along is None
+        assert w.last_fix.detector == "gaussderiv" and w.last_along is None
         # The setting changes: a calibrated marker does not.
-        w.on_set_edge_boxes({"boxes": [list(BOX)]})
+        w.on_set_edge_box({"box": list(BOX)})
         w.on_set_camera({"detector": "halfmax", "detector_sigma_px": 6.0})
         w.on_set_calibration({"calibration": _cal().to_dict()})  # gaussderiv one
         w.on_frame(w.source.render(0.0), 4.0, 4.0)
-        assert w.fixes[0].detector == "gaussderiv"
+        assert w.last_fix.detector == "gaussderiv"
     finally:
         _close(w, pipes)
 
 
-def test_measure_uses_the_detector_given_per_box_else_the_setting() -> None:
+def test_measure_uses_the_detector_given_else_the_setting() -> None:
     w, pipes = _inproc_worker()
     try:
-        w.on_measure(
-            {
-                "n_frames": 2,
-                "p_um": P0,
-                "boxes": [
-                    {"box": list(BOX), "axis": "x", "polarity": 1},
-                    {
-                        "box": list(BOX),
-                        "axis": "x",
-                        "polarity": 1,
-                        "detector": "halfmax",
-                        "detector_sigma_px": 6.0,
-                    },
-                ],
-            }
-        )
-        (m,) = [m for m in _messages(pipes) if m["type"] == "measurement"]
-        assert [e["detector"] for e in m["edges"]] == ["gaussderiv", "halfmax"]
-        assert [e["detector_sigma_px"] for e in m["edges"]] == [6.0, 6.0]
-        assert all(e["n"] == 2 and e["edge_width_mean"] > 0 for e in m["edges"])
+        base = {"n_frames": 2, "p_um": P0, "box": list(BOX), "axis": "x", "polarity": 1}
+        w.on_measure(base)
+        w.on_measure({**base, "detector": "halfmax", "detector_sigma_px": 6.0})
+        a, b = [m for m in _messages(pipes) if m["type"] == "measurement"]
+        assert (a["detector"], b["detector"]) == ("gaussderiv", "halfmax")
+        assert (a["detector_sigma_px"], b["detector_sigma_px"]) == (6.0, 6.0)
+        assert all(m["n"] == 2 and m["edge_width_mean"] > 0 for m in (a, b))
         # both locate the same edge of the symmetric fake
-        a, b = m["edges"]
         assert a["edge_mean"] == pytest.approx(b["edge_mean"], abs=0.5)
     finally:
         _close(w, pipes)
@@ -1896,15 +1875,15 @@ def test_zero_measures_with_the_detector_of_the_calibration() -> None:
     cal = _cal(detector="halfmax")  # the setting is gaussderiv: a stale calibration
     with _service(mmc) as svc:
         assert svc.wait_ready()
-        real = svc._snap_edges
+        real = svc._snap_edge
         seen: list[Any] = []
 
-        def snap(n, p, specs, return_frame, detectors=None):
-            seen.append(detectors)
-            return real(n, p, specs, return_frame, detectors)
+        def snap(n, p, box, axis, pol, return_frame, detector=None):
+            seen.append(detector)
+            return real(n, p, box, axis, pol, return_frame, detector)
 
-        svc._snap_edges = snap  # type: ignore[method-assign]
+        svc._snap_edge = snap  # type: ignore[method-assign]
         z = svc.zero(cal, n_frames=3)
-        assert seen == [[("halfmax", 6.0)]]
-        assert (z.edges[0].detector, z.edges[0].detector_sigma_px) == ("halfmax", 6.0)
-        assert z.edges[0].slope_px_per_um == cal.edges[0].slope_px_per_um
+        assert seen == [("halfmax", 6.0)]
+        assert (z.edge.detector, z.edge.detector_sigma_px) == ("halfmax", 6.0)
+        assert z.edge.slope_px_per_um == cal.edge.slope_px_per_um
