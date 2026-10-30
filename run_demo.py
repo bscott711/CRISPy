@@ -546,8 +546,31 @@ def build_demo_controls() -> QWidget:
     return panel
 
 
+def install_demo_spot_store() -> None:
+    """Give the piezo panel's Spot lock section a simulated camera (no hardware)."""
+    from CRISPy.spot.store import MemorySpotSettingsStore, set_settings_store
+
+    store = MemorySpotSettingsStore()
+    store.settings.source.kind = "fake"  # FakeSpotSource, no ToupTek SDK
+    # The fake's true image motion: the LED patch moves 5 px per um of piezo travel
+    # along x, and is sharpest at P = 50 um (the same figures the worker tests use).
+    store.settings.source.fake = {
+        "cal_like": {
+            "x0": 320.0,
+            "y0": 240.0,
+            "ux": 1.0,
+            "uy": 0.0,
+            "slope_px_per_um": 5.0,
+            "p0_um": 50.0,
+        },
+        "drift_um_per_s": 0.02,
+    }
+    set_settings_store(store)
+
+
 def run_demo():
     app = QApplication.instance() or QApplication(sys.argv)
+    install_demo_spot_store()  # before the panels are built
 
     # Patch the function in the `plugin` module's namespace
     with patch("CRISPy.plugin.discover_crisp_devices", mock_discover):

@@ -102,6 +102,15 @@ from .focus_curve import (
     sharpest_position,
     write_curve_csv,
 )
+from .gating import (
+    CURVE,
+    DITHER,
+    HOLD,
+    control_gate,
+    poll_may_run,
+    spot_section_enabled,
+    tool_may_start,
+)
 from .hold import (
     DEFAULT_DURATION_S,
     DEFAULT_RATE_HZ,
@@ -310,7 +319,7 @@ _BAD_STATES = {"Error", "Inhibit", "Dim"}
 _GOOD_STATES = {"Lock", "In Focus", "Ready"}
 
 # Diagnostic tools; one runs at a time, and the slow poll is paused while it does.
-_DITHER, _CURVE, _HOLD = "dither", "curve", "hold"
+_DITHER, _CURVE, _HOLD = DITHER, CURVE, HOLD
 _TOOL_TITLES = {_DITHER: "Dither", _CURVE: "Focus curve", _HOLD: "Hold test"}
 # The Dither assistant re-reads the state this often, and stops after this many reads
 # in a row outside the dither states.
@@ -676,9 +685,17 @@ class CrispControlPanel(QWidget):
         controller: CrispController,
         mmcore: CMMCorePlus | None = None,
         parent: QWidget | None = None,
+        *,
+        spot_lock: bool = False,
     ) -> None:
         super().__init__(parent)
         self.controller = controller
+        # The spot edge lock section (piezo panels only; ``spot_lock`` marks the one
+        # panel of this process that gets it, see CRISPy.spot_choice).
+        self._spot_lock_wanted = spot_lock
+        self.spot_panel: QWidget | None = None
+        self.spot_section: _Section | None = None
+        self._spot_lock_active = False
         self.mmcore = mmcore or CMMCorePlus.instance()
         self._readouts: dict[str, QLabel] = {}
         self._last_readouts: dict[str, str] = {}
@@ -764,6 +781,29 @@ class CrispControlPanel(QWidget):
             self.mmcore.mda.events.sequenceFinished.connect(self._on_mda_finished)
 
     # ------------------------------------------------------------------ build
+    def _build_spot_section(self, layout: QVBoxLayout) -> None:
+        """Add the spot edge lock (``CRISPy.spot``) as a "Spot lock" section."""
+        from .spot.panel import SpotFocusPanel
+        from .spot.store import get_settings_store
+
+        store = get_settings_store()
+        piezo = (
+            store.piezo_label
+            if store.piezo_label is not None
+            else self.controller.actuator_label
+        )
+        crisp = (
+            store.crisp_label
+            if store.crisp_label is not None
+            else self.controller.label
+        )
+        panel = SpotFocusPanel(self.mmcore, piezo_label=piezo, crisp_label=crisp)
+        # The panel stops its worker when it is destroyed, i.e. with this panel.
+        panel.lockActiveChanged.connect(self._on_spot_lock_active)
+        self.spot_panel = panel
+        self.spot_section = _Section("Spot lock", panel)
+        layout.addWidget(self.spot_section)
+
     def _build(self) -> None:
         layout = QVBoxLayout(self)
 
@@ -906,6 +946,10 @@ class CrispControlPanel(QWidget):
             cal.addWidget(b)
         layout.addWidget(cal_box)
 
+        # --- Spot lock (the one piezo panel of the process; collapsed until used) --
+        if self._spot_lock_wanted and self.controller.actuator_type == "piezo":
+            self._build_spot_section(layout)
+
         # --- Dither assistant (compact, in the panel; collapsed until used) ---
         self.dither_section = _Section("Dither", self._build_dither_body())
         self.dither_section.toggle_btn.toggled.connect(self._on_dither_section_toggled)
@@ -942,6 +986,7 @@ class CrispControlPanel(QWidget):
         param_body = QWidget()
         form = QFormLayout(param_body)
         self._add_parameter_widgets(form)
+        self._param_body = param_body  # disabled while the spot lock runs
         self.params_section = _Section("Parameters", param_body)
         layout.addWidget(self.params_section)
 
@@ -1329,7 +1374,7 @@ class CrispControlPanel(QWidget):
         with suppress(Exception):
             fn()
         self._full_read_due = True
-        if refresh and self._active_tool is None:
+        if refresh and self._poll_now_allowed():
             self._poller.poll_now(force=True)
 
     def _on_idle_ready(self) -> None:
@@ -1363,7 +1408,7 @@ class CrispControlPanel(QWidget):
             self.led_error_lbl.clear()
             self.led_error_lbl.hide()
         self._full_read_due = True
-        if self._active_tool is None:
+        if self._poll_now_allowed():
             self._poller.poll_now(force=True)
         return ok
 
@@ -1379,9 +1424,10 @@ class CrispControlPanel(QWidget):
         """Relight the LED so a new intensity takes effect (Idle with LED on, Ready).
 
         Guarded on the cached state (no serial read on the GUI thread); never sent
-        while locked, calibrating or dithering, or while a diagnostic tool runs.
+        while locked, calibrating or dithering, or while a diagnostic tool or the
+        spot lock runs.
         """
-        if self._active_tool is not None:
+        if self._active_tool is not None or self._spot_lock_active:
             return
         if should_reapply_led(self._last_state, self.btn_led.isChecked()):
             self._led_write(True)
@@ -1399,6 +1445,8 @@ class CrispControlPanel(QWidget):
         self._do(self.controller.set_log_cal)
 
     def _on_dither_clicked(self) -> None:
+        if self._spot_lock_active:
+            return  # refuse before writing CRISP State: the spot lock owns the line
         # Re-aligning the detector changes the slope too.
         self._set_measured_slope(None)
         # The assistant takes over the serial port straight away, so skip the
@@ -1420,7 +1468,7 @@ class CrispControlPanel(QWidget):
     def _on_poll_toggled(self, checked: bool) -> None:
         if checked:
             # While a tool runs, the slow poller stays paused; it resumes after.
-            if self._active_tool is None and not self._mda_running:
+            if self._poll_may_run():
                 self._full_read_due = True
                 self._poller.start()
                 self._poller.poll_now(force=True)
@@ -1439,7 +1487,7 @@ class CrispControlPanel(QWidget):
     def _on_mda_finished(self, *_args) -> None:
         self._mda_running = False
         with suppress(RuntimeError):
-            if self.poll_chk.isChecked() and self._active_tool is None:
+            if self.poll_chk.isChecked() and self._poll_may_run():
                 self._full_read_due = True
                 self._poller.start()
 
@@ -1458,12 +1506,59 @@ class CrispControlPanel(QWidget):
         super().closeEvent(event)
 
     # ------------------------------------------------------------- tool core
-    def _begin_tool(self, name: str) -> bool:
-        """Claim the serial port for tool *name*; ``False`` if another one has it."""
+    def _poll_may_run(self) -> bool:
+        """The slow poll runs only with no tool, no MDA and no spot lock on the line."""
+        return poll_may_run(
+            active_tool=self._active_tool,
+            mda_running=self._mda_running,
+            spot_lock=self._spot_lock_active,
+        )
+
+    def _poll_now_allowed(self) -> bool:
+        """A one-off refresh is read only when no tool and no spot lock has the line."""
+        return tool_may_start(
+            active_tool=self._active_tool, spot_lock=self._spot_lock_active
+        )
+
+    def _set_readouts_title(self) -> None:
         if self._active_tool is not None:
+            self.readouts_box.setTitle(
+                f"Readouts  (paused: {_TOOL_TITLES[self._active_tool]})"
+            )
+        elif self._spot_lock_active:
+            self.readouts_box.setTitle("Readouts  (paused: Spot lock)")
+        else:
+            self.readouts_box.setTitle("Readouts")
+
+    def _on_spot_lock_active(self, active: bool) -> None:
+        """The spot lock owns the Tiger serial line while it runs: pause the poll.
+
+        Like the MDA auto-pause; the poll resumes when the lock is no longer active.
+        """
+        self._spot_lock_active = active
+        self._set_readouts_title()
+        self._sync_tool_controls()
+        if active:
+            with suppress(RuntimeError):
+                self._poller.stop()
+        elif self.poll_chk.isChecked() and self._poll_may_run():
+            self._full_read_due = True
+            with suppress(RuntimeError):
+                self._poller.start()
+                if self.isVisible():
+                    self._poller.poll_now(force=True)
+
+    def _begin_tool(self, name: str) -> bool:
+        """Claim the serial port for tool *name*; ``False`` if another one has it.
+
+        Also ``False`` while the spot lock runs: it is the only reader of the Tiger.
+        """
+        if not tool_may_start(
+            active_tool=self._active_tool, spot_lock=self._spot_lock_active
+        ):
             return False
         self._active_tool = name
-        self.readouts_box.setTitle(f"Readouts  (paused: {_TOOL_TITLES[name]})")
+        self._set_readouts_title()
         with suppress(RuntimeError):
             self._poller.stop()  # one reader on the serial port at a time
         self._sync_tool_controls()
@@ -1473,9 +1568,9 @@ class CrispControlPanel(QWidget):
         if self._active_tool != name:
             return
         self._active_tool = None
-        self.readouts_box.setTitle("Readouts")
+        self._set_readouts_title()
         self._sync_tool_controls()
-        if self.poll_chk.isChecked() and not self._mda_running:
+        if self.poll_chk.isChecked() and self._poll_may_run():
             self._full_read_due = True
             with suppress(RuntimeError):
                 self._poller.start()
@@ -1496,10 +1591,24 @@ class CrispControlPanel(QWidget):
     def _sync_tool_controls(self) -> None:
         tool = self._active_tool
         curve = tool == _CURVE
-        self.tools_running_lbl.setText(
-            f"{_TOOL_TITLES[tool]} running" if tool is not None else ""
+        spot = self._spot_lock_active  # the spot lock is the only serial reader
+        if tool is not None:
+            self.tools_running_lbl.setText(f"{_TOOL_TITLES[tool]} running")
+        else:
+            self.tools_running_lbl.setText(
+                "Spot lock running: stop it to use the tools" if spot else ""
+            )
+        # The spot lock and a CRISPy tool never run together: the section is
+        # disabled while a tool runs, and the tools cannot start while it locks.
+        if self.spot_panel is not None:
+            self.spot_panel.setEnabled(spot_section_enabled(active_tool=tool))
+        gate = control_gate(
+            active_tool=tool,
+            spot_lock=spot,
+            crisp_locked=self._last_state in _LOCKED_STATES,
         )
         # The focus curve moves the actuator; nothing else may change state meanwhile.
+        # While the spot lock runs, nothing here may write to the Tiger either.
         for b in (
             self.btn_idle_ready,
             self.btn_lock,
@@ -1509,15 +1618,18 @@ class CrispControlPanel(QWidget):
             self.btn_dither,
             self.btn_gain,
         ):
-            b.setEnabled(not curve)
+            b.setEnabled(gate.ops)
+        self.btn_led.setEnabled(gate.led)
+        for w in (self.joystick_chk, self._param_body):
+            w.setEnabled(gate.led_and_params)
         self.dither_watch_btn.blockSignals(True)
         self.dither_watch_btn.setChecked(tool == _DITHER)
         self.dither_watch_btn.blockSignals(False)
-        self.dither_watch_btn.setEnabled(tool in (None, _DITHER))
+        self.dither_watch_btn.setEnabled(gate.dither_watch)
         self.curve_run_btn.setText("Cancel" if curve else "Run focus curve")
-        self.curve_run_btn.setEnabled(tool in (None, _CURVE))
+        self.curve_run_btn.setEnabled(gate.curve_run)
         self.hold_start_btn.setText("Stop" if tool == _HOLD else "Start hold test")
-        self.hold_start_btn.setEnabled(tool in (None, _HOLD))
+        self.hold_start_btn.setEnabled(gate.hold_start)
         self.curve_save_btn.setEnabled(self._curve_scan is not None and not curve)
         self.hold_save_btn.setEnabled(bool(self._hold_results) and tool != _HOLD)
 
@@ -2437,8 +2549,8 @@ class CrispControlPanel(QWidget):
 
     def _apply_values(self, snap: CrispSnapshot) -> None:
         """Apply a telemetry *snap* to the widgets (runs on the GUI thread)."""
-        if self._active_tool is not None:
-            return  # a read that was in flight when a tool took over
+        if self._active_tool is not None or self._spot_lock_active:
+            return  # a read that was in flight when a tool or the spot lock took over
         self._update_state(snap.state)
         if snap.full:
             # Calibration Gain / Range are among the full readouts, so derive the
@@ -2554,7 +2666,13 @@ class CrispControlPanel(QWidget):
             self._set_led_button(True)
         elif state == "Idle" and previous_state != "Idle":
             self._set_led_button(False)
-        self.btn_led.setEnabled(not locked)
+        self.btn_led.setEnabled(
+            control_gate(
+                active_tool=self._active_tool,
+                spot_lock=self._spot_lock_active,
+                crisp_locked=locked,
+            ).led
+        )
         self.btn_lock.setText("Unlock" if locked else "Lock")
 
         # Auto joystick lockout: only act on a lock/unlock *transition*, so a
