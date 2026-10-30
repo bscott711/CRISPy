@@ -81,6 +81,19 @@ def test_error_statistics_and_rate() -> None:
     assert stats.duration_s == pytest.approx(10.0)
 
 
+def test_an_error_ramp_is_reported_as_a_trend_not_as_noise() -> None:
+    # Unlocked, with the optics drifting: the error ramps 16 counts/min (1 µm/min at
+    # 16 counts/µm) with ±1 count of noise on top. Without detrending, the ramp alone
+    # would give 16/√12 ≈ 4.6 counts rms over the minute.
+    samples = [
+        HoldSample(k * 0.1, 25.0, 16.0 * (k * 0.1) / 60.0 + (-1) ** k)
+        for k in range(601)
+    ]
+    stats = analyze_hold(samples)
+    assert stats.error_drift_per_min == pytest.approx(16.0, rel=0.01)
+    assert stats.error_rms == pytest.approx(1.0, rel=0.02)
+
+
 def test_missing_positions_give_no_position_stats() -> None:
     stats = analyze_hold([HoldSample(k * 0.1, None, 1.0) for k in range(20)])
     assert stats.rms_nm is None
@@ -181,8 +194,40 @@ def test_worker_stops_when_the_lock_is_lost() -> None:
     core = FakeCore(states=["In Focus", "Ready", "Ready"])
     r = _run(core, duration_s=10.0)
     assert not r.completed
-    assert r.lock_lost_at_s is not None
+    assert r.interrupted_at_s is not None
+    assert r.locked
     assert "lock lost" in r.note
+
+
+def test_unlocked_run_records_while_ready_and_is_marked_unlocked() -> None:
+    core = FakeCore(states=["Ready"])
+    r = _run(core, duration_s=1.2, locked=False)
+    assert r.completed
+    assert not r.locked
+    assert r.note == ""
+    assert r.stats.rms_nm is not None
+    assert core.writes == []
+
+
+def test_unlocked_run_ends_when_crisp_starts_driving_the_actuator() -> None:
+    for driving in ("In Focus", "Calibrating", "Dither"):
+        core = FakeCore(states=["Ready", driving, driving])
+        r = _run(core, duration_s=10.0, locked=False)
+        assert not r.completed, driving
+        assert r.interrupted_at_s is not None
+        assert "driving" in r.note
+
+
+def test_unlocked_run_accepts_idle() -> None:
+    r = _run(FakeCore(states=["Idle"]), duration_s=1.2, locked=False)
+    assert r.completed
+
+
+def test_csv_records_the_mode(tmp_path: Path) -> None:
+    r = _run(FakeCore(states=["Ready"]), locked=False)
+    out = tmp_path / "hold.csv"
+    write_hold_csv(out, r)
+    assert "# mode: unlocked" in out.read_text(encoding="utf-8").splitlines()
 
 
 def test_one_unlocked_read_alone_does_not_stop_the_run() -> None:

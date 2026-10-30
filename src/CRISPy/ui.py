@@ -13,47 +13,67 @@ the ASITiger device-adapter properties:
 * derived metrics -> actuator-type badge, error *sensitivity* (counts/µm) from the
                      calibration, the focus error expressed in microns, and the
                      in-loop error fluctuation while locked
-* diagnostics     -> the Dither assistant (:mod:`CRISPy.dither`), the focus curve
+* diagnostics     -> the Dither assistant (:mod:`CRISPy.dither`, a collapsible
+                     section of the panel), the focus curve
                      (:mod:`CRISPy.focus_curve`) and the hold test (:mod:`CRISPy.hold`)
+                     (the last two in a window of their own)
 * parameters      -> reused ``pymmcore_widgets.PropertyWidget`` controls
 """
 
 from __future__ import annotations
 
+import itertools
+import logging
+import math
 import re
 import statistics
 import threading
 import time
 from collections import deque
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from pymmcore_plus import CMMCorePlus
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import QEvent, QObject, Qt, QTimer, Signal
+from qtpy.QtGui import QColor, QImage, QPixmap, QWheelEvent
 from qtpy.QtWidgets import (
     QAbstractItemView,
+    QAbstractScrollArea,
+    QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .controller import CAL_GAIN_PROP, CAL_RANGE_PROP, counts_per_um
+from .controller import (
+    CAL_GAIN_PROP,
+    CAL_RANGE_PROP,
+    LED_PROP,
+    counts_per_um,
+    should_reapply_led,
+)
 from .dither import (
     DEFAULT_WINDOW_S,
     DITHER_STATES,
@@ -69,6 +89,7 @@ from .dither import (
 )
 from .focus_curve import (
     DEFAULT_HALF_RANGE_UM,
+    DEFAULT_PIEZO_HALF_RANGE_UM,
     DEFAULT_READS,
     DEFAULT_SETTLE_S,
     DEFAULT_STEP_UM,
@@ -78,6 +99,7 @@ from .focus_curve import (
     analyze_focus_curve,
     run_focus_curve,
     scan_offsets,
+    sharpest_position,
     write_curve_csv,
 )
 from .hold import (
@@ -88,18 +110,27 @@ from .hold import (
     HoldTest,
     write_hold_csv,
 )
+from .imaging import FrameStore, image_view_factory, snap_images, snap_provider
 from .plot import LinePlot, RefLine, Series
 from .sampling import Sampler, device_present, read_str
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
+    import numpy as np
     from pymmcore_widgets.control._async_poller import AsyncPoller
     from qtpy.QtGui import QCloseEvent, QHideEvent
 
     from .controller import CrispController
 
+logger = logging.getLogger(__name__)
+
+_LED_REAPPLY_DELAY_MS = 200  # debounce after a LED Intensity edit
 _PARAM_MAX_WIDTH = 190  # keep slider+value controls compact / out of the way
+# How long a focus-curve position waits for its snap on the GUI thread.
+_SNAP_TIMEOUT_S = 30.0
+# The summary suggests moving the lock point to the sharpest image beyond this, µm.
+_SHARPEST_OFFSET_UM = 0.3
 
 _POLL_INTERVAL_MS = 750
 # The slow poll reads the fast-changing values every tick and the rest (SNR is fixed
@@ -133,7 +164,7 @@ _READOUTS: list[tuple[str, str, str]] = [
         (
             "In the Dither state: the change in focus error across the dither move.\n"
             "Turn the detector lateral adjustment screw for the largest absolute\n"
-            "value (ASI: at least ±100; > 200 is plenty). See the Dither tab.\n"
+            "value (ASI: at least ±100; > 200 is plenty). See the Dither section.\n"
             "In other states: the focus error, measured inside the feedback loop."
         ),
     ),
@@ -174,7 +205,13 @@ _READOUTS: list[tuple[str, str, str]] = [
     (
         "Calibration Range(um)",
         "Cal Range (µm)",
-        "The calibration / dither move distance: 1.5 µm / NA².",
+        (
+            "The calibration / dither move distance, set from Objective NA:\n"
+            "1.5 µm / NA² (the NA shown is the one this distance corresponds to).\n"
+            "ASI: set Objective NA to the objective this axis moves, before\n"
+            "Log Cal; then recalibrate. Too high an NA gives too short a dither\n"
+            "move and a small, noisy dither Err."
+        ),
     ),
 ]
 _READOUT_PROPS = [prop for prop, _, _ in _READOUTS]
@@ -195,7 +232,10 @@ _PARAMS: list[tuple[str, str, str]] = [
         "LED Intensity (%)",
         (
             "UL X. More light improves signal-to-noise (ASI default 50%).\n"
-            "Redo Log Cal after changing it."
+            "Redo Log Cal after changing it.\n"
+            "A new intensity takes effect when the LED is relit: in Idle (LED on)\n"
+            "or Ready the panel relights it for you. While locked, unlock and\n"
+            "re-lock to apply it (the panel does not relight a locked axis)."
         ),
     ),
     (
@@ -258,6 +298,8 @@ _PARAMS: list[tuple[str, str, str]] = [
 ]
 
 _LOCKED_STATES = {"Lock", "In Focus"}
+# States in which a hold test runs unlocked (CRISP not driving the actuator).
+_UNLOCKED_HOLD_STATES = {"Ready", "Idle"}
 _BUSY_STATES = {
     "loG_cal": "Log Cal…",
     "Dither": "Dither…",
@@ -319,6 +361,28 @@ def _err_color(level: float | None) -> str:
     return _RED
 
 
+class _WheelGuard(QObject):
+    """Event filter: a wheel event on an unfocused control scrolls the panel instead."""
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if (
+            event.type() == QEvent.Type.Wheel
+            and isinstance(obj, QWidget)
+            and not obj.hasFocus()
+        ):
+            parent = obj.parentWidget()
+            while parent is not None and not isinstance(parent, QAbstractScrollArea):
+                parent = parent.parentWidget()
+            if parent is not None and isinstance(event, QWheelEvent):
+                # Scroll the panel by what the wheel would normally scroll it by.
+                bar = parent.verticalScrollBar()
+                notches = event.angleDelta().y() / 120.0
+                lines = QApplication.wheelScrollLines()
+                bar.setValue(bar.value() - round(notches * lines * bar.singleStep()))
+            return True  # never reaches the control
+        return False
+
+
 @dataclass(frozen=True)
 class CrispSnapshot:
     """A plain snapshot of CRISP telemetry, read off the GUI thread.
@@ -332,6 +396,272 @@ class CrispSnapshot:
     state: str
     readouts: dict[str, str]
     full: bool = False
+
+
+@dataclass
+class _Job:
+    fn: Callable[[], object]
+    done: threading.Event = field(default_factory=threading.Event)
+    result: object = None
+    error: Exception | None = None
+
+
+class _GuiCall(QObject):
+    """Run a function on the GUI thread for a worker thread, which waits for it.
+
+    The focus curve snaps the way a Snap button would, on the GUI thread (the host's
+    Snap expects it, and image viewers update there); the scan's worker blocks until
+    the frames, or the error, come back.
+    """
+
+    _request = Signal(object)
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._request.connect(self._run)
+
+    def call(self, fn: Callable[[], object], timeout: float) -> object:
+        job = _Job(fn)
+        self._request.emit(job)  # queued: this runs on a worker thread
+        if not job.done.wait(timeout):
+            raise TimeoutError(f"no image within {timeout:.0f} s")
+        if job.error is not None:
+            raise job.error
+        return job.result
+
+    def _run(self, job: _Job) -> None:
+        try:
+            job.result = job.fn()
+        except Exception as e:  # noqa: BLE001 - handed back to the waiting worker
+            job.error = e
+        finally:
+            job.done.set()
+
+
+class _FrameView(QGraphicsView):
+    """One full image, shown the way the host's preview windows show it.
+
+    Grey, with the contrast stretched from the frame's minimum to its maximum, at full
+    resolution; the wheel zooms and dragging pans. Used when the host provides no
+    viewer of its own (:func:`.imaging.set_image_view_factory`).
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setScene(QGraphicsScene(self))
+        self._item = QGraphicsPixmapItem()
+        self.scene().addItem(self._item)
+        self._shape: tuple[int, int] | None = None
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setBackgroundBrush(QColor(40, 40, 40))
+        self.setMinimumSize(320, 320)
+
+    def append(self, img: np.ndarray) -> None:
+        a = img[..., :3].mean(axis=-1) if img.ndim == 3 else img
+        lo, hi = float(a.min()), float(a.max())
+        scale = 255.0 / (hi - lo) if hi > lo else 0.0
+        a8 = ((a - lo) * scale).astype("uint8")
+        h, w = a8.shape
+        qimg = QImage(a8.tobytes(), w, h, w, QImage.Format.Format_Grayscale8)
+        self._item.setPixmap(QPixmap.fromImage(qimg.copy()))
+        if self._shape != (h, w):
+            self._shape = (h, w)
+            self.scene().setSceneRect(0, 0, w, h)
+            self.fitInView(self._item, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def wheelEvent(self, event: QWheelEvent | None) -> None:
+        if event is None:
+            return
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.scale(factor, factor)
+
+
+class _CurveImagesWindow(QWidget):
+    """The focus curve's images: one view per camera and a slider over the positions.
+
+    Each view is the host's own (the widget of its preview windows, through
+    :func:`.imaging.set_image_view_factory`) or :class:`_FrameView`. A window of its
+    own, not part of the panel: a GPU canvas inside the panel's scroll area wouldn't
+    clip when the panel scrolls.
+
+    Parameters
+    ----------
+    title
+        The window title.
+    frame_at
+        Returns ``(z, {camera: frame})`` for a position index.
+    parent
+        The panel; the window is closed and deleted with it.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        frame_at: Callable[[int], tuple[float, dict[str, np.ndarray]]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(title)
+        self._frame_at = frame_at
+        v = QVBoxLayout(self)
+        top = QHBoxLayout()
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setToolTip("Step through the images by position.")
+        self.slider.valueChanged.connect(self._display)
+        self.caption = QLabel()
+        top.addWidget(self.slider, 1)
+        top.addWidget(self.caption)
+        v.addLayout(top)
+        self._row = QHBoxLayout()
+        v.addLayout(self._row, 1)
+        self._views: dict[str, QWidget] = {}
+        self._count = 0
+        self.resize(1000, 560)
+
+    def reset(self) -> None:
+        """A new scan: no positions yet (the views stay, showing the last image)."""
+        self._count = 0
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, 0)
+        self.slider.blockSignals(False)
+        self.caption.setText("waiting for the first image…")
+
+    def set_count(self, count: int) -> None:
+        self._count = count
+        self.slider.setRange(0, max(0, count - 1))
+
+    def show_index(self, index: int) -> None:
+        if self.slider.value() == index:
+            self._display(index)
+        else:
+            self.slider.setValue(index)
+
+    def _view(self, camera: str) -> QWidget:
+        view = self._views.get(camera)
+        if view is not None:
+            return view
+        view = None
+        factory = image_view_factory()
+        if factory is not None:
+            with suppress(Exception):
+                view = factory(camera)
+        if not isinstance(view, QWidget) or not callable(getattr(view, "append", None)):
+            view = _FrameView()
+        box = QWidget()
+        col = QVBoxLayout(box)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.addWidget(QLabel(camera))
+        col.addWidget(view, 1)
+        self._row.addWidget(box, 1)
+        self._views[camera] = view
+        detach = getattr(view, "detach", None)  # host previews listen to the core
+        if callable(detach):
+            self.destroyed.connect(lambda *_: detach())
+        return view
+
+    def _display(self, index: int) -> None:
+        if not 0 <= index < self._count:
+            return
+        z, frames = self._frame_at(index)
+        for camera, frame in frames.items():
+            self._view(camera).append(frame)  # type: ignore[attr-defined]
+        self.caption.setText(
+            f"z = {z:+.2f} µm from the start ({index + 1} / {self._count})"
+        )
+
+
+class _Section(QWidget):
+    """A titled section whose body shows or hides when the title is clicked.
+
+    Parameters
+    ----------
+    title
+        The clickable title.
+    body
+        The widget shown when the section is expanded.
+    expanded
+        Whether the section starts expanded.
+    parent
+        Optional parent widget.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        body: QWidget,
+        *,
+        expanded: bool = False,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._body = body
+        self.toggle_btn = QToolButton()
+        self.toggle_btn.setText(title)
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle_btn.setStyleSheet(
+            "QToolButton { border: none; font-weight: bold; }"
+        )
+        self.toggle_btn.toggled.connect(self._set_expanded)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(self.toggle_btn)
+        v.addWidget(body)
+        self.toggle_btn.setChecked(expanded)
+        self._set_expanded(expanded)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.toggle_btn.setArrowType(
+            Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+        )
+        self._body.setVisible(expanded)
+
+
+class _ToolsWindow(QWidget):
+    """The Focus curve and Hold test in a window of their own.
+
+    Not part of the panel: with their plots and the hold table they would make the
+    dock too big to leave room for the images. Closing the window stops a running
+    tool, as hiding the panel does. (The small Dither assistant stays in the panel.)
+
+    Parameters
+    ----------
+    title
+        The window title.
+    tabs
+        The tab widget holding the tools.
+    on_close
+        Called when the window is closed.
+    parent
+        The panel; the window is closed and deleted with it.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        tabs: QTabWidget,
+        on_close: Callable[[], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(title)
+        self._tabs = tabs
+        self._on_close = on_close
+        QVBoxLayout(self).addWidget(tabs)
+        self.resize(540, 520)  # min. 506 x 435 (offscreen); the plots take the rest
+
+    def show_tab(self, tab: QWidget | None = None) -> None:
+        """Select *tab* (if given) and bring the window up."""
+        if tab is not None:
+            self._tabs.setCurrentWidget(tab)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        self._on_close()
+        super().closeEvent(event)
 
 
 class CrispControlPanel(QWidget):
@@ -353,7 +683,11 @@ class CrispControlPanel(QWidget):
         self._readouts: dict[str, QLabel] = {}
         self._last_readouts: dict[str, str] = {}
         # Cached error->µm scaling and a rolling history for the fluctuation metric.
-        self._sensitivity: float | None = None
+        self._sensitivity: float | None = None  # from Cal Gain / Cal Range (assumed)
+        # Slope measured by the last focus curve, counts/µm (signed). It replaces the
+        # calibration-derived figure for µm conversions until Log Cal / Dither.
+        self._measured_slope: float | None = None
+        self._wheel_guard = _WheelGuard(self)
         self._error_history: deque[float] = deque(maxlen=_STABILITY_WINDOW)
         self._last_state = ""
         # Edge-detector for the auto joystick lockout: starts False so a state
@@ -374,11 +708,17 @@ class CrispControlPanel(QWidget):
         self._dither_sampler: Sampler[DitherSample] | None = None
         self._dither_next_state = 0.0  # worker-only
         self._dither_outside = 0
+        self._dither_last_in = float("-inf")  # time of the last read in a dither state
         self._last_dither_paint = 0.0
         self._curve_stop = threading.Event()
         self._curve_points: list[CurvePoint] = []
         self._curve_scan: CurveScan | None = None
         self._curve_analysis: CurveAnalysis | None = None
+        # The last scan's full frames (kept on disk), the z of each, their window.
+        self._curve_frames: FrameStore | None = None
+        self._curve_frame_z: list[float] = []
+        self._curve_images: _CurveImagesWindow | None = None
+        self._gui_call = _GuiCall(self)
         self._hold: HoldTest | None = None
         self._hold_samples: list[HoldSample] = []
         self._hold_results: list[HoldResult] = []
@@ -482,10 +822,14 @@ class CrispControlPanel(QWidget):
         next_row = (len(_READOUTS) + 1) // 2
         self.sensitivity_lbl = QLabel("Sensitivity: --")
         self.sensitivity_lbl.setToolTip(
-            "|Calibration Gain| / Calibration Range, in error counts per µm. This\n"
-            "assumes Calibration Gain is the error change over the calibration\n"
-            "move; the Focus curve tab measures the real slope."
+            "How many counts of the error readout one µm of focus makes, measured by\n"
+            "the Focus curve (until the next Log Cal or Dither). The µm figures in\n"
+            "this panel use it.\n\n"
+            "|Calibration Gain| / Calibration Range is shown too, but it is on a\n"
+            "different, internal scale (on the rig ~300× the measured slope), so it\n"
+            "is not used for conversions."
         )
+        self.sensitivity_lbl.setWordWrap(True)
         grid.addWidget(self.sensitivity_lbl, next_row, 0, 1, 4)
         self.stability_lbl = QLabel("In-loop error: --")
         self.stability_lbl.setToolTip(
@@ -494,6 +838,7 @@ class CrispControlPanel(QWidget):
             "This is the error inside the feedback loop: it can look quiet while\n"
             "the actuator moves. Use the Hold test to measure the focus motion."
         )
+        self.stability_lbl.setWordWrap(True)
         grid.addWidget(self.stability_lbl, next_row + 1, 0, 1, 4)
         layout.addWidget(ro_box)
 
@@ -512,6 +857,28 @@ class CrispControlPanel(QWidget):
         op.addWidget(self.btn_lock, 0, 1)
         op.addWidget(self.btn_offset, 1, 0)
         op.addWidget(self.btn_save, 1, 1)
+        self.btn_led = QPushButton("LED On")
+        self.btn_led.setCheckable(True)
+        self.btn_led.setToolTip(
+            "Turn this axis's LED on or off by itself (no recalibration, no lock).\n"
+            "Addressed to this axis's own card, so the Z and P axes are independent.\n"
+            "A new LED Intensity takes effect when the LED is relit: in Idle (LED on)\n"
+            "or Ready the panel relights it after you change it; while locked, unlock\n"
+            "and re-lock to apply it (the panel does not relight a locked axis)."
+        )
+        self.btn_led.clicked.connect(self._on_led_clicked)
+        op.addWidget(self.btn_led, 2, 0, 1, 2)
+        # Shown only while the last LED write failed; cleared on the next success.
+        self.led_error_lbl = QLabel()
+        self.led_error_lbl.setWordWrap(True)
+        self.led_error_lbl.setStyleSheet(f"color: {_RED};")
+        self.led_error_lbl.hide()
+        op.addWidget(self.led_error_lbl, 3, 0, 1, 2)
+        # Debounces LED Intensity edits into one relight (see _on_led_intensity_edited).
+        self._led_timer = QTimer(self)
+        self._led_timer.setSingleShot(True)
+        self._led_timer.setInterval(_LED_REAPPLY_DELAY_MS)
+        self._led_timer.timeout.connect(self._reapply_led)
         self.joystick_chk = QCheckBox("Joystick enabled")
         self.joystick_chk.setChecked(True)
         self.joystick_chk.setToolTip(
@@ -522,14 +889,15 @@ class CrispControlPanel(QWidget):
             " locked."
         )
         self.joystick_chk.toggled.connect(self._on_joystick_toggled)
-        op.addWidget(self.joystick_chk, 2, 0, 1, 2)
+        op.addWidget(self.joystick_chk, 4, 0, 1, 2)
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
-        cal_box = QGroupBox("Calibration  (1. Log Cal → 2. Dither → 3. Set Gain)")
+        cal_box = QGroupBox("Calibration")
+        cal_box.setToolTip("In order: 1. Log Cal → 2. Dither → 3. Set Gain.")
         cal = QHBoxLayout(cal_box)
         self.btn_log = QPushButton("1. Log Cal")
-        self.btn_log.clicked.connect(lambda: self._do(self.controller.set_log_cal))
+        self.btn_log.clicked.connect(self._on_log_cal_clicked)
         self.btn_dither = QPushButton("2. Dither")
         self.btn_dither.clicked.connect(self._on_dither_clicked)
         self.btn_gain = QPushButton("3. Set Gain")
@@ -538,34 +906,60 @@ class CrispControlPanel(QWidget):
             cal.addWidget(b)
         layout.addWidget(cal_box)
 
-        # --- diagnostics --------------------------------------------------
+        # --- Dither assistant (compact, in the panel; collapsed until used) ---
+        self.dither_section = _Section("Dither", self._build_dither_body())
+        self.dither_section.toggle_btn.toggled.connect(self._on_dither_section_toggled)
+        layout.addWidget(self.dither_section)
+
+        # --- Focus curve / Hold test (in a window of their own; _ToolsWindow) -
         self.tools_tabs = QTabWidget()
-        self._dither_tab = self._build_dither_tab()
         self._curve_tab = self._build_curve_tab()
         self._hold_tab = self._build_hold_tab()
-        self.tools_tabs.addTab(self._dither_tab, "Dither")
         self.tools_tabs.addTab(self._curve_tab, "Focus curve")
         self.tools_tabs.addTab(self._hold_tab, "Hold test")
-        layout.addWidget(self.tools_tabs)
+        self.tools_window = _ToolsWindow(
+            f"CRISP focus curve / hold test: {self.controller.label}",
+            self.tools_tabs,
+            self._stop_window_tools,
+            parent=self,
+        )
+        tools_row = QHBoxLayout()
+        self.tools_btn = QPushButton("Focus curve / Hold test…")
+        self.tools_btn.setToolTip(
+            "Opens the Focus curve and the Hold test in a window of their own.\n"
+            "Closing it stops a running tool. (The Dither assistant is the\n"
+            "Dither section above.)"
+        )
+        self.tools_btn.clicked.connect(lambda: self.tools_window.show_tab())
+        self.tools_running_lbl = QLabel()
+        self.tools_running_lbl.setStyleSheet(f"color: {_ORANGE}; font-weight: bold;")
+        tools_row.addWidget(self.tools_btn)
+        tools_row.addWidget(self.tools_running_lbl)
+        tools_row.addStretch()
+        layout.addLayout(tools_row)
 
         # --- parameters (reused pymmcore-widgets property controls) -------
-        param_box = QGroupBox("Parameters")
-        form = QFormLayout(param_box)
+        param_body = QWidget()
+        form = QFormLayout(param_body)
         self._add_parameter_widgets(form)
-        layout.addWidget(param_box)
+        self.params_section = _Section("Parameters", param_body)
+        layout.addWidget(self.params_section)
 
         layout.addStretch()
         self._sync_tool_controls()
 
-    def _build_dither_tab(self) -> QWidget:
-        tab = QWidget()
-        v = QVBoxLayout(tab)
+    def _build_dither_body(self) -> QWidget:
+        """Build the Dither assistant's widgets (kept narrow: it sits in the panel)."""
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(0, 0, 0, 0)
         self.dither_status = QLabel()
         self.dither_status.setWordWrap(True)
         v.addWidget(self.dither_status)
 
         row = QHBoxLayout()
         self.dither_level_lbl = QLabel("|Err| --")
+        self.dither_level_lbl.setWordWrap(True)
         self.dither_level_lbl.setStyleSheet("font-weight: bold; font-size: 22px;")
         self.dither_level_lbl.setToolTip(
             "Median of |Dither Err| over the smoothing window, so the brief jumps\n"
@@ -579,11 +973,20 @@ class CrispControlPanel(QWidget):
         v.addLayout(row)
 
         self.dither_sum_lbl = QLabel("Sum --")
+        self.dither_sum_lbl.setWordWrap(True)
         self.dither_detail_lbl = QLabel()
+        self.dither_detail_lbl.setWordWrap(True)
+        self.dither_detail_lbl.setToolTip(
+            "Scatter: the standard deviation of |Err| over the smoothing window, in\n"
+            "counts and as % of |Err|. Counts compare directly between axes; a large\n"
+            "% means the peak and the readings move by that much from noise alone."
+        )
         v.addWidget(self.dither_sum_lbl)
         v.addWidget(self.dither_detail_lbl)
 
-        self.dither_plot = LinePlot(x_label="seconds ago", y_label="|Err|")
+        self.dither_plot = LinePlot(
+            x_label="seconds ago", y_label="|Err|", min_height=120
+        )
         v.addWidget(self.dither_plot)
 
         ctl = QHBoxLayout()
@@ -612,11 +1015,13 @@ class CrispControlPanel(QWidget):
         ctl.addWidget(self.dither_watch_btn)
         ctl.addWidget(self.dither_reset_btn)
         ctl.addStretch()
-        ctl.addWidget(QLabel("Smoothing:"))
+        smooth_lbl = QLabel("Smooth:")  # short: the row must stay narrow
+        smooth_lbl.setToolTip(self.dither_window.toolTip())
+        ctl.addWidget(smooth_lbl)
         ctl.addWidget(self.dither_window)
         v.addLayout(ctl)
         self._paint_dither(force=True)
-        return tab
+        return body
 
     def _build_curve_tab(self) -> QWidget:
         tab = QWidget()
@@ -634,7 +1039,11 @@ class CrispControlPanel(QWidget):
         self.curve_range = QDoubleSpinBox()
         self.curve_range.setRange(0.5, 50.0)
         self.curve_range.setDecimals(1)
-        self.curve_range.setValue(DEFAULT_HALF_RANGE_UM)
+        self.curve_range.setValue(
+            DEFAULT_PIEZO_HALF_RANGE_UM
+            if self.controller.actuator_type == "piezo"
+            else DEFAULT_HALF_RANGE_UM
+        )
         self.curve_range.setPrefix("± ")
         self.curve_range.setSuffix(" µm")
         self.curve_step = QDoubleSpinBox()
@@ -677,12 +1086,47 @@ class CrispControlPanel(QWidget):
         btns.addWidget(self.curve_save_btn)
         btns.addStretch()
         v.addLayout(btns)
+        self.curve_snap = QCheckBox("Snap an image at each position")
+        self.curve_snap.setToolTip(
+            "Snaps the way the host's Snap does (its cameras and illumination), or\n"
+            "with the core's current camera when the host doesn't provide that. Each\n"
+            "position takes an exposure (plus the camera's overhead) longer. The\n"
+            "images show the focus going in and out; their sharpness marks where the\n"
+            "image is in focus, to compare with the lock point."
+        )
+        v.addWidget(self.curve_snap)
 
         self.curve_status = QLabel("Needs the Ready state (LED on, unlocked).")
         self.curve_status.setWordWrap(True)
         v.addWidget(self.curve_status)
         self.curve_plot = LinePlot(x_label="z from start (µm)", y_label="error")
         v.addWidget(self.curve_plot)
+
+        self.curve_images_box = QWidget()
+        box = QVBoxLayout(self.curve_images_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Sharpness of"))
+        self.curve_camera = QComboBox()
+        self.curve_camera.setToolTip("Which camera's sharpness to plot and report.")
+        self.curve_camera.currentIndexChanged.connect(self._on_curve_camera)
+        row.addWidget(self.curve_camera)
+        row.addStretch()
+        self.curve_images_btn = QPushButton("Show images")
+        self.curve_images_btn.setToolTip(
+            "The images at every position, full size, one view per camera."
+        )
+        self.curve_images_btn.clicked.connect(self._on_curve_show_images)
+        row.addWidget(self.curve_images_btn)
+        box.addLayout(row)
+        self.curve_sharp_plot = LinePlot(
+            x_label="z from start (µm)",
+            y_label="image sharpness (relative)",
+            min_height=110,
+        )
+        box.addWidget(self.curve_sharp_plot)
+        self.curve_images_box.setVisible(False)
+        v.addWidget(self.curve_images_box)
         self.curve_result_lbl = QLabel()
         self.curve_result_lbl.setWordWrap(True)
         self.curve_result_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -693,10 +1137,11 @@ class CrispControlPanel(QWidget):
         tab = QWidget()
         v = QVBoxLayout(tab)
         intro = QLabel(
-            "Records the actuator's own position while locked and splits it into "
-            "drift (the trend), wander (how much the 1 s averages move) and jitter "
-            "(the spread within each second). It changes no settings: change one "
-            "Parameter at a time and run it again to compare."
+            "Records the actuator's own position and splits it into drift (the "
+            "trend), wander (how much the 1 s averages move) and jitter (the spread "
+            "within each second). Run it unlocked (Ready) to see the actuator by "
+            "itself, then locked to see what the lock adds. It changes no settings: "
+            "change one Parameter at a time and run it again to compare."
         )
         intro.setWordWrap(True)
         v.addWidget(intro)
@@ -731,7 +1176,10 @@ class CrispControlPanel(QWidget):
         btns.addStretch()
         v.addLayout(btns)
 
-        self.hold_status = QLabel("Needs the lock engaged (Lock / In Focus).")
+        self.hold_status = QLabel(
+            "Runs locked (Lock / In Focus) or unlocked (Ready / Idle). Unlocked, "
+            "CRISP isn't driving the actuator, so it shows the actuator's own noise."
+        )
         self.hold_status.setWordWrap(True)
         v.addWidget(self.hold_status)
         self.hold_plot = LinePlot(x_label="seconds", y_label="position (nm)")
@@ -739,15 +1187,17 @@ class CrispControlPanel(QWidget):
 
         cols = [
             "Started",
-            "Averages",
-            "Loop Gain",
-            "Update (ms)",
-            "LED %",
+            "Mode",
             "Drift nm/min",
             "Jitter nm",
             "Wander nm",
             "pk-pk nm",
             "Err rms",
+            "Err /min",
+            "Averages",
+            "Loop Gain",
+            "Update (ms)",
+            "LED %",
             "Note",
         ]
         self.hold_table = QTableWidget(0, len(cols))
@@ -758,7 +1208,8 @@ class CrispControlPanel(QWidget):
         self.hold_table.setToolTip(
             "Newest first. All after removing the drift (the straight-line trend).\n"
             "Jitter: rms spread within each second. Wander: rms of the 1 s averages.\n"
-            "pk-pk: largest minus smallest position."
+            "pk-pk: largest minus smallest position.\n"
+            "Err rms: the error about its trend. Err /min: the error's trend (counts/min)."
         )
         v.addWidget(self.hold_table)
         return tab
@@ -789,12 +1240,45 @@ class CrispControlPanel(QWidget):
         except Exception:
             return None
 
+    def _counts_per_um(self) -> float | None:
+        """Error-readout counts per µm, from the last focus curve; else ``None``.
+
+        The Cal Gain / Cal Range figure is on a different, internal scale (on the rig
+        the Z axis's was ~300× the measured slope), so it is never used to convert
+        the error readout to µm.
+        """
+        if self._measured_slope:
+            return abs(self._measured_slope)
+        return None
+
     def _to_um(self, counts: float) -> float | None:
-        """Convert raw error counts to microns via the cached sensitivity."""
-        sens = self._sensitivity
+        """Convert raw error counts to microns (see :meth:`_counts_per_um`)."""
+        sens = self._counts_per_um()
         if not sens:  # None or 0
             return None
         return counts / sens
+
+    def _set_measured_slope(self, slope: float | None) -> None:
+        if slope != self._measured_slope:
+            self._error_history.clear()  # a different scale for the nm figures
+        self._measured_slope = slope
+        self._render_sensitivity()
+
+    def _render_sensitivity(self) -> None:
+        cal = self._sensitivity
+        cal_txt = f"Cal Gain / Range {cal:.0f} (internal scale)" if cal else ""
+        if self._measured_slope:
+            text = (
+                f"Error readout: {abs(self._measured_slope):.1f} counts/µm "
+                "(focus curve)"
+            )
+            if cal_txt:
+                text += f" · {cal_txt}"
+        elif cal_txt:
+            text = f"{cal_txt} · run a Focus curve for the error's counts/µm"
+        else:
+            text = "Sensitivity: -- (uncalibrated; run a Focus curve)"
+        self.sensitivity_lbl.setText(text)
 
     def _add_parameter_widgets(self, form: QFormLayout) -> None:
         # Imported lazily so the module still imports without a Qt app / in demos.
@@ -816,9 +1300,27 @@ class CrispControlPanel(QWidget):
                 continue
             wdg.setMaximumWidth(_PARAM_MAX_WIDTH)
             wdg.setToolTip(tip)
+            self._install_wheel_guard(wdg)
+            if prop == LED_PROP:
+                # Emitted after the widget wrote the property, for user edits only
+                # (a refresh from the core blocks the value widget's signals).
+                wdg.valueChanged.connect(self._on_led_intensity_edited)
             name = QLabel(friendly)
             name.setToolTip(tip)
             form.addRow(name, wdg)
+
+    def _install_wheel_guard(self, widget: QWidget) -> None:
+        """Make *widget* (and its children) ignore the wheel unless clicked first.
+
+        The parameter controls are sliders and spin boxes inside a scrolling panel:
+        without this, scrolling the panel over one silently changes a controller
+        setting (Objective NA, LED, Loop Gain, ...). The wheel scrolls the panel
+        instead; click a control first to use the wheel on it.
+        """
+        for w in (widget, *widget.findChildren(QWidget)):
+            if w.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+                w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # no focus by wheel
+            w.installEventFilter(self._wheel_guard)
 
     # -------------------------------------------------------------- handlers
     def _do(self, fn: Callable[[], None], *, refresh: bool = True) -> None:
@@ -836,13 +1338,69 @@ class CrispControlPanel(QWidget):
         else:
             self._do(self.controller.set_idle)
 
+    def _set_led_button(self, on: bool) -> None:
+        self.btn_led.blockSignals(True)
+        self.btn_led.setChecked(on)
+        self.btn_led.blockSignals(False)
+        self.btn_led.setText("LED Off" if on else "LED On")
+
+    def _led_write(self, on: bool) -> bool:
+        """Light or darken this axis's LED; show the error in the panel if it fails.
+
+        Unlike `_do`, a failure is logged and shown (not swallowed): the LED button
+        used to flip to "on" even when nothing was sent. Returns True on success.
+        """
+        self._stop_hold()  # changing the state ends a hold test
+        ok = True
+        try:
+            self.controller.set_led(on)
+        except (RuntimeError, ValueError) as exc:
+            ok = False
+            logger.warning("CRISP %s: LED write failed: %s", self.controller.label, exc)
+            self.led_error_lbl.setText(f"LED command failed: {exc}")
+            self.led_error_lbl.show()
+        else:
+            self.led_error_lbl.clear()
+            self.led_error_lbl.hide()
+        self._full_read_due = True
+        if self._active_tool is None:
+            self._poller.poll_now(force=True)
+        return ok
+
+    def _on_led_clicked(self, checked: bool) -> None:
+        ok = self._led_write(checked)
+        self._set_led_button(checked if ok else not checked)
+
+    def _on_led_intensity_edited(self, _value: object = None) -> None:
+        """A new LED Intensity only lights up once the LED is relit: debounce it."""
+        self._led_timer.start()
+
+    def _reapply_led(self) -> None:
+        """Relight the LED so a new intensity takes effect (Idle with LED on, Ready).
+
+        Guarded on the cached state (no serial read on the GUI thread); never sent
+        while locked, calibrating or dithering, or while a diagnostic tool runs.
+        """
+        if self._active_tool is not None:
+            return
+        if should_reapply_led(self._last_state, self.btn_led.isChecked()):
+            self._led_write(True)
+
     def _on_lock(self) -> None:
         if self.controller.get_state() in _LOCKED_STATES:
             self._do(self.controller.set_unlock)
         else:
             self._do(self.controller.set_lock)
 
+    def _on_log_cal_clicked(self) -> None:
+        # Log Cal sets a new log-amp gain, which rescales the error: a measured slope
+        # no longer applies.
+        self._set_measured_slope(None)
+        self._do(self.controller.set_log_cal)
+
     def _on_dither_clicked(self) -> None:
+        # Re-aligning the detector changes the slope too.
+        self._set_measured_slope(None)
         # The assistant takes over the serial port straight away, so skip the
         # slow poll's refresh.
         self._do(self.controller.set_dither, refresh=False)
@@ -892,6 +1450,11 @@ class CrispControlPanel(QWidget):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._stop_tools()
+        self.tools_window.close()
+        if self._curve_images is not None:
+            self._curve_images.close()
+        if self._curve_frames is not None:
+            self._curve_frames.close()
         super().closeEvent(event)
 
     # ------------------------------------------------------------- tool core
@@ -921,6 +1484,10 @@ class CrispControlPanel(QWidget):
 
     def _stop_tools(self) -> None:
         self._stop_dither()
+        self._stop_window_tools()
+
+    def _stop_window_tools(self) -> None:
+        """Stop the tools of the Focus curve / Hold test window (not the Dither)."""
         self._stop_hold()
         if self._active_tool == _CURVE:
             # The worker returns the actuator to its start, then reports back.
@@ -929,6 +1496,9 @@ class CrispControlPanel(QWidget):
     def _sync_tool_controls(self) -> None:
         tool = self._active_tool
         curve = tool == _CURVE
+        self.tools_running_lbl.setText(
+            f"{_TOOL_TITLES[tool]} running" if tool is not None else ""
+        )
         # The focus curve moves the actuator; nothing else may change state meanwhile.
         for b in (
             self.btn_idle_ready,
@@ -961,6 +1531,8 @@ class CrispControlPanel(QWidget):
             self._on_dither_sample(payload)  # type: ignore[arg-type]
         elif kind == "curve_point":
             self._on_curve_point(payload)  # type: ignore[arg-type]
+        elif kind == "curve_images":
+            self._on_curve_images(payload)  # type: ignore[arg-type]
         elif kind == "curve_done":
             self._on_curve_done(payload)  # type: ignore[arg-type]
         elif kind == "curve_error":
@@ -971,6 +1543,11 @@ class CrispControlPanel(QWidget):
             self._on_hold_done(payload)  # type: ignore[arg-type]
 
     # ------------------------------------------------------- dither assistant
+    def _on_dither_section_toggled(self, expanded: bool) -> None:
+        """Collapsing the section stops a running assistant (as hiding the panel)."""
+        if not expanded:
+            self._stop_dither()
+
     def _on_dither_watch_toggled(self, checked: bool) -> None:
         if checked:
             self._start_dither()
@@ -984,8 +1561,9 @@ class CrispControlPanel(QWidget):
             return
         self._dither_tracker.reset()
         self._dither_outside = 0
+        self._dither_last_in = float("-inf")
         self._dither_next_state = 0.0
-        self.tools_tabs.setCurrentWidget(self._dither_tab)
+        self.dither_section.toggle_btn.setChecked(True)  # show it, no pop-up
         label = self.controller.label
         self._dither_sampler = Sampler(
             self._read_dither,
@@ -1018,16 +1596,22 @@ class CrispControlPanel(QWidget):
     def _on_dither_sample(self, sample: DitherSample) -> None:
         if self._active_tool != _DITHER:  # a straggler queued before it stopped
             return
-        self._dither_tracker.add(sample)
         if sample.state is not None:
             self._update_state(sample.state)
             if sample.state in DITHER_STATES:
                 self._dither_outside = 0
+                self._dither_last_in = sample.t
             else:
+                if self._dither_outside == 0:
+                    # The state is only read every so often: drop what was read
+                    # since it last read as dithering (Ready errors near 0).
+                    self._dither_tracker.discard_after(self._dither_last_in)
                 self._dither_outside += 1
                 if self._dither_outside >= _DITHER_OUTSIDE_TO_STOP:
                     self._stop_dither()
                     return
+        if self._dither_outside == 0:
+            self._dither_tracker.add(sample)
         self._paint_dither()
 
     def _on_dither_reset(self) -> None:
@@ -1054,7 +1638,9 @@ class CrispControlPanel(QWidget):
         s = self._dither_tracker.stats
         color = _err_color(s.level)
         sign = " (negative)" if s.sign < 0 else ""
-        settling = "  settling…" if s.level is not None and not s.steady else ""
+        settling = (
+            "  settling…" if active and s.level is not None and not s.steady else ""
+        )
         self.dither_level_lbl.setText(f"|Err| {_fmt(s.level, '.0f')}{sign}{settling}")
         self.dither_level_lbl.setStyleSheet(
             f"font-weight: bold; font-size: 22px; color: {color};"
@@ -1080,10 +1666,12 @@ class CrispControlPanel(QWidget):
             sum_color = _ORANGE
         self.dither_sum_lbl.setText(sum_text)
         self.dither_sum_lbl.setStyleSheet(f"color: {sum_color};")
-        spread = None if s.spread is None else s.spread * 100
+        rel = None
+        if s.noise is not None and s.level:
+            rel = s.noise / s.level * 100
         self.dither_detail_lbl.setText(
-            f"raw {_fmt(s.raw_err, '+.0f')}  ·  spread ±{_fmt(spread, '.0f')}%  ·  "
-            f"{_fmt(s.rate_hz, '.0f')} reads/s"
+            f"raw {_fmt(s.raw_err, '+.0f')}  ·  scatter σ {_fmt(s.noise, '.1f')} counts "
+            f"({_fmt(rel, '.0f')}%)  ·  {_fmt(s.rate_hz, '.0f')} reads/s"
         )
 
         hlines = [
@@ -1148,10 +1736,17 @@ class CrispControlPanel(QWidget):
             return
         half, step = self.curve_range.value(), self.curve_step.value()
         n = len(scan_offsets(half, step))
+        snap = self.curve_snap.isChecked()
+        if snap and snap_provider() is None and self.mmcore.isSequenceRunning():
+            self.curve_status.setText("Stop Live first: the scan snaps its own images.")
+            return
+        also = " and snap an image at each" if snap else ""
         if not self._confirm_move(
             f"Move {actuator} from {-half:g} to +{half:g} µm around its current "
-            f"position in {step:g} µm steps ({n} positions), then return it to the "
-            "start?\n\nDon't touch the focus wheel while it runs."
+            f"position in {step:g} µm steps ({n} positions){also}, then return it to "
+            "the start?\n\nThe scan stays inside the actuator's travel limits and "
+            "leaves out positions it can't reach. Don't touch the focus wheel while "
+            "it runs."
         ):
             return
         if not self._begin_tool(_CURVE):
@@ -1159,6 +1754,17 @@ class CrispControlPanel(QWidget):
         self._curve_stop.clear()
         self._curve_points = []
         self._curve_analysis = None
+        if self._curve_frames is not None:
+            self._curve_frames.close()
+        self._curve_frames = FrameStore(n) if snap else None
+        self._curve_frame_z = []
+        self.curve_images_box.setVisible(False)
+        self.curve_sharp_plot.clear()
+        if snap:
+            window = self._images_window()
+            window.reset()
+            window.show()
+            window.raise_()
         self.tools_tabs.setCurrentWidget(self._curve_tab)
         self.curve_status.setStyleSheet("")
         self.curve_status.setText(f"Scanning {n} positions…")
@@ -1172,14 +1778,36 @@ class CrispControlPanel(QWidget):
                 step,
                 self.curve_settle.value() / 1000.0,
                 self.curve_reads.value(),
+                snap,
             ),
             name=f"CRISPy-curve-{self.controller.label}",
             daemon=True,
         ).start()
 
     def _curve_worker(
-        self, actuator: str, half: float, step: float, settle: float, reads: int
+        self,
+        actuator: str,
+        half: float,
+        step: float,
+        settle: float,
+        reads: int,
+        snap: bool,
     ) -> None:
+        store = self._curve_frames
+        count = itertools.count()
+
+        def keep_frames(point: CurvePoint, frames: Mapping[str, np.ndarray]) -> None:
+            index = next(count)
+            if store is not None:
+                store.put(index, frames)  # full size, to disk, on this thread
+            self._emit("curve_images", (index, point.z_um, tuple(frames)))
+
+        def snap_on_gui_thread() -> Mapping[str, np.ndarray]:
+            frames = self._gui_call.call(
+                lambda: snap_images(self.mmcore), _SNAP_TIMEOUT_S
+            )
+            return cast("Mapping[str, np.ndarray]", frames)
+
         try:
             scan = run_focus_curve(
                 self.mmcore,
@@ -1191,6 +1819,8 @@ class CrispControlPanel(QWidget):
                 reads_per_point=reads,
                 should_stop=self._curve_stop.is_set,
                 on_point=lambda p: self._emit("curve_point", p),
+                snap=snap_on_gui_thread if snap else None,
+                on_images=keep_frames,
             )
         except Exception as e:  # noqa: BLE001 - reported in the panel
             self._emit("curve_error", str(e))
@@ -1206,6 +1836,51 @@ class CrispControlPanel(QWidget):
         )
         self._paint_curve()
 
+    def _images_window(self) -> _CurveImagesWindow:
+        if self._curve_images is None:
+            self._curve_images = _CurveImagesWindow(
+                f"Focus curve images: {self.controller.label}",
+                self._curve_frame_at,
+                self,
+            )
+        return self._curve_images
+
+    def _curve_frame_at(self, index: int) -> tuple[float, dict[str, np.ndarray]]:
+        store = self._curve_frames
+        z = self._curve_frame_z[index] if index < len(self._curve_frame_z) else 0.0
+        if store is None:
+            return z, {}
+        frames = {}
+        for camera in store.cameras:
+            frame = store.get(index, camera)
+            if frame is not None:
+                frames[camera] = frame
+        return z, frames
+
+    def _on_curve_images(self, payload: tuple[int, float, tuple[str, ...]]) -> None:
+        if self._active_tool != _CURVE:
+            return
+        index, z, cameras = payload
+        self._curve_frame_z.append(z)
+        for camera in cameras:
+            if self.curve_camera.findText(camera) < 0:
+                self.curve_camera.addItem(camera)
+        self.curve_images_box.setVisible(True)
+        window = self._images_window()
+        window.set_count(len(self._curve_frame_z))
+        window.show_index(index)  # follow the scan
+
+    def _on_curve_show_images(self) -> None:
+        window = self._images_window()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _on_curve_camera(self) -> None:
+        self._paint_curve()
+        if self._curve_analysis is not None and self._active_tool != _CURVE:
+            self.curve_result_lbl.setText(self._curve_summary(self._curve_analysis))
+
     def _on_curve_done(self, scan: CurveScan) -> None:
         self._curve_scan = scan
         self._curve_points = list(scan.points)
@@ -1218,6 +1893,16 @@ class CrispControlPanel(QWidget):
         self._end_tool(_CURVE)
         self._paint_curve()
         self.curve_result_lbl.setText(self._curve_summary(self._curve_analysis))
+        if scan.completed and self._curve_analysis.slope:
+            self._set_measured_slope(self._curve_analysis.slope)
+        sharp = sharpest_position(scan.points, self.curve_camera.currentText())
+        if sharp is not None and self._curve_frame_z:
+            # Show the sharpest image to start with.
+            nearest = min(
+                range(len(self._curve_frame_z)),
+                key=lambda i: abs(self._curve_frame_z[i] - sharp[0]),
+            )
+            self._images_window().show_index(nearest)
 
     def _on_curve_error(self, message: str) -> None:
         self.curve_status.setText(message)
@@ -1230,13 +1915,32 @@ class CrispControlPanel(QWidget):
             self.curve_plot.clear()
             return
         a = self._curve_analysis
-        vlines = [RefLine(0.0, _GREY, "start")]
+        vlines = [RefLine(0.0, _GREY, "start", label_bottom=True)]
         markers: list[tuple[float, float, str]] = []
         if a is not None and a.crossing_um is not None:
             vlines.append(RefLine(a.crossing_um, _BLUE, "lock point", dashed=False))
+            vlines.extend(
+                RefLine(z, _ORANGE, "other crossing") for z, _ in a.other_crossings
+            )
             for pk in (a.peak_low, a.peak_high):
                 if pk is not None:
                     markers.append((pk[0], pk[1], _ORANGE))
+        camera = self.curve_camera.currentText()
+        sharp = sharpest_position(pts, camera) if a is not None and camera else None
+        if sharp is not None:
+            vlines.append(RefLine(sharp[0], _GREEN))
+        self._paint_sharpness(pts, camera, a, sharp)
+        scan = self._curve_scan
+        if a is not None and scan is not None and scan.limits_um is not None:
+            for cut, limit in zip(
+                (scan.limited_low, scan.limited_high), scan.limits_um
+            ):
+                if cut:
+                    vlines.append(
+                        RefLine(
+                            limit - scan.z0_um, _RED, "travel limit", label_bottom=True
+                        )
+                    )
         self.curve_plot.set_data(
             [Series([p.z_um for p in pts], [p.error for p in pts], _BLUE, 1.8)],
             hlines=[RefLine(0.0, _GREY)],
@@ -1244,30 +1948,154 @@ class CrispControlPanel(QWidget):
             markers=markers,
         )
 
+    def _paint_sharpness(
+        self,
+        pts: list[CurvePoint],
+        camera: str,
+        a: CurveAnalysis | None,
+        sharp: tuple[float, bool] | None,
+    ) -> None:
+        scored = [(p.z_um, p.scores[camera]) for p in pts if camera in p.scores]
+        if not scored:
+            self.curve_sharp_plot.clear()
+            return
+        top = max(score for _, score in scored) or 1.0
+        vlines = []
+        if sharp is not None:
+            vlines.append(RefLine(sharp[0], _GREEN, "sharpest", label_bottom=True))
+        if a is not None and a.crossing_um is not None:
+            vlines.append(RefLine(a.crossing_um, _BLUE, "lock point", dashed=False))
+        self.curve_sharp_plot.set_data(
+            [Series([z for z, _ in scored], [v / top for _, v in scored], _GREEN, 1.6)],
+            vlines=vlines,
+            x_range=(pts[0].z_um, pts[-1].z_um),
+        )
+
+    def _curve_sharpness_text(self, a: CurveAnalysis) -> str | None:
+        camera = self.curve_camera.currentText()
+        sharp = sharpest_position(self._curve_points, camera) if camera else None
+        if sharp is None:
+            return None
+        z, inside = sharp
+        if not inside:
+            end = "upper" if z > 0 else "lower"
+            return (
+                f"<b>Image sharpness</b> ({camera}) is highest at the {end} end of the "
+                f"scan ({z:+.1f} µm): the sharpest image is beyond it."
+            )
+        text = f"<b>Sharpest image</b> ({camera}, green line) at {z:+.2f} µm"
+        if a.crossing_um is None:
+            return text + " from the start."
+        d = z - a.crossing_um
+        text += f", {d:+.2f} µm from the lock point"
+        if abs(d) >= _SHARPEST_OFFSET_UM:
+            text += (
+                ". To lock at the sharpest image, move there in Ready and Set Offset"
+            )
+        return text + "."
+
     def _curve_summary(self, a: CurveAnalysis) -> str:
         if a.crossing_um is None:
             return (
                 "No zero crossing in the scanned range: the lock point is outside it, "
                 "or there is no usable signal. Check Sum and the Dither alignment."
             )
-        lines = []
+        lines = [
+            (
+                f"<b>Lock point</b> at {a.crossing_um:+.2f} µm from the start: where "
+                "CRISP would hold focus with the current lock offset. (Set Offset in "
+                "Ready at best focus moves it to 0.)"
+            )
+        ]
+        sharpness = self._curve_sharpness_text(a)
+        if sharpness:
+            lines.append(sharpness)
+        res = a.resolution_nm
+        slope = f"<b>Slope</b> {_fmt(a.slope, '+.1f')} counts/µm of the error readout"
+        if res is not None:
+            slope += f": one count = {res:.0f} nm of focus"
+        lines.append(slope + ".")
         cal = self._sensitivity
-        slope = f"{_fmt(a.slope, '+.0f')} counts/µm"
-        if cal is not None:
-            slope += f" (the calibration readout says {cal:.0f})"
-        lines.append(f"<b>Lock point</b> at {a.crossing_um:+.2f} µm, slope {slope}.")
-        if cal and a.slope and not 0.7 <= abs(a.slope) / cal <= 1.0 / 0.7:
+        if cal and a.slope:
+            ratio = cal / abs(a.slope)
             lines.append(
-                f"The two differ by {max(abs(a.slope) / cal, cal / abs(a.slope)):.1f}×: "
-                "either the calibration predates the last alignment (redo "
-                "3. Set Gain), or Calibration Gain isn't the slope the Sensitivity "
-                "readout assumes."
+                f"Cal Gain / Cal Range ({cal:.0f}) is {ratio:.0f}× this: it is on a "
+                "different (internal) scale, so it can't convert the error readout "
+                "to µm. The panel uses this measured slope instead, until the next "
+                "Log Cal or Dither."
             )
         lo, hi = a.margin_low_um, a.margin_high_um
-        if lo is not None and hi is not None:
+        z_lo = min(p.z_um for p in self._curve_points) if self._curve_points else None
+        z_hi = max(p.z_um for p in self._curve_points) if self._curve_points else None
+        found = [
+            f"{m:.2f} µm {side}"
+            for m, side in ((lo, "below"), (hi, "above"))
+            if m is not None
+        ]
+        if found:
             lines.append(
-                f"<b>Peaks</b> {lo:.2f} µm below and {hi:.2f} µm above the lock point "
-                "(a lock point close to a peak is hard to hold)."
+                f"<b>Peak{'s' if len(found) > 1 else ''}</b> {' and '.join(found)} the "
+                "lock point (a lock point close to a peak is hard to hold)."
+            )
+        missing = [
+            side
+            for side, pk in (("below", a.peak_low), ("above", a.peak_high))
+            if pk is None
+        ]
+        scan = self._curve_scan
+        cut = {
+            "below": scan is not None and scan.limited_low,
+            "above": scan is not None and scan.limited_high,
+        }
+        if missing:
+            span = ""
+            if z_lo is not None and z_hi is not None:
+                span = f" ({z_lo:+.1f} … {z_hi:+.1f} µm)"
+            text = (
+                f"<b>No turnover {' or '.join(missing)} the lock point within the "
+                f"scan</b>{span}: the error levels off or keeps growing to the end."
+            )
+            if not found and not all(cut[side] for side in missing):
+                text += " Scan wider (if safe) to find the peaks."
+            lines.append(text)
+        if scan is not None and z_lo is not None and z_hi is not None:
+            reached = [
+                f"{abs(z):.1f} µm {side}"
+                for side, z in (("below", z_lo), ("above", z_hi))
+                if cut[side]
+            ]
+            if reached:
+                text = (
+                    f"<b>Travel limit:</b> {scan.actuator} could only go "
+                    f"{' and '.join(reached)} the start"
+                )
+                if scan.limits_um is not None:
+                    lo_lim, hi_lim = scan.limits_um
+                    text += (
+                        f" (its limits are {lo_lim:.1f} … {hi_lim:.1f} µm; it started "
+                        f"at {scan.z0_um:.1f} µm)"
+                    )
+                if scan.skipped:
+                    text += (
+                        f"; {scan.skipped} position{'s' if scan.skipped > 1 else ''} "
+                        "it didn't reach were left out"
+                    )
+                lines.append(text + ". The curve past that wasn't measured.")
+        for z, s in a.other_crossings:
+            if s is None or not a.slope:
+                continue
+            steep = abs(s) / abs(a.slope)
+            if (s > 0) != (a.slope > 0):
+                meaning = (
+                    "opposite sign: probably another reflecting surface coming into "
+                    "focus. Past it the error pushes the wrong way, so the capture "
+                    "range ends there"
+                )
+            else:
+                meaning = "same sign: a second point the lock could settle on"
+            lines.append(
+                f"<b>Another zero crossing</b> at {z:+.1f} µm, slope {s:+.0f} counts/µm "
+                f"({steep:.1f}× as steep as the lock point; {meaning})."
             )
         cap_lo = _fmt(a.capture_low_um, "+.2f")
         cap_hi = _fmt(a.capture_high_um, "+.2f")
@@ -1275,16 +2103,43 @@ class CrispControlPanel(QWidget):
             f"<b>Capture range</b> {'≤ ' if a.capture_low_open else ''}{cap_lo} … "
             f"{'≥ ' if a.capture_high_open else ''}{cap_hi} µm."
         )
-        if a.noise_floor_nm is not None:
-            lines.append(
-                f"<b>Error noise</b> ±{a.noise_counts:.1f} counts → focus noise floor "
-                f"≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)."
-            )
-        else:
-            lines.append(
-                "Use 2 or more reads per position to estimate the noise floor."
-            )
+        lines.append(self._curve_noise_text(a))
         return "<br>".join(lines)
+
+    @staticmethod
+    def _curve_noise_text(a: CurveAnalysis) -> str:
+        reads = ""
+        if a.noise_counts is not None:
+            reads = f"; the reads at one position agreed to ±{a.noise_counts:.1f}"
+        if a.scatter_counts is not None and a.scatter_counts > 1.0 and a.scatter_nm:
+            return (
+                f"<b>Error noise</b> ±{a.scatter_counts:.1f} counts rms from one "
+                f"position to the next, ≈ {a.scatter_nm:.0f} nm of focus at this "
+                f"slope{reads}."
+            )
+        biggest = max(
+            (n for n in (a.scatter_counts, a.noise_counts) if n is not None),
+            default=None,
+        )
+        if biggest is None:
+            return "Use 2 or more reads per position to estimate the noise floor."
+        if biggest <= 1.0:
+            one = (
+                f" (one count = {a.resolution_nm:.0f} nm here)"
+                if a.resolution_nm
+                else ""
+            )
+            return (
+                "<b>Error noise</b> about one count or less, i.e. mostly the readout's "
+                f"rounding: it can't show focus changes smaller than one count{one}. "
+                "The Hold test (actuator position) measures the real noise."
+            )
+        floor = (
+            f" → focus noise floor ≈ {a.noise_floor_nm:.0f} nm rms (noise / slope)"
+            if a.noise_floor_nm is not None
+            else ""
+        )
+        return f"<b>Error noise</b> ±{biggest:.1f} counts{floor}."
 
     def _on_curve_save(self) -> None:
         if self._curve_scan is None:
@@ -1335,10 +2190,14 @@ class CrispControlPanel(QWidget):
             )
             return
         state = self.controller.get_state()
-        if state not in _LOCKED_STATES:
+        if state in _LOCKED_STATES:
+            locked = True
+        elif state in _UNLOCKED_HOLD_STATES:
+            locked = False  # the actuator by itself, not driven by CRISP
+        else:
             self.hold_status.setText(
-                f"The hold test needs the lock engaged; the state is "
-                f"{state or 'unknown'}."
+                f"The hold test runs locked (Lock / In Focus) or unlocked (Ready / "
+                f"Idle); the state is {state or 'unknown'}."
             )
             return
         if not self._begin_tool(_HOLD):
@@ -1346,7 +2205,8 @@ class CrispControlPanel(QWidget):
         self._hold_samples = []
         self.tools_tabs.setCurrentWidget(self._hold_tab)
         duration = float(self.hold_duration.value())
-        self.hold_status.setText(f"Recording for {duration:.0f} s…")
+        mode = "locked" if locked else "unlocked: the actuator by itself"
+        self.hold_status.setText(f"Recording for {duration:.0f} s ({mode})…")
         self.hold_plot.clear()
         self._hold = HoldTest(
             self.mmcore,
@@ -1354,6 +2214,7 @@ class CrispControlPanel(QWidget):
             actuator,
             duration_s=duration,
             rate_hz=self.hold_rate.value(),
+            locked=locked,
             on_sample=lambda s: self._emit("hold_sample", s),
             on_done=lambda r: self._emit("hold_done", r),
         )
@@ -1380,36 +2241,65 @@ class CrispControlPanel(QWidget):
             self.hold_status.setText(
                 f"Recording… {sample.t:.0f} / {self.hold_duration.value()} s"
             )
-            self._paint_hold(self._hold_samples)
+            locked = self._hold.locked if self._hold is not None else True
+            self._paint_hold(self._hold_samples, locked=locked)
 
-    def _paint_hold(self, samples: list[HoldSample]) -> None:
+    def _paint_hold(self, samples: list[HoldSample], *, locked: bool) -> None:
+        """Plot the position over time, and for an unlocked run the error too.
+
+        Unlocked, the actuator stands still, so the error is how the focus moves
+        without the lock: with a measured slope it goes on the position's nm axis as the
+        move a lock would make to cancel it (-error / slope), otherwise in counts. A
+        locked run's error is in-loop (mostly sensor noise the lock averages out), so
+        drawn as focus it would look like motion that isn't there; only the position.
+        """
         pos = [(s.t, s.position_um) for s in samples if s.position_um is not None]
-        if not pos:
-            self.hold_plot.clear()
-            return
-        z_first = pos[0][1]
-        self.hold_plot.set_data(
-            [
+        err = [] if locked else [(s.t, s.error) for s in samples if s.error is not None]
+        slope = self._measured_slope
+        series: list[Series] = []
+        label = "position (nm)"
+        if slope and err:
+            label = "nm: position (blue), error ÷ slope (orange)"
+        elif err:
+            label = "error (counts); run a Focus curve to see it in nm"
+            pos = []
+        if pos:
+            z_first = pos[0][1]
+            series.append(
                 Series(
                     [t for t, _ in pos],
                     [(z - z_first) * 1000.0 for _, z in pos],  # type: ignore[operator]
                     _BLUE,
                     1.4,
                 )
-            ],
-            hlines=[RefLine(0.0, _GREY)],
-        )
+            )
+        if err:
+            scale = -1000.0 / slope if slope else 1.0
+            series.append(
+                Series(
+                    [t for t, _ in err],
+                    [e * scale for _, e in err],  # type: ignore[operator]
+                    _ORANGE,
+                    1.0,
+                )
+            )
+        if not series:
+            self.hold_plot.clear()
+            return
+        self.hold_plot.set_y_label(label)
+        self.hold_plot.set_data(series, hlines=[RefLine(0.0, _GREY)])
 
     def _on_hold_done(self, result: HoldResult) -> None:
         self._hold = None
         self._hold_results.insert(0, result)
         del self._hold_results[_HOLD_RESULTS_KEPT:]
         self._end_tool(_HOLD)
-        self._paint_hold(result.samples)
+        self._paint_hold(result.samples, locked=result.locked)
         self._fill_hold_table()
         s = result.stats
+        mode = "Locked" if result.locked else "Unlocked"
         summary = (
-            f"{'Done' if result.completed else result.note.capitalize()}: "
+            f"{mode}, {'done' if result.completed else result.note}: "
             f"{s.duration_s:.0f} s, {_fmt(s.rate_hz, '.0f')} samples/s. "
             f"Drift {_fmt(s.drift_nm_per_min, '+.1f')} nm/min, jitter "
             f"{_fmt(s.jitter_nm, '.0f')} nm, wander {_fmt(s.wander_nm, '.0f')} nm rms, "
@@ -1417,6 +2307,45 @@ class CrispControlPanel(QWidget):
         )
         if s.rms_nm is None:
             summary += f" No position readings from {result.actuator}."
+        if not result.locked:
+            summary += (
+                " CRISP wasn't driving the actuator, so this is its own motion"
+                " (piezo + drive)."
+            )
+            sens = self._measured_slope
+            if s.error_rms is not None and sens:
+                summary += (
+                    f" The error's {s.error_rms:.1f} counts rms (about its trend) is"
+                    " the sensor and optics noise: ≈"
+                    f" {s.error_rms / abs(sens) * 1000:.0f} nm at the measured slope."
+                )
+            if s.error_drift_per_min is not None and sens:
+                follow = -s.error_drift_per_min / sens * 1000
+                summary += (
+                    f" The error drifted {s.error_drift_per_min:+.1f} counts/min: a lock"
+                    f" would move the actuator ≈ {follow:+.0f} nm/min to follow it."
+                )
+            elif s.error_rms is not None and s.error_drift_per_min is not None:
+                summary += (
+                    f" The error scattered {s.error_rms:.1f} counts rms about its"
+                    f" trend and drifted {s.error_drift_per_min:+.1f} counts/min (run a"
+                    " Focus curve to see these in nm)."
+                )
+        else:
+            sens = self._measured_slope
+            if s.error_rms is not None and sens and s.rms_nm is not None:
+                summary += (
+                    f" The in-loop error was {s.error_rms:.1f} counts rms (≈"
+                    f" {s.error_rms / abs(sens) * 1000:.0f} nm if it were focus); the"
+                    f" actuator moved {s.rms_nm:.0f} nm rms, so most of that is sensor"
+                    " noise the lock averages out."
+                )
+            if s.drift_nm_per_min is not None and abs(s.drift_nm_per_min) >= 200:
+                summary += (
+                    " A steady drift while locked is the lock following something: if"
+                    " the image stays sharp, the focus itself drifted (mechanics,"
+                    " temperature); if it blurs, CRISP's reference drifted."
+                )
         change = result.lock_offset_change
         if change:
             summary += (
@@ -1435,15 +2364,17 @@ class CrispControlPanel(QWidget):
                 note = f"{note + '; ' if note else ''}offset {change:+.0f}"
             cells = [
                 r.started.strftime("%H:%M:%S"),
-                r.settings.get("Averages", ""),
-                r.settings.get("Loop Gain", ""),
-                r.settings.get("Update rate (ms)", ""),
-                r.settings.get("LED (%)", ""),
+                "locked" if r.locked else "unlocked",
                 _fmt(s.drift_nm_per_min, "+.1f", ""),
                 _fmt(s.jitter_nm, ".0f", ""),
                 _fmt(s.wander_nm, ".0f", ""),
                 _fmt(s.pkpk_nm, ".0f", ""),
                 _fmt(s.error_rms, ".1f", ""),
+                _fmt(s.error_drift_per_min, "+.1f", ""),
+                r.settings.get("Averages", ""),
+                r.settings.get("Loop Gain", ""),
+                r.settings.get("Update rate (ms)", ""),
+                r.settings.get("LED (%)", ""),
                 note,
             ]
             for col, text in enumerate(cells):
@@ -1532,16 +2463,21 @@ class CrispControlPanel(QWidget):
             # scale, so start the fluctuation window fresh.
             self._error_history.clear()
         self._sensitivity = new
-        if new is None:
-            self.sensitivity_lbl.setText("Sensitivity: -- (uncalibrated)")
-        else:
-            self.sensitivity_lbl.setText(f"Sensitivity: {new:.0f} counts/µm")
+        self._render_sensitivity()
 
     def _update_readout(self, prop: str, value: str) -> None:
         lbl = self._readouts.get(prop)
         if lbl is None:
             return
-        if prop == "Signal Noise Ratio":
+        if prop == CAL_RANGE_PROP:
+            # Shown with the NA it corresponds to (cal range = 1.5 µm / NA²), so a
+            # setting that doesn't match the objective this axis moves stands out.
+            rng = _to_float(value)
+            if rng and rng > 0:
+                lbl.setText(f"{rng:.3f}  (NA {math.sqrt(1.5 / rng):.2f})")
+            else:
+                lbl.setText(str(value))
+        elif prop == "Signal Noise Ratio":
             snr = _to_float(value)
             if snr is None:
                 lbl.setText(str(value))
@@ -1592,6 +2528,7 @@ class CrispControlPanel(QWidget):
         self.stability_lbl.setText(f"{text} rms · pk-pk {ptp:.0f} cts")
 
     def _update_state(self, state: str) -> None:
+        previous_state = self._last_state
         if state != self._last_state:
             # Errors from different states aren't comparable (Dither shows its swing).
             self._error_history.clear()
@@ -1611,6 +2548,13 @@ class CrispControlPanel(QWidget):
         led_on = bool(state) and state != "Idle"
         self.btn_idle_ready.setText("Set Idle (LED off)" if led_on else "Set Ready")
         locked = state in _LOCKED_STATES
+        # A direct LED-on leaves the state at "Idle", so there the button keeps the
+        # user's choice; entering or leaving Idle resets it (every other state is lit).
+        if state and state != "Idle":
+            self._set_led_button(True)
+        elif state == "Idle" and previous_state != "Idle":
+            self._set_led_button(False)
+        self.btn_led.setEnabled(not locked)
         self.btn_lock.setText("Unlock" if locked else "Lock")
 
         # Auto joystick lockout: only act on a lock/unlock *transition*, so a

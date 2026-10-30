@@ -4,8 +4,14 @@ The CRISP error signal is measured *inside* the feedback loop, so it can look qu
 while the actuator moves: on this rig's 2026-08-14 log the locked piezo's error stayed
 within ±9 counts while the piezo itself moved ~100 nm between samples. The actuator's
 own position readback is what the servo does to the focus, so this test records it
-(plus the error and the state) at a steady rate while the axis sits locked, then
-separates:
+(plus the error and the state) at a steady rate while the axis sits locked.
+
+It can also run **unlocked** (Ready or Idle), with CRISP not driving the actuator. The
+position then shows the actuator's own noise (the piezo and its drive), and in Ready the
+error shows the sensor's noise. Comparing an unlocked and a locked run separates what
+the actuator does by itself from what the lock adds.
+
+Either way the record is split into:
 
 * **drift**: the straight-line trend, in nm/min. Part of it is CRISP doing its job,
   following thermal drift of the sample; a drift together with a changing lock offset
@@ -16,6 +22,11 @@ separates:
   little: its rise over 1 s divided by √12).
 
 ``jitter² + wander²`` is the detrended mean-square, so the two add up to the total.
+
+The error gets the same straight-line fit: its **trend** (counts/min) and its rms about
+the trend. In an unlocked run the actuator stands still, so an error trend is the optics
+or the sensor drifting; divided by the focus-curve slope it is the drift a lock would
+follow. (Without the detrending, a ramp of R counts over the run alone gives R/√12 rms.)
 It also records the lock settings and the lock offset at the start and end, so runs can
 be compared one change at a time. It never writes a setting.
 
@@ -46,6 +57,14 @@ ERROR_PROP = "Dither Error"
 STATE_PROP = "CRISP State"
 LOCK_OFFSET_PROP = "Lock Offset"
 LOCKED_STATES = frozenset({"Lock", "In Focus"})
+# States in which CRISP drives the actuator; an unlocked run ends if one appears.
+DRIVEN_STATES = LOCKED_STATES | {
+    "Dither",
+    "Calibrating",
+    "loG_cal",
+    "gain_Cal",
+    "Curve",
+}
 
 # Lock settings recorded with each run: (property, short name).
 SETTINGS_PROPS: list[tuple[str, str]] = [
@@ -62,8 +81,9 @@ DEFAULT_RATE_HZ = 10.0
 DEFAULT_BIN_S = 1.0
 # Read the state about this often (not every sample) to see a lost lock.
 _STATE_EVERY_S = 1.0
-# Stop after this many consecutive state reads that aren't locked.
-_UNLOCKED_READS_TO_STOP = 2
+# Stop after this many consecutive state reads in the wrong mode (a single odd read
+# is tolerated).
+_WRONG_STATE_READS_TO_STOP = 2
 
 
 @dataclass(frozen=True)
@@ -89,7 +109,8 @@ class HoldStats:
     wander_nm: float | None  # detrended, bin_s and slower
     pkpk_nm: float | None  # detrended
     error_mean: float | None
-    error_rms: float | None  # population std-dev of the error
+    error_rms: float | None  # about the error's straight-line trend
+    error_drift_per_min: float | None = None  # the trend, counts/min
 
 
 @dataclass
@@ -104,9 +125,10 @@ class HoldResult:
     lock_offset_end: float | None
     stats: HoldStats
     samples: list[HoldSample] = field(default_factory=list)
-    completed: bool = True  # False if stopped or the lock was lost
-    lock_lost_at_s: float | None = None
+    completed: bool = True  # False if stopped, or the state left the run's mode
+    interrupted_at_s: float | None = None  # when the state left the run's mode
     note: str = ""
+    locked: bool = True  # a locked run (CRISP driving) or an unlocked one
 
     @property
     def lock_offset_change(self) -> float | None:
@@ -133,9 +155,13 @@ def analyze_hold(
     duration = samples[-1].t - samples[0].t if len(samples) > 1 else 0.0
     rate = (len(samples) - 1) / duration if duration > 0 else None
 
-    errors = [s.error for s in samples if s.error is not None]
-    err_mean = statistics.fmean(errors) if errors else None
-    err_rms = statistics.pstdev(errors) if len(errors) > 1 else None
+    errs = [(s.t, s.error) for s in samples if s.error is not None]
+    err_mean = statistics.fmean(e for _, e in errs) if errs else None
+    err_rms = err_drift = None
+    if len(errs) > 1:
+        ea, eb = _linear_fit([t for t, _ in errs], [e for _, e in errs])
+        err_rms = math.sqrt(statistics.fmean((e - (ea + eb * t)) ** 2 for t, e in errs))
+        err_drift = eb * 60.0
 
     pos = [(s.t, s.position_um) for s in samples if s.position_um is not None]
     drift = rms = jitter = wander = pkpk = None
@@ -173,6 +199,7 @@ def analyze_hold(
         pkpk_nm=pkpk,
         error_mean=err_mean,
         error_rms=err_rms,
+        error_drift_per_min=err_drift,
     )
 
 
@@ -184,13 +211,18 @@ class HoldTest:
     mmcore
         The shared core.
     label
-        The CRISP autofocus device; it should be locked.
+        The CRISP autofocus device.
     actuator
         The stage device CRISP drives; its position is recorded.
     duration_s
         How long to record.
     rate_hz
         Target sample rate. Each sample is two reads (position, error).
+    locked
+        ``True`` (default) for a run with the lock engaged; it ends if the lock is
+        lost. ``False`` for a run with CRISP *not* driving the actuator (Ready or
+        Idle): the position then shows the actuator's own noise and the error the
+        sensor's noise. It ends if the state moves into Lock, Dither or calibration.
     on_sample
         Called on the worker thread with each sample.
     on_done
@@ -206,12 +238,14 @@ class HoldTest:
         *,
         duration_s: float = DEFAULT_DURATION_S,
         rate_hz: float = DEFAULT_RATE_HZ,
+        locked: bool = True,
         on_sample: Callable[[HoldSample], None] | None = None,
         on_done: Callable[[HoldResult], None] | None = None,
     ) -> None:
         self._mmcore = mmcore
         self._label = label
         self._actuator = actuator
+        self._locked = locked
         self._duration_s = duration_s
         self._interval = 1.0 / rate_hz
         self._on_sample = on_sample
@@ -222,6 +256,11 @@ class HoldTest:
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def locked(self) -> bool:
+        """Whether this is a locked run (CRISP driving) or an unlocked one."""
+        return self._locked
 
     def start(self) -> None:
         if self.running:
@@ -243,6 +282,12 @@ class HoldTest:
         if self._thread is not None:
             self._thread.join(timeout)
 
+    def _state_ok(self, state: str) -> bool:
+        """Whether *state* matches the run's mode (locked, or not driven)."""
+        if self._locked:
+            return state in LOCKED_STATES
+        return state not in DRIVEN_STATES
+
     def _read_position(self) -> float | None:
         with suppress(Exception):
             return float(self._mmcore.getPosition(self._actuator))
@@ -259,8 +304,8 @@ class HoldTest:
         offset_start = read_float(core, label, LOCK_OFFSET_PROP)
 
         samples: list[HoldSample] = []
-        lock_lost_at: float | None = None
-        unlocked_reads = 0
+        interrupted_at: float | None = None
+        wrong_reads = 0
         t0 = time.monotonic()
         next_state = t0
         note = ""
@@ -289,10 +334,14 @@ class HoldTest:
                     note = "stopped: display closed"
                     break
             if state is not None:
-                unlocked_reads = 0 if state in LOCKED_STATES else unlocked_reads + 1
-                if unlocked_reads >= _UNLOCKED_READS_TO_STOP:
-                    lock_lost_at = sample.t
-                    note = f"lock lost ({state})"
+                wrong_reads = 0 if self._state_ok(state) else wrong_reads + 1
+                if wrong_reads >= _WRONG_STATE_READS_TO_STOP:
+                    interrupted_at = sample.t
+                    note = (
+                        f"lock lost ({state})"
+                        if self._locked
+                        else f"CRISP started driving the actuator ({state})"
+                    )
                     break
             wait = self._interval - (time.monotonic() - now)
             if wait > 0:
@@ -311,8 +360,9 @@ class HoldTest:
             stats=analyze_hold(samples),
             samples=samples,
             completed=not stopped_early,
-            lock_lost_at_s=lock_lost_at,
+            interrupted_at_s=interrupted_at,
             note=note,
+            locked=self._locked,
         )
         if self._on_done is not None:
             self._on_done(result)
@@ -324,6 +374,7 @@ def write_hold_csv(path: Path | str, result: HoldResult) -> None:
     meta = {
         "crisp": result.label,
         "actuator": result.actuator,
+        "mode": "locked" if result.locked else "unlocked",
         "started": result.started.isoformat(timespec="seconds"),
         **{f"setting {k}": v for k, v in result.settings.items()},
         "lock_offset_start": result.lock_offset_start,
@@ -334,6 +385,7 @@ def write_hold_csv(path: Path | str, result: HoldResult) -> None:
         "wander_nm": s.wander_nm,
         "pkpk_nm": s.pkpk_nm,
         "error_rms": s.error_rms,
+        "error_drift_per_min": s.error_drift_per_min,
     }
     with open(path, "w", newline="", encoding="utf-8") as fh:
         fh.writelines(

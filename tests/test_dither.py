@@ -194,6 +194,30 @@ def test_spread_reports_fluctuation_as_a_fraction_of_the_level() -> None:
     assert tr.stats.spread == pytest.approx(0.1)
 
 
+def test_noise_is_the_scatter_in_counts_independent_of_level() -> None:
+    rng = random.Random(1)
+    small = DitherTracker(window_s=3.0)
+    _feed(small, [70.0 + rng.gauss(0, 9) for _ in range(60)])
+    big = DitherTracker(window_s=3.0)
+    _feed(big, [1400.0 + rng.gauss(0, 9) for _ in range(60)])
+    assert small.stats.noise == pytest.approx(9.0, rel=0.35)
+    assert big.stats.noise == pytest.approx(9.0, rel=0.35)
+    assert small.stats.spread > 10 * big.stats.spread  # same noise, very different %
+
+
+def test_discard_after_drops_readings_from_after_the_dither() -> None:
+    tr = DitherTracker(window_s=1.0)
+    t = _feed(tr, [115.0] * 40)  # 2 s of dithering
+    t_last_dither = t - 0.05
+    _feed(tr, [0.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], t0=t)  # Ready
+    assert tr.stats.level < 50  # the tail dragged it down
+    tr.discard_after(t_last_dither)
+    assert tr.stats.level == pytest.approx(115.0)
+    assert tr.stats.raw_err == 115.0
+    assert tr.stats.peak == pytest.approx(115.0)
+    assert all(t <= t_last_dither for t, _, _ in tr.trace())
+
+
 def test_sum_is_tracked_and_classified() -> None:
     tr = DitherTracker()
     _feed(tr, [100.0] * 5, signal_sum=0.0)

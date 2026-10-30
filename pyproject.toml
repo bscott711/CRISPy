@@ -5,6 +5,7 @@ description = "A multi-ASI CRISP autofocus plugin for pymmcore-gui"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy",
     "pymmcore-plus",
     "pymmcore-widgets",
     "qtpy",
