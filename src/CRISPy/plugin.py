@@ -1,3 +1,4 @@
+from pymmcore_plus import CMMCorePlus
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QLabel,
@@ -6,9 +7,11 @@ from qtpy.QtWidgets import (
     QTabWidget,
     QWidget,
 )
-from pymmcore_plus import CMMCorePlus
+
 from .controller import ASICrispController
 from .discovery import discover_crisp_devices
+from .spot.store import get_settings_store
+from .spot_choice import choose_spot_index
 from .ui import CrispControlPanel
 
 
@@ -21,6 +24,11 @@ def _scrolled(widget: QWidget) -> QScrollArea:
 
 
 def launch_crisp_plugin() -> QWidget:
+    """Build the CRISPy panels, one per CRISP axis.
+
+    Only one piezo panel (see :func:`~CRISPy.spot_choice.choose_spot_index`) gets the
+    "Spot lock" section; the stage panels are unchanged.
+    """
     mmcore = CMMCorePlus.instance()
     labels = discover_crisp_devices(mmcore)
     num_devices = len(labels)
@@ -30,9 +38,14 @@ def launch_crisp_plugin() -> QWidget:
         widget.setMargin(20)
         return widget
 
+    controllers = [ASICrispController(label, mmcore) for label in labels]
+    spot_index = choose_spot_index(
+        [(c.actuator_type, c.actuator_label) for c in controllers],
+        get_settings_store().piezo_label,
+    )
     panels = [
-        _scrolled(CrispControlPanel(ASICrispController(label, mmcore), mmcore))
-        for label in labels
+        _scrolled(CrispControlPanel(c, mmcore, spot_lock=(i == spot_index)))
+        for i, c in enumerate(controllers)
     ]
 
     if num_devices == 1:

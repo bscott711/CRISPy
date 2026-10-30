@@ -1,11 +1,13 @@
 [project]
 name = "CRISPy"
-version = "0.1.0"
+version = "0.2.0"
 description = "A multi-ASI CRISP autofocus plugin for pymmcore-gui"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
+    "pydantic>=2.10",
+    "psygnal>=0.12",
     "pymmcore-plus",
     "pymmcore-widgets",
     "qtpy",
@@ -31,3 +33,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Moved verbatim from pymmcore-gui (a35df08); these rules would need behaviour edits.
+"src/CRISPy/spot/**" = ["BLE001", "S110", "SIM102", "ISC004", "PYI034", "N999"]
+"tests/test_spot_focus.py" = ["RUF059"]

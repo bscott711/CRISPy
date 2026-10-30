@@ -41,12 +41,12 @@ uv pip install -e .
 uv pip install git+https://github.com/bscott711/CRISPy.git
 ```
 
-Once installed, launch `pymmcore-gui`. CRISPy will automatically register itself and appear in the **Plugins** menu.
+Once installed, launch `pymmcore-gui`. pymmcore-gui embeds CRISPy itself (its CRISP widget calls `CRISPy.plugin.launch_crisp_plugin()`) and sets the host hooks CRISPy offers: `CRISPy.imaging` (snap and image view for the Focus curve) and `CRISPy.spot.store.set_settings_store` (where the Spot lock keeps its settings). Without a host, `launch_crisp_plugin()` works on its own and `run_demo.py` shows it.
 
 ## 🚀 Usage
 
 1. Open `pymmcore-gui` and load your Hardware Configuration.
-1. Navigate to **Plugins -> CRISPy**.
+1. Open the **CRISP** widget (pymmcore-gui builds it with `launch_crisp_plugin()`).
 1. The plugin will automatically discover all loaded ASI CRISP devices.
 1. In each axis's **Parameters** box, set **Objective NA** to the NA of the objective *that axis moves*. It sets the dither move (1.5 µm / NA²); the Cal Range readout shows the NA it corresponds to. Too high an NA gives too short a dither move and a small, noisy dither Err.
 1. Focus on your sample, then follow the 3-step calibration in each axis's **Calibration** box:
@@ -149,6 +149,10 @@ uv run pytest -q
 
 `ruff` is not a project dependency; install it separately (for example `uv tool install ruff`).
 
+## Spot lock
+
+The **piezo** axis panel has a **Spot lock** section (the stage panel does not). It holds the piezo at the sample plane by watching the edge of the CRISP LED spot on a second camera, and runs as a separate worker process. It is a controller, not a diagnostic tool: while it is starting, locking, calibrating or zeroing, the panel's slow poll is paused, the panel's own controls that write to the Tiger (Operation and Calibration buttons, LED, joystick, Parameters) are disabled, and the Dither, Focus curve and Hold test cannot start; while a tool runs, the section is disabled. A config reload rebuilds the panel and stops a running lock. How it works, its calibration and its rules are in [docs/spot_focus_lock.md](docs/spot_focus_lock.md). `just demo` shows it with a simulated camera.
+
 ## 🏗️ Architecture
 
 CRISPy strictly adheres to Separation of Concerns (SoC) and DRY principles. All device I/O goes through the shared `CMMCorePlus` instance, never a serial port directly.
@@ -158,4 +162,6 @@ CRISPy strictly adheres to Separation of Concerns (SoC) and DRY principles. All 
 - **`dither.py`**, **`focus_curve.py`**, **`hold.py`**: The diagnostics, with no Qt dependency: the Dither assistant's tracker, the focus-curve scan and analysis, and the hold test's recorder and analysis.
 - **`sampling.py`**: The fast reader thread and read helpers the diagnostics share.
 - **`ui.py`** and **`plot.py`**: The Visuals. `CrispControlPanel` is a Qt-native panel for one axis that reuses `pymmcore-widgets` property controls for the adjustable parameters; `plot.py` is a small QPainter plot for the diagnostics.
-- **`plugin.py`**: The Entry Point. Registered via `pyproject.toml` entry points. Acts as the orchestrator, querying discovery, instantiating controllers, and building the panels (single, splitter or tabs).
+- **`plugin.py`**: The Entry Point. `launch_crisp_plugin()` is what pymmcore-gui calls to embed CRISPy (the `pyproject.toml` entry point names the same function). Acts as the orchestrator, querying discovery, instantiating controllers, and building the panels (single, splitter or tabs); it picks the one piezo panel that gets the Spot lock (`spot_choice.py`).
+- **`imaging.py`**: Qt-free camera images for the Focus curve, with the host hooks `set_snap_provider()` and `set_image_view_factory()`.
+- **`spot/`**: The spot edge focus lock (moved here from pymmcore-gui): a worker process that reads the AmScope camera and holds the piezo, its panel, and the `store.py` settings hook. See [docs/spot_focus_lock.md](docs/spot_focus_lock.md).
