@@ -91,7 +91,7 @@ NOT_AVAILABLE = "Not available"
 NEED_BOX_TEXT = "Draw an edge box across the edge that moves with focus"
 #: panel.py:1119-1121 (the single-box wording; two boxes are not reported).
 BOX_CHANGED_TEXT = "edge box changed since the calibration; recalibrate"
-#: panel.py:119 ``_NO_CRISP``.
+#: Wording copied from the old panel text.
 NO_CRISP_TEXT = "no CRISP device (no CRISP label)"
 #: spot_focus_service.py:614 (the refusal of Calibrate during an acquisition).
 MDA_RUNNING_TEXT = "an acquisition is running; calibrate after it ends"
