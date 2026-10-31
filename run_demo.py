@@ -378,6 +378,9 @@ class MockMDAEvents:
 class MockMDA:
     events = MockMDAEvents()
 
+    def is_running(self) -> bool:
+        return False
+
 
 class MockCMMCorePlus:
     _instance = None
