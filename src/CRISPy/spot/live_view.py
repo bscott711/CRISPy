@@ -22,6 +22,11 @@ box (Draw edge box 2), cross and ring in other colours; the panel feeds its cros
 and ring (:meth:`SpotLiveView.set_secondary_point`,
 :meth:`SpotLiveView.set_secondary_setpoint`).
 
+The widget's own layout is only the image. Its toolbar widgets (Fit, 1:1, Draw ROI,
+Draw edge, Auto levels, Bayer to grey, the zoom % and the cursor / status labels) are
+attributes, created hidden and not in any layout: the owner (the panel) places the
+ones it wants and calls ``show()`` on them.
+
 See ``docs/spot_focus_lock.md``, "Live camera view and controls".
 """
 
@@ -52,7 +57,6 @@ from qtpy.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
-    QHBoxLayout,
     QLabel,
     QPushButton,
     QVBoxLayout,
@@ -375,6 +379,9 @@ class SpotLiveView(QWidget):
     windowClosed = Signal()
     #: ``(fps, max_value, saturated_percent)`` a few times a second.
     statsChanged = Signal(float, int, float)
+    #: ``True`` when frames stopped arriving (see :attr:`no_new_frames`), ``False``
+    #: when they flow again or the image was cleared. Emitted on a change only.
+    staleChanged = Signal(bool)
 
     def __init__(
         self, service: Any | None = None, parent: QWidget | None = None
@@ -401,6 +408,7 @@ class SpotLiveView(QWidget):
         self._fps_mark: tuple[int, float] | None = None
         self._last_new = 0.0
         self._last_stats = 0.0
+        self._stale = False
 
         # -- scene ---------------------------------------------------------
         self.scene = QGraphicsScene(self)
@@ -494,14 +502,17 @@ class SpotLiveView(QWidget):
         self.view.zoomed.connect(self._on_user_zoom)
         self.view.resized.connect(self._on_resized)
 
-        # -- toolbar -------------------------------------------------------
-        self.fit_button = QPushButton("Fit")
+        # -- toolbar widgets ----------------------------------------------
+        # Created hidden and unplaced: the owner puts them in its own layout (and
+        # calls show() on them). They are children of this view so none is a stray
+        # top-level window.
+        self.fit_button = QPushButton("Fit", self)
         self.fit_button.setToolTip("Scale the whole sensor to the window")
         self.fit_button.clicked.connect(self.fit)
-        self.one_to_one_button = QPushButton("1:1")
+        self.one_to_one_button = QPushButton("1:1", self)
         self.one_to_one_button.setToolTip("One image pixel per screen pixel")
         self.one_to_one_button.clicked.connect(self.one_to_one)
-        self.draw_roi_button = QPushButton("Draw ROI")
+        self.draw_roi_button = QPushButton("Draw ROI", self)
         self.draw_roi_button.setCheckable(True)
         self.draw_roi_button.setToolTip(
             "Drag a rectangle on the image to set the camera ROI"
@@ -509,7 +520,7 @@ class SpotLiveView(QWidget):
         self.draw_roi_button.toggled.connect(
             lambda on: self._on_draw_toggled("roi", on)
         )
-        self.draw_edge_button = QPushButton("Draw edge box")
+        self.draw_edge_button = QPushButton("Draw edge", self)
         self.draw_edge_button.setCheckable(True)
         self.draw_edge_button.setToolTip(
             "Drag a rectangle across the edge of the LED patch that moves with "
@@ -518,7 +529,7 @@ class SpotLiveView(QWidget):
         self.draw_edge_button.toggled.connect(
             lambda on: self._on_draw_toggled("edge", on)
         )
-        self.draw_edge2_button = QPushButton("Draw edge box 2")
+        self.draw_edge2_button = QPushButton("Draw edge box 2", self)
         self.draw_edge2_button.setCheckable(True)
         self.draw_edge2_button.setToolTip(
             "Drag a rectangle across a second edge (optional); a lateral image "
@@ -527,13 +538,13 @@ class SpotLiveView(QWidget):
         self.draw_edge2_button.toggled.connect(
             lambda on: self._on_draw_toggled("edge2", on)
         )
-        self.auto_levels = QCheckBox("Auto levels")
+        self.auto_levels = QCheckBox("Auto levels", self)
         self.auto_levels.setToolTip(
             "Stretch the display from the frame's min to its max (linear). "
             "Off: fixed 0 to full scale."
         )
         self.auto_levels.toggled.connect(lambda _: self._redraw())
-        self.bayer_grey = QCheckBox("Bayer to grey")
+        self.bayer_grey = QCheckBox("Bayer to grey", self)
         self.bayer_grey.setChecked(True)
         self.bayer_grey.setToolTip(
             "Average each 2x2 colour (Bayer) cell for display so the colour mosaic "
@@ -542,37 +553,29 @@ class SpotLiveView(QWidget):
             "mosaic."
         )
         self.bayer_grey.toggled.connect(lambda _: self._redraw())
-        self.zoom_label = QLabel("")
-        # Two rows: the view also lives in a narrow dock, where one row of all the
-        # controls would force the dock wide.
-        draw_bar = QHBoxLayout()
+        self.zoom_label = QLabel("", self)
+        self.status_label = QLabel("Waiting for the camera...", self)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setWordWrap(True)
+        self.status_label.setMinimumWidth(10)
+        self.cursor_label = QLabel("", self)
+        self.cursor_label.setMinimumWidth(10)
         for w in (
             self.fit_button,
             self.one_to_one_button,
             self.draw_roi_button,
             self.draw_edge_button,
             self.draw_edge2_button,
+            self.auto_levels,
+            self.bayer_grey,
+            self.zoom_label,
+            self.status_label,
+            self.cursor_label,
         ):
-            draw_bar.addWidget(w)
-        draw_bar.addStretch()
-        display_bar = QHBoxLayout()
-        display_bar.addWidget(self.auto_levels)
-        display_bar.addWidget(self.bayer_grey)
-        display_bar.addStretch()
-        display_bar.addWidget(self.zoom_label)
-
-        self.status_label = QLabel("Waiting for the camera...")
-        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.status_label.setMinimumWidth(10)
-        self.cursor_label = QLabel("")
-        self.cursor_label.setMinimumWidth(10)
+            w.hide()
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.addLayout(draw_bar)
-        layout.addLayout(display_bar)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.view, 1)
-        layout.addWidget(self.cursor_label)
-        layout.addWidget(self.status_label)
 
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
@@ -583,8 +586,8 @@ class SpotLiveView(QWidget):
     # ------------------------------------------------------------------
 
     def sizeHint(self) -> QSize:
-        """Preferred window size."""
-        return QSize(900, 700)
+        """Preferred size when docked (it grows with spare height; see the panel)."""
+        return QSize(400, 300)
 
     @property
     def sensor(self) -> tuple[int, int] | None:
@@ -610,6 +613,11 @@ class SpotLiveView(QWidget):
     def fit_mode(self) -> bool:
         """Whether the view re-fits the sensor when the window is resized."""
         return self._fit
+
+    @property
+    def no_new_frames(self) -> bool:
+        """Whether a frame was shown but none arrived lately (older than ``STALE_S``)."""
+        return self._stale
 
     @property
     def polling(self) -> bool:
@@ -733,6 +741,7 @@ class SpotLiveView(QWidget):
         self._roi_item.setVisible(False)
         self.status_label.setText("Waiting for the camera...")
         self.cursor_label.setText("")
+        self._set_stale(False)
 
     # ------------------------------------------------------------------
     # window events
@@ -870,11 +879,10 @@ class SpotLiveView(QWidget):
         frame = self._frame
         if frame is None:
             return
+        self._set_stale(stale)
         x, y, w, h = (int(v) for v in frame.roi)
+        # Frame rate, maximum and saturation are shown by the owner (statsChanged).
         parts = [
-            f"{self.fps:.1f} fps" if self.fps else "- fps",
-            f"max {int(frame.max_value)}",
-            f"{float(frame.saturated_frac) * 100.0:.2f}% saturated",
             f"{int(frame.bits)}-bit",
             f"ROI {w}x{h} at ({x}, {y})",
         ]
@@ -887,6 +895,11 @@ class SpotLiveView(QWidget):
         if stale:
             text = "No new frames.  " + text
         self.status_label.setText(text)
+
+    def _set_stale(self, stale: bool) -> None:
+        if stale != self._stale:
+            self._stale = stale
+            self.staleChanged.emit(stale)
 
     # ------------------------------------------------------------------
     # cursor readout

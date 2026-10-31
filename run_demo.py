@@ -39,6 +39,7 @@ from unittest.mock import patch
 
 import numpy as np
 from psygnal import Signal
+from pymmcore_plus import DeviceType, PropertyType
 from qtpy.QtCore import QObject, Qt, QTimer
 from qtpy.QtCore import Signal as QtSignal
 from qtpy.QtWidgets import (
@@ -78,6 +79,7 @@ class SimAxis:
         agc: int,
         max_lock_range: str,
         travel_um: tuple[float, float],
+        in_focus_um: str = "0.0500",
     ) -> None:
         self.lock = threading.RLock()
         self.label, self.stage = label, stage
@@ -116,6 +118,8 @@ class SimAxis:
             "Number of Skips": "5",
             "LED Intensity": "50",
             "Objective NA": "1.49",
+            "In Focus Range(um)": in_focus_um,
+            "Wait ms after Lock": "1000",
         }
 
     # ---------------------------------------------------------------- optics
@@ -301,6 +305,7 @@ _AXES: dict[str, SimAxis] = {
         max_lock_range="2.0000",
         # A 150 µm piezo with focus 2.2 µm above its lower limit.
         travel_um=(-22.0, 128.0),
+        in_focus_um="0.1280",
     ),
 }
 _BY_STAGE = {ax.stage: ax for ax in _AXES.values()}
@@ -343,6 +348,26 @@ _CAMERA = SimCamera()
 # 1. Define the Mocks FIRST
 class MockEvents:
     propertyChanged = Signal(str, str, str)
+    # PropertyWidget's ChoiceWidget (enumerated properties) listens for this.
+    systemConfigurationLoaded = Signal()
+
+
+# How the demo CRISP axes describe their editable properties to PropertyWidget:
+# (type, read-only, allowed values, (lower, upper) limits or None). The ranges are
+# plausible stand-ins, not read from the ASITiger adapter. Properties that are not
+# listed (the SimAxis telemetry values) are plain read-only strings.
+_PROP_SPECS: dict[str, tuple[PropertyType, bool, tuple[str, ...], tuple | None]] = {
+    "LED Intensity": (PropertyType.Integer, False, (), (0, 100)),
+    "GainMultiplier": (PropertyType.Integer, False, (), (1, 50)),
+    "Objective NA": (PropertyType.Float, False, (), (0.1, 1.65)),
+    "Number of Averages": (PropertyType.Integer, False, (), (0, 8)),
+    "Max Lock Range(mm)": (PropertyType.Float, False, (), None),
+    "In Focus Range(um)": (PropertyType.Float, False, (), None),
+    "Number of Skips": (PropertyType.Integer, False, (), (0, 500)),
+    "Wait ms after Lock": (PropertyType.Integer, False, (), None),
+    "AxisLetter": (PropertyType.String, True, (), None),
+    "TigerHexAddress": (PropertyType.String, True, (), None),
+}
 
 
 class MockMDAEvents:
@@ -352,6 +377,9 @@ class MockMDAEvents:
 
 class MockMDA:
     events = MockMDAEvents()
+
+    def is_running(self) -> bool:
+        return False
 
 
 class MockCMMCorePlus:
@@ -381,10 +409,47 @@ class MockCMMCorePlus:
     def getLoadedDevices(self):
         return [*_AXES, *_BY_STAGE]
 
+    def getDeviceType(self, device):
+        return DeviceType.AutoFocusDevice if device in _AXES else DeviceType.StageDevice
+
     def hasProperty(self, label, prop):
-        # No PropertyWidget-backed parameters in the demo (the Demo controls dock
-        # stands in for them), but the refresh flag exists like on real hardware.
-        return prop == "RefreshPropertyValues"
+        # The refresh flag exists like on real hardware; the CRISP axes also answer
+        # for their SimAxis properties so PropertyWidget rows build (the Demo
+        # controls dock still drives Averages / Loop Gain).
+        if prop == "RefreshPropertyValues":
+            return True
+        return label in _AXES and prop in _AXES[label].props
+
+    # --- property metadata (the PropertyWidget API) ------------------------
+    @staticmethod
+    def _spec(label, prop):
+        if label not in _AXES or prop not in _AXES[label].props:
+            raise ValueError(f"No property {prop!r} on {label!r}")
+        return _PROP_SPECS.get(prop, (PropertyType.String, True, (), None))
+
+    def getDevicePropertyNames(self, label):
+        return tuple(_AXES[label].props) if label in _AXES else ()
+
+    def getPropertyType(self, label, prop):
+        return self._spec(label, prop)[0]
+
+    def isPropertyReadOnly(self, label, prop):
+        return self._spec(label, prop)[1]
+
+    def getAllowedPropertyValues(self, label, prop):
+        return self._spec(label, prop)[2]
+
+    def hasPropertyLimits(self, label, prop):
+        return self._spec(label, prop)[3] is not None
+
+    def getPropertyLowerLimit(self, label, prop):
+        return self._spec(label, prop)[3][0]
+
+    def getPropertyUpperLimit(self, label, prop):
+        return self._spec(label, prop)[3][1]
+
+    def isPropertyPreInit(self, label, prop):
+        return False
 
     # --- property access ---------------------------------------------------
     def getProperty(self, label, prop):

@@ -5,21 +5,26 @@ or two straight edges of the CRISP LED patch on a side camera in a worker
 process and holds piezo P by nudging it rarely. This panel
 
 - lets the user draw the edge box across the edge that moves with focus (in the
-  live view) and, optionally, a second edge box across another edge (two edges
-  halve the noise and expose a lateral image shift as a disagreement),
-  calibrates them (**Calibrate**: a piezo sweep around the present P, on a
-  background thread), makes the present edge positions the zero (**Zero here**)
+  live view; ONE edge: a saved second box is kept but never used),
+  calibrates it (**Calibrate**: a piezo sweep around the present P, on a
+  background thread), makes the present edge position the zero (**Zero here**)
   and sets a focus **Offset**;
 - locks and unlocks the loop (**Lock** / **Stop**; it runs until Stop,
   independent of any MDA; Lock with no valid calibration calibrates first);
 - runs the camera: SDK folder, Preview (which streams into the full-resolution
-  :class:`~CRISPy.spot.live_view.SpotLiveView`, docked above the
-  controls or popped out into its own window), exposure, gain,
-  channel and ROI, all applied live;
+  :class:`~CRISPy.spot.live_view.SpotLiveView`, docked in the panel's layout or
+  popped out into its own window), exposure, gain, channel and ROI, all applied
+  live;
 - shows a strip chart of the focus error and the commanded piezo over the last
   five minutes, and move statistics;
 - lights the CRISP LED (LED button, live LED %; Preview turns it on) and edits the
   loop parameters.
+
+The panel is one plain column: control row, offset / tracking error, ONE message
+line (:func:`CRISPy.piezo_status.message`), the live image, toolbar rows, the frame
+statistics and four section buttons (Camera, Calibration settings, Diagnostics,
+Advanced; one open at a time). A host puts the status words above it from
+:meth:`SpotFocusPanel.status_inputs` (re-read on ``statusChanged``).
 
 Everything is written to the settings store's ``spot_focus`` settings
 (:mod:`~CRISPy.spot.store`). The service is created
@@ -60,21 +65,20 @@ from qtpy.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QSpinBox,
-    QSplitter,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
+from .. import piezo_status
 from .live_view import SpotLiveView
 from .spot_focus import (
     EDGE_DETECTOR_LABELS,
@@ -119,8 +123,12 @@ DEFAULT_LED_PCT = 50.0
 _NO_CRISP = "no CRISP device (no CRISP label)"
 #: Smallest height of the docked live view, px.
 _VIEW_MIN_H = 240
-#: Initial splitter sizes (live view, controls), a ratio before the first layout.
-_SPLIT_SIZES = (380, 420)
+#: Frame statistics line before the first frame.
+_FRAME_STATS_IDLE = "Frame rate: -   Maximum: -   Saturated pixels: -"
+#: Telemetry readouts that are not shown (two-edge only, or the tracking error).
+_HIDDEN_READOUTS = frozenset({"edge2", "disagreement", "error"})
+#: Loop parameters that are not shown (two-edge only); the spin stays for load / save.
+_HIDDEN_PARAMS = frozenset({"max_edge_disagreement_um"})
 
 # (settings field, label, min, max, step, decimals, suffix, tooltip)
 _PARAMS: tuple[tuple[str, str, float, float, float, int, str, str], ...] = (
@@ -492,10 +500,21 @@ class SpotFocusPanel(QWidget):
     lock_active : bool
         ``True`` while the lock is starting, running, calibrating or zeroing (the
         host must not poll the Tiger then). :attr:`lockActiveChanged` fires when it changes.
+    control_extra_layout : QHBoxLayout
+        An empty layout in its own row directly under the control row (Calibrate,
+        Zero here ... Lock, Stop): the host adds the Joystick checkbox here.
+    message_label : QLabel
+        The one contextual line (plain text, from :func:`piezo_status.message`).
+    tracking_error_label : QLabel
+        The tracking error ("+0.012 µm" while locked, else "Not available").
     """
 
     #: Emitted with the new :attr:`lock_active` value when it changes.
     lockActiveChanged = Signal(bool)
+    #: Emitted by :meth:`_refresh_status` after it updated :attr:`message_label` and
+    #: :attr:`tracking_error_label`: some input of :meth:`status_inputs` may have
+    #: changed, so a host showing the status words should re-read them.
+    statusChanged = Signal()
     lock_active: bool = False
 
     def __init__(
@@ -522,7 +541,22 @@ class SpotFocusPanel(QWidget):
         self._cal: FocusCalibration | None = None
         self._cal_message = ""  # why there is no calibration (old file, ...)
         self._edge_box: tuple[int, int, int, int] | None = None
+        # The UI has ONE edge. A saved ``edge_box_2`` stays in the store untouched but
+        # is never read here, so this stays ``None``.
         self._edge_box2: tuple[int, int, int, int] | None = None
+        # -- status inputs (see status_inputs / _refresh_status) ------------
+        self._fault_reason = ""
+        self._start_error = ""
+        self._calibrate_error = ""
+        self._zero_error = ""
+        self._stop_error = ""
+        self._camera_error = ""
+        self._led_error = ""
+        self._notice = ""  # a hint without a status field (shown when no error is)
+        self._camera_missing = False
+        self._crisp_present: bool | None = None  # None: not known yet
+        self._mda_running = False  # cached by the 1 s tick
+        self._tracking_error_um: float | None = None
 
         # -- controls ------------------------------------------------------
         self.calibrate_button = QPushButton("Calibrate")
@@ -540,15 +574,15 @@ class SpotFocusPanel(QWidget):
         self.start_button.clicked.connect(self.start)
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self.stop)
-        buttons = QHBoxLayout()
-        for b in (
-            self.calibrate_button,
-            self.zero_button,
-            self.start_button,
-            self.stop_button,
-        ):
-            buttons.addWidget(b)
-        buttons.addStretch()
+        #: An empty layout in its own row under the control row: the host puts the
+        #: Joystick checkbox in it.
+        self.control_extra_layout = QHBoxLayout()
+        control_row = QHBoxLayout()
+        control_row.addWidget(self.calibrate_button)
+        control_row.addWidget(self.zero_button)
+        control_row.addStretch()
+        control_row.addWidget(self.start_button)
+        control_row.addWidget(self.stop_button)
 
         self.offset_spin = self._spin(
             -5.0,
@@ -559,13 +593,26 @@ class SpotFocusPanel(QWidget):
             "Hold the focus this far from the zero (µm of P; applies at once)",
         )
         self.offset_spin.valueChanged.connect(lambda v: self._set_param("offset_um", v))
+        #: "+0.012 µm" while the lock runs, else "Not available" (kept by
+        #: :meth:`_refresh_status`).
+        self.tracking_error_label = QLabel(piezo_status.NOT_AVAILABLE)
+        self.tracking_error_label.setTextFormat(Qt.TextFormat.PlainText)
         offset_row = QHBoxLayout()
-        offset_row.addWidget(QLabel("Offset (µm)"))
+        offset_row.addWidget(QLabel("Offset"))
         offset_row.addWidget(self.offset_spin)
         offset_row.addStretch()
+        offset_row.addWidget(QLabel("Tracking error:"))
+        offset_row.addWidget(self.tracking_error_label)
 
-        # -- edge box and sweep --------------------------------------------
-        self.draw_edge_button = QPushButton("Draw edge box")
+        #: The ONE contextual line (:func:`piezo_status.message`), plain text.
+        self.message_label = QLabel()
+        self.message_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.message_label.setWordWrap(True)
+
+        # -- edge box -------------------------------------------------------
+        # The Draw edge button is this mirror of the view's: it also starts the
+        # preview when needed. The view's own button stays hidden.
+        self.draw_edge_button = QPushButton("Draw edge")
         self.draw_edge_button.setCheckable(True)
         self.draw_edge_button.setToolTip(
             "Drag a rectangle in the Spot camera window across the edge of the LED "
@@ -574,29 +621,21 @@ class SpotFocusPanel(QWidget):
         self.draw_edge_button.toggled.connect(self._toggle_draw_edge)
         self.edge_box_label = QLabel()
         self.edge_box_label.setTextFormat(Qt.TextFormat.PlainText)
-        edge_row = QHBoxLayout()
-        edge_row.addWidget(self.draw_edge_button)
-        edge_row.addWidget(QLabel("x, y, w, h"))
-        edge_row.addWidget(self.edge_box_label, 1)
 
-        self.draw_edge2_button = QPushButton("Draw edge box 2")
+        # Second edge: not part of this UI. The widgets exist (hidden, unconnected
+        # to anything that writes) until the dead code is removed.
+        self.draw_edge2_button = QPushButton("Draw edge box 2", self)
         self.draw_edge2_button.setCheckable(True)
-        self.draw_edge2_button.setToolTip(
-            "Optional second edge (for example the left edge when box 1 is the top "
-            "edge): the two are fused, and a lateral image shift shows as a "
-            "disagreement"
-        )
         self.draw_edge2_button.toggled.connect(self._toggle_draw_edge2)
-        self.clear_edge2_button = QPushButton("Clear box 2")
-        self.clear_edge2_button.setToolTip("Go back to a single edge")
-        self.clear_edge2_button.clicked.connect(lambda: self.set_edge_box2(None))
-        self.edge_box2_label = QLabel()
+        self.clear_edge2_button = QPushButton("Clear box 2", self)
+        self.edge_box2_label = QLabel(self)
         self.edge_box2_label.setTextFormat(Qt.TextFormat.PlainText)
-        edge2_row = QHBoxLayout()
-        edge2_row.addWidget(self.draw_edge2_button)
-        edge2_row.addWidget(self.clear_edge2_button)
-        edge2_row.addWidget(QLabel("x, y, w, h"))
-        edge2_row.addWidget(self.edge_box2_label, 1)
+        for w in (
+            self.draw_edge2_button,
+            self.clear_edge2_button,
+            self.edge_box2_label,
+        ):
+            w.hide()
 
         self.span_spin = self._spin(
             0.2, 20.0, 0.5, 2, " µm", "Total piezo travel of the calibration sweep"
@@ -618,25 +657,15 @@ class SpotFocusPanel(QWidget):
         self.frames_spin.valueChanged.connect(
             lambda v: self._set_sweep("sweep_frames", int(v))
         )
-        sweep_row = QHBoxLayout()
-        sweep_row.addWidget(QLabel("Span"))
-        sweep_row.addWidget(self.span_spin)
-        sweep_row.addWidget(QLabel("Steps"))
-        sweep_row.addWidget(self.steps_spin)
-        sweep_row.addWidget(QLabel("Frames / step"))
-        sweep_row.addWidget(self.frames_spin)
-        sweep_row.addStretch()
-        edge_group = QGroupBox("Edge box and calibration sweep")
-        edge_lay = QVBoxLayout(edge_group)
-        edge_lay.addLayout(edge_row)
-        edge_lay.addLayout(edge2_row)
-        edge_lay.addLayout(sweep_row)
 
-        self.state_label = QLabel()
+        # Old status widgets: no longer placed (message_label replaces them). They
+        # stay hidden children so code that still sets them works.
+        self.state_label = QLabel(self)
         self.state_label.setTextFormat(Qt.TextFormat.RichText)
-        self.fault_label = QLabel()
+        self.fault_label = QLabel(self)
         self.fault_label.setTextFormat(Qt.TextFormat.RichText)
-        self.fault_label.setWordWrap(True)
+        self.state_label.hide()
+        self.fault_label.hide()
         self.calibration_label = QLabel()
         self.calibration_label.setTextFormat(Qt.TextFormat.RichText)
         self.calibration_label.setWordWrap(True)
@@ -655,16 +684,23 @@ class SpotFocusPanel(QWidget):
             self._on_view_closed, Qt.ConnectionType.QueuedConnection
         )
         self.live_view.statsChanged.connect(self._on_view_stats)
+        self.live_view.staleChanged.connect(lambda _: self._refresh_status())
         self.live_view.setMinimumHeight(_VIEW_MIN_H)
+        # Takes the spare height (a tall window gives a bigger image); the sizeHint
+        # is modest, so a short window scrolls in the host instead.
+        self.live_view.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         self.live_view.set_polling(False)  # Preview turns it on
 
         # -- readouts ------------------------------------------------------
         self.readout_labels: dict[str, QLabel] = {}
         readouts = QFormLayout()
+        readouts.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         for key, text in (
             ("moves", "Moves / min"),
             ("move_ms", "Move time (mean / max)"),
-            ("edge", "Edge 1 (px)"),
+            ("edge", "Edge (px)"),
             ("edge2", "Edge 2 (px)"),
             ("contrast", "Contrast"),
             ("fps", "Frame rate"),
@@ -675,7 +711,11 @@ class SpotFocusPanel(QWidget):
             if key in ("edge", "edge2"):
                 label.setTextFormat(Qt.TextFormat.RichText)  # coloured noise
             self.readout_labels[key] = label
-            readouts.addRow(text, label)
+            if key in _HIDDEN_READOUTS:
+                label.setParent(self)  # not a row: see _on_telemetry
+                label.hide()
+            else:
+                readouts.addRow(text, label)
         self.note_label = QLabel()
         self.note_label.setTextFormat(Qt.TextFormat.RichText)
         self.note_label.setWordWrap(True)
@@ -683,48 +723,123 @@ class SpotFocusPanel(QWidget):
         # -- parameters ----------------------------------------------------
         self.param_spins: dict[str, QDoubleSpinBox] = {"offset_um": self.offset_spin}
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
         for field, label, lo, hi, step, decimals, suffix, tip in _PARAMS:
             spin = self._spin(lo, hi, step, decimals, suffix, tip)
             spin.valueChanged.connect(lambda v, f=field: self._set_param(f, v))
             self.param_spins[field] = spin
-            form.addRow(label, spin)
-        params_group = QGroupBox("Parameters")
-        params_group.setLayout(form)
-        camera_group = self._build_camera_group()
+            if field in _HIDDEN_PARAMS:
+                # Two-edge only. Kept so load / save leaves the setting unchanged.
+                spin.setParent(self)
+                spin.hide()
+            else:
+                form.addRow(label, spin)
+
+        # -- sections ------------------------------------------------------
+        camera_page = self._build_camera_page()
+        calibration_page = self._build_calibration_page()
+        diagnostics_page = QWidget()
+        diag_lay = QVBoxLayout(diagnostics_page)
+        diag_lay.setContentsMargins(0, 0, 0, 0)
+        diag_lay.addWidget(self.chart, 1)
+        diag_lay.addLayout(readouts)
+        diag_lay.addWidget(self.note_label)
+        diag_lay.addWidget(self.live_view.cursor_label)
+        diag_lay.addWidget(self.live_view.status_label)
+        self.live_view.cursor_label.show()
+        self.live_view.status_label.show()
+        advanced_page = QWidget()
+        adv_lay = QVBoxLayout(advanced_page)
+        adv_lay.setContentsMargins(0, 0, 0, 0)
+        adv_lay.addLayout(form)
+
+        #: Section name -> its checkable button / its content widget. One page is
+        #: visible at a time (all closed at start).
+        self.section_buttons: dict[str, QPushButton] = {}
+        self.section_pages: dict[str, QWidget] = {}
+        section_row = QHBoxLayout()
+        for name, title, page in (
+            ("camera", "Camera", camera_page),
+            ("calibration", "Calibration settings", calibration_page),
+            ("diagnostics", "Diagnostics", diagnostics_page),
+            ("advanced", "Advanced", advanced_page),
+        ):
+            button = QPushButton(title)
+            button.setCheckable(True)
+            button.toggled.connect(lambda on, n=name: self._on_section_toggled(n, on))
+            page.hide()
+            self.section_buttons[name] = button
+            self.section_pages[name] = page
+            section_row.addWidget(button)
+
+        # -- toolbar rows under the image -----------------------------------
+        self.preview_button = QPushButton("Preview")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setToolTip(
+            "Stream the camera into the Spot camera view (full resolution)"
+        )
+        self.preview_button.clicked.connect(self.set_preview)
+        self.pop_out_button = QPushButton("Pop out")
+        self.pop_out_button.setCheckable(True)
+        self.pop_out_button.setToolTip(
+            "Float the Spot camera view as its own window; click again (or close "
+            "the window) to dock it back above the controls"
+        )
+        self.pop_out_button.toggled.connect(self.set_view_floating)
+        self.frame_stats_label = QLabel(_FRAME_STATS_IDLE)
+        self.frame_stats_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.frame_stats_label.setWordWrap(True)
+        self.camera_readout = QLabel("-", self)  # old readout: hidden, kept for PR2
+        self.camera_readout.hide()
+        view = self.live_view
+        # A docked child, not the window it was created as. The flags are explicit:
+        # setParent(parent) alone does nothing when the parent is unchanged.
+        view.setParent(self, Qt.WindowType.Widget)
+        self.display_settings_button = QPushButton("Display settings")
+        self.display_settings_button.setToolTip(
+            "Auto levels, Bayer to grey and the zoom of the image"
+        )
+        self._display_menu = self._build_display_menu()
+        self.display_settings_button.setMenu(self._display_menu)
+        for w in (view.fit_button, view.one_to_one_button, view.draw_roi_button):
+            w.show()
+        toolbar1 = QHBoxLayout()
+        toolbar1.addWidget(self.preview_button)
+        toolbar1.addWidget(view.fit_button)
+        toolbar1.addWidget(view.one_to_one_button)
+        toolbar1.addWidget(self.pop_out_button)
+        toolbar1.addStretch()
+        toolbar2 = QHBoxLayout()
+        toolbar2.addWidget(QLabel("Image region:"))
+        toolbar2.addWidget(view.draw_roi_button)
+        toolbar2.addWidget(self.full_frame_button)
+        toolbar2.addStretch()
+        toolbar3 = QHBoxLayout()
+        toolbar3.addWidget(QLabel("Tracking edge:"))
+        toolbar3.addWidget(self.draw_edge_button)
+        toolbar3.addStretch()
+        toolbar3.addWidget(self.display_settings_button)
 
         # -- layout --------------------------------------------------------
-        box = QGroupBox("Spot focus lock")
-        layout = QVBoxLayout(box)
-        layout.addLayout(buttons)
-        layout.addLayout(offset_row)
-        layout.addWidget(self.state_label)
-        layout.addWidget(self.fault_label)
-        layout.addWidget(self.calibration_label)
-        layout.addWidget(edge_group)
-        layout.addWidget(camera_group)
-        layout.addWidget(self.chart, 1)
-        layout.addLayout(readouts)
-        layout.addWidget(self.note_label)
-        layout.addWidget(params_group)
-        # The live view sits above the controls and does not scroll with them.
-        controls = QScrollArea()
-        controls.setFrameShape(QFrame.Shape.NoFrame)
-        controls.setWidgetResizable(True)
-        controls.setWidget(box)
-        self.splitter = QSplitter(Qt.Orientation.Vertical)
-        self.splitter.setChildrenCollapsible(False)
-        self.splitter.addWidget(self.live_view)  # re-parents it: docked
-        self.splitter.addWidget(controls)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes(list(_SPLIT_SIZES))
         self._view_index = 0  # where the view goes back to
-        self._split_sizes = list(_SPLIT_SIZES)
         self._float_size = QSize(900, 700)  # the popped-out window's size
         self._float_hidden = False  # the floating view is hidden with the panel
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self.splitter)
+        outer.addLayout(control_row)
+        outer.addLayout(self.control_extra_layout)
+        outer.addLayout(offset_row)
+        outer.addWidget(self.message_label)
+        outer.addWidget(view, 1)  # re-parents it: docked
+        view.show()  # setParent hid it
+        outer.addLayout(toolbar1)
+        outer.addLayout(toolbar2)
+        outer.addLayout(toolbar3)
+        outer.addWidget(self.frame_stats_label)
+        outer.addLayout(section_row)
+        for page in self.section_pages.values():
+            outer.addWidget(page)
+        self._outer = outer
 
         # -- timers, relay -------------------------------------------------
         self._flush_timer = QTimer(self)
@@ -761,8 +876,8 @@ class SpotFocusPanel(QWidget):
         self._set_state("idle")
         self.refresh()
 
-    def _build_camera_group(self) -> QGroupBox:
-        """The Camera section: SDK folder, Preview, exposure/gain/channel, ROI."""
+    def _build_camera_page(self) -> QWidget:
+        """The Camera section: SDK folder, exposure/gain/channel, ROI, LED."""
         self.sdk_edit = QLineEdit()
         self.sdk_edit.setPlaceholderText("folder holding the vendor's toupcam.py")
         self.sdk_edit.setToolTip(
@@ -780,25 +895,6 @@ class SpotFocusPanel(QWidget):
         self.camera_label.setTextFormat(Qt.TextFormat.PlainText)
         self.camera_label.setWordWrap(True)
 
-        self.preview_button = QPushButton("Preview")
-        self.preview_button.setCheckable(True)
-        self.preview_button.setToolTip(
-            "Stream the camera into the Spot camera view (full resolution)"
-        )
-        self.preview_button.clicked.connect(self.set_preview)
-        self.pop_out_button = QPushButton("Pop out")
-        self.pop_out_button.setCheckable(True)
-        self.pop_out_button.setToolTip(
-            "Float the Spot camera view as its own window; click again (or close "
-            "the window) to dock it back above the controls"
-        )
-        self.pop_out_button.toggled.connect(self.set_view_floating)
-        self.camera_readout = QLabel("-")
-        preview_row = QHBoxLayout()
-        preview_row.addWidget(self.preview_button)
-        preview_row.addWidget(self.pop_out_button)
-        preview_row.addWidget(self.camera_readout, 1)
-
         self.led_button = QPushButton("LED")
         self.led_button.setCheckable(True)
         self.led_button.setToolTip(
@@ -810,13 +906,10 @@ class SpotFocusPanel(QWidget):
             0.0, 100.0, 1.0, 0, " %", "CRISP LED intensity (applies at once)"
         )
         self.led_spin.valueChanged.connect(self._set_led)
-        self.crisp_readout = QLabel("CRISP: -")
+        # Old CRISP text readout: hidden (the message line reports problems).
+        self.crisp_readout = QLabel("CRISP: -", self)
         self.crisp_readout.setTextFormat(Qt.TextFormat.PlainText)
-        led_row = QHBoxLayout()
-        led_row.addWidget(self.led_button)
-        led_row.addWidget(QLabel("LED %"))
-        led_row.addWidget(self.led_spin)
-        led_row.addWidget(self.crisp_readout, 1)
+        self.crisp_readout.hide()
 
         self.exposure_spin = self._spin(
             0.1, 15000.0, 1.0, 2, " ms", "Camera exposure (applies at once)"
@@ -837,6 +930,55 @@ class SpotFocusPanel(QWidget):
         )
         self.channel_combo.currentTextChanged.connect(self._set_channel)
 
+        self.roi_spins: dict[str, QSpinBox] = {}
+        for name in ("x", "y", "w", "h"):
+            spin = QSpinBox()
+            spin.setRange(0, 16384)
+            spin.setSingleStep(2)
+            spin.setKeyboardTracking(False)
+            spin.setToolTip(f"ROI {name} in sensor pixels (even); 0 width = full frame")
+            self.roi_spins[name] = spin
+        self.apply_roi_button = QPushButton("Apply ROI")
+        self.apply_roi_button.clicked.connect(self.apply_roi)
+        # Placed in the toolbar under the image, not in this section.
+        self.full_frame_button = QPushButton("Full frame")
+        self.full_frame_button.clicked.connect(self.full_frame)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Exposure"), 0, 0)
+        grid.addWidget(self.exposure_spin, 0, 1)
+        grid.addWidget(QLabel("Gain"), 0, 2)
+        grid.addWidget(self.gain_spin, 0, 3)
+        grid.addWidget(QLabel("Channel"), 1, 0)
+        grid.addWidget(self.channel_combo, 1, 1)
+        grid.addWidget(self.led_button, 2, 0)
+        grid.addWidget(self.led_spin, 2, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        roi_grid = QGridLayout()
+        for i, (name, spin) in enumerate(self.roi_spins.items()):
+            roi_grid.addWidget(QLabel(name), i // 2, (i % 2) * 2)
+            roi_grid.addWidget(spin, i // 2, (i % 2) * 2 + 1)
+        roi_grid.setColumnStretch(1, 1)
+        roi_grid.setColumnStretch(3, 1)
+        roi_buttons = QHBoxLayout()
+        roi_buttons.addWidget(self.apply_roi_button)
+        roi_buttons.addStretch()
+
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(QLabel("SDK folder"))
+        lay.addLayout(sdk_row)
+        lay.addWidget(self.camera_label)
+        lay.addLayout(grid)
+        lay.addWidget(QLabel("ROI (sensor pixels)"))
+        lay.addLayout(roi_grid)
+        lay.addLayout(roi_buttons)
+        return page
+
+    def _build_calibration_page(self) -> QWidget:
+        """The Calibration settings section: sweep, edge detector, box, summary."""
         self.detector_combo = QComboBox()
         for name in EDGE_DETECTORS:
             self.detector_combo.addItem(EDGE_DETECTOR_LABELS[name], name)
@@ -860,51 +1002,59 @@ class SpotFocusPanel(QWidget):
         )
         self.detector_sigma_spin.valueChanged.connect(self._set_detector_sigma)
 
-        self.roi_spins: dict[str, QSpinBox] = {}
-        roi_row = QHBoxLayout()
-        for name in ("x", "y", "w", "h"):
-            spin = QSpinBox()
-            spin.setRange(0, 16384)
-            spin.setSingleStep(2)
-            spin.setKeyboardTracking(False)
-            spin.setToolTip(f"ROI {name} in sensor pixels (even); 0 width = full frame")
-            self.roi_spins[name] = spin
-            roi_row.addWidget(QLabel(name))
-            roi_row.addWidget(spin)
-        self.apply_roi_button = QPushButton("Apply ROI")
-        self.apply_roi_button.clicked.connect(self.apply_roi)
-        self.full_frame_button = QPushButton("Full frame")
-        self.full_frame_button.clicked.connect(self.full_frame)
-        roi_buttons = QHBoxLayout()
-        roi_buttons.addWidget(self.apply_roi_button)
-        roi_buttons.addWidget(self.full_frame_button)
-        roi_buttons.addStretch()
-
         grid = QGridLayout()
-        grid.addWidget(QLabel("Exposure"), 0, 0)
-        grid.addWidget(self.exposure_spin, 0, 1)
-        grid.addWidget(QLabel("Gain"), 0, 2)
-        grid.addWidget(self.gain_spin, 0, 3)
-        grid.addWidget(QLabel("Channel"), 0, 4)
-        grid.addWidget(self.channel_combo, 0, 5)
-        grid.addWidget(QLabel("Edge detector"), 1, 0)
-        grid.addWidget(self.detector_combo, 1, 1, 1, 2)
-        grid.addWidget(QLabel("Detector width"), 1, 3)
-        grid.addWidget(self.detector_sigma_spin, 1, 4)
-        grid.setColumnStretch(6, 1)
+        grid.addWidget(QLabel("Span"), 0, 0)
+        grid.addWidget(self.span_spin, 0, 1)
+        grid.addWidget(QLabel("Steps"), 0, 2)
+        grid.addWidget(self.steps_spin, 0, 3)
+        grid.addWidget(QLabel("Frames per step"), 1, 0)
+        grid.addWidget(self.frames_spin, 1, 1)
+        grid.addWidget(QLabel("Edge detector"), 2, 0)
+        grid.addWidget(self.detector_combo, 2, 1)
+        grid.addWidget(QLabel("Detector width"), 3, 0)
+        grid.addWidget(self.detector_sigma_spin, 3, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        box_row = QHBoxLayout()
+        box_row.addWidget(QLabel("Edge box (x, y, w, h)"))
+        box_row.addWidget(self.edge_box_label, 1)
 
-        group = QGroupBox("Camera")
-        lay = QVBoxLayout(group)
-        lay.addWidget(QLabel("SDK folder"))
-        lay.addLayout(sdk_row)
-        lay.addWidget(self.camera_label)
-        lay.addLayout(preview_row)
-        lay.addLayout(led_row)
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.addLayout(grid)
-        lay.addWidget(QLabel("ROI (sensor pixels)"))
-        lay.addLayout(roi_row)
-        lay.addLayout(roi_buttons)
-        return group
+        lay.addLayout(box_row)
+        lay.addWidget(self.calibration_label)
+        return page
+
+    def _build_display_menu(self) -> QMenu:
+        """The Display settings popup: Auto levels, Bayer to grey, zoom %."""
+        view = self.live_view
+        menu = QMenu(self)
+        # The view created these hidden; show them first (the menu sizes a widget
+        # action from the widget as it is when the action is added).
+        for w in (view.auto_levels, view.bayer_grey):
+            w.show()
+            action = QWidgetAction(menu)
+            action.setDefaultWidget(w)
+            menu.addAction(action)
+        zoom_row = QWidget()
+        zoom_lay = QHBoxLayout(zoom_row)
+        zoom_lay.addWidget(QLabel("Zoom"))
+        view.zoom_label.show()
+        zoom_lay.addWidget(view.zoom_label)
+        zoom_action = QWidgetAction(menu)
+        zoom_action.setDefaultWidget(zoom_row)
+        menu.addAction(zoom_action)
+        return menu
+
+    def _on_section_toggled(self, name: str, on: bool) -> None:
+        """Open one section (closing the others) or close the open one."""
+        if on:
+            for other, button in self.section_buttons.items():
+                if other != name and button.isChecked():
+                    button.setChecked(False)  # re-enters here with on=False
+        self.section_pages[name].setVisible(on)
 
     @staticmethod
     def _spin(
@@ -964,18 +1114,23 @@ class SpotFocusPanel(QWidget):
 
     @staticmethod
     def _drawn_boxes(cfg: Any) -> list[tuple[int, int, int, int]]:
-        """The saved edge boxes in calibration order; none without box 1."""
-        if cfg.edge_box is None:
-            return []
-        boxes = [cfg.edge_box]
-        if cfg.edge_box_2 is not None:
-            boxes.append(cfg.edge_box_2)
-        return boxes
+        """The saved edge box as a list; none without box 1.
+
+        Only ONE edge is used: a saved ``edge_box_2`` stays in the store but is never
+        passed on.
+        """
+        return [] if cfg.edge_box is None else [cfg.edge_box]
+
+    @staticmethod
+    def _single_edge(cal: FocusCalibration | None) -> FocusCalibration | None:
+        """*cal* if it was made with exactly one edge, else ``None`` (a two-edge one)."""
+        return cal if cal is not None and len(cal.edges) == 1 else None
 
     def _send_preview_state(self, svc: SpotFocusService | None = None) -> None:
         """Tell the worker the saved calibration and edge boxes.
 
-        With both, the preview measures the boxes and shows the fused error.
+        The preview measures the one box and shows its error. A calibration made with
+        two edges is not sent (the UI is single-edge).
         """
         if svc is None:
             svc = self.service
@@ -983,7 +1138,7 @@ class SpotFocusPanel(QWidget):
             return
         cfg = get_settings_store().settings
         try:
-            svc.set_calibration(cfg.calibration_status()[0])
+            svc.set_calibration(self._single_edge(cfg.calibration_status()[0]))
             svc.set_edge_boxes(self._drawn_boxes(cfg))
         except Exception:
             logger.warning("spot focus set_edge_boxes failed", exc_info=True)
@@ -1047,21 +1202,17 @@ class SpotFocusPanel(QWidget):
         if self._cal is None and not cfg.calibration:
             self._cal_message = ""
         self._edge_box = cfg.edge_box
-        self._edge_box2 = cfg.edge_box_2
         self.live_view.set_edge_box(self._edge_box)
-        self.live_view.set_edge_box2(self._edge_box2)
+        self.live_view.set_edge_box2(None)  # one edge only; the saved box 2 is kept
         self._show_edge_box_text()
         self._place_zero_marker()
         self._refresh_calibration()
         self._update_enabled()
 
     def _show_edge_box_text(self) -> None:
-        box, box2 = self._edge_box, self._edge_box2
+        box = self._edge_box
         self.edge_box_label.setText(
             "none" if box is None else ", ".join(str(int(v)) for v in box)
-        )
-        self.edge_box2_label.setText(
-            "none (optional)" if box2 is None else ", ".join(str(int(v)) for v in box2)
         )
 
     @staticmethod
@@ -1080,9 +1231,7 @@ class SpotFocusPanel(QWidget):
             self.live_view.set_secondary_setpoint(None)
             return
         self.live_view.set_setpoint(self._zero_point(cal.edges[0]))
-        self.live_view.set_secondary_setpoint(
-            self._zero_point(cal.edges[1]) if len(cal.edges) > 1 else None
-        )
+        self.live_view.set_secondary_setpoint(None)  # one edge only
 
     def _refresh_calibration(self) -> None:
         cal = self._cal
@@ -1090,7 +1239,9 @@ class SpotFocusPanel(QWidget):
             self.calibration_label.setText(
                 _colored(self._cal_message or "not calibrated", ATTENTION_COLOR)
             )
+            self._refresh_status()
             return
+        # One edge only: a calibration made with more shows edge 1 and is stale.
         lines = [
             html.escape(
                 f"edge {i} axis {e.axis} | {e.slope_px_per_um:+.2f} px/µm | "
@@ -1099,7 +1250,7 @@ class SpotFocusPanel(QWidget):
             + _colored(
                 f"noise {edge_noise_um(e):.3f} µm", noise_color(edge_noise_um(e))
             )
-            for i, e in enumerate(cal.edges, 1)
+            for i, e in enumerate(cal.edges[:1], 1)
         ]
         detectors = "/".join(dict.fromkeys(detector_text(e) for e in cal.edges))
         lines.append(
@@ -1109,29 +1260,34 @@ class SpotFocusPanel(QWidget):
             )
         )
         text = "<br>".join(lines)
-        notes = list(cal.warnings)
+        notes = list(cal.warnings) if len(cal.edges) == 1 else []
         if why := self._mismatch_text():
             notes.insert(0, why)
-        notes.extend(box_warnings(cal))
-        drawn = [snap_box(b) for b in self._drawn_boxes_now()]
-        if drawn and drawn != [tuple(b) for b in cal.boxes]:
-            notes.append(
-                "edge boxes changed since the calibration; recalibrate"
-                if len(drawn) > 1 or len(cal.edges) > 1
-                else "edge box changed since the calibration; recalibrate"
-            )
+        notes.extend(w for w in box_warnings(cal) if w.startswith("box 1 "))
+        if self._box_changed():
+            notes.append(piezo_status.BOX_CHANGED_TEXT)
         if notes:
             text += "<br>" + _colored("; ".join(notes), ATTENTION_COLOR)
         self.calibration_label.setText(text)
+        self._refresh_status()
 
     def _drawn_boxes_now(self) -> list[tuple[int, int, int, int]]:
-        """The boxes drawn now (box 1, then box 2 if any); none without box 1."""
-        if self._edge_box is None:
-            return []
-        boxes = [self._edge_box]
-        if self._edge_box2 is not None:
-            boxes.append(self._edge_box2)
-        return boxes
+        """The box drawn now as a list (one edge only); none without a box."""
+        return [] if self._edge_box is None else [self._edge_box]
+
+    def _box_changed(self) -> bool:
+        """The calibration no longer fits the drawn box.
+
+        True when the drawn (snapped) box differs from the calibration's, and for any
+        calibration made with other than exactly one edge.
+        """
+        cal = self._cal
+        if cal is None:
+            return False
+        if len(cal.edges) != 1:
+            return True
+        drawn = [snap_box(b) for b in self._drawn_boxes_now()]
+        return bool(drawn) and drawn != [tuple(b) for b in cal.boxes]
 
     def _write(self) -> None:
         self._flush_timer.start()
@@ -1222,17 +1378,17 @@ class SpotFocusPanel(QWidget):
         self.led_button.blockSignals(False)
         if not text:
             self.crisp_readout.setText("CRISP: none")
-            self.fault_label.setText(_colored(_NO_CRISP, ATTENTION_COLOR))
-            return
-        self.crisp_readout.setText(text)
-        if self.fault_label.text() == _colored(_NO_CRISP, ATTENTION_COLOR):
-            self.fault_label.setText("")
+            self._crisp_present = False  # the message line says so (_NO_CRISP)
+        else:
+            self.crisp_readout.setText(text)
+            self._crisp_present = True
+        self._refresh_status()
 
     def _on_led_failed(self, message: str) -> None:
         self.led_button.blockSignals(True)
         self.led_button.setChecked(False)
         self.led_button.blockSignals(False)
-        self.fault_label.setText(_colored(f"LED: {message}", ALERT_COLOR))
+        self._set_problem("_led_error", message)
 
     def _apply_camera(self, **kwargs: Any) -> None:
         """Send a live camera change to the worker (if there is one)."""
@@ -1243,7 +1399,7 @@ class SpotFocusPanel(QWidget):
             svc.set_camera(**kwargs)
         except Exception as err:
             logger.warning("spot focus set_camera failed", exc_info=True)
-            self.fault_label.setText(_colored(f"Camera: {err}", ALERT_COLOR))
+            self._set_problem("_camera_error", str(err))
 
     def _set_exposure(self, value: float) -> None:
         if self._loading:
@@ -1409,9 +1565,7 @@ class SpotFocusPanel(QWidget):
 
     def _on_edge_box_drawn(self, x: int, y: int, w: int, h: int) -> None:
         if self._busy or self.state == "running":
-            self.fault_label.setText(
-                _colored("Stop the lock before moving the edge box.", ATTENTION_COLOR)
-            )
+            self._set_problem("_notice", "Stop the lock before moving the edge box.")
             return
         self.set_edge_box((x, y, w, h))
 
@@ -1427,25 +1581,18 @@ class SpotFocusPanel(QWidget):
         self.live_view.set_edge_box(box)
         self._show_edge_box_text()
         self._refresh_calibration()
-        if self.fault_label.text() and NEED_BOX_TEXT in self.fault_label.text():
-            self.fault_label.setText("")
         self._update_enabled()
         if self.state != "running":
             self._send_preview_state()
 
     def _on_edge_box2_drawn(self, x: int, y: int, w: int, h: int) -> None:
-        if self._busy or self.state == "running":
-            self.fault_label.setText(
-                _colored("Stop the lock before moving the edge box.", ATTENTION_COLOR)
-            )
-            return
-        self.set_edge_box2((x, y, w, h))
+        """Ignored: the UI has one edge (no control can start Draw edge box 2)."""
 
     def set_edge_box2(self, box: tuple[int, int, int, int] | None) -> None:
         """Use *box* ``(x, y, w, h)`` (sensor px) as the second edge box.
 
-        ``None`` clears it (a single edge again). It is saved, drawn on the
-        live view and sent to the worker with the first box.
+        Not used by the UI (one edge only; nothing calls it, because it would
+        overwrite the saved ``edge_box_2``). ``None`` clears it.
         """
         get_settings_store().settings.edge_box_2 = box
         self._write()
@@ -1517,11 +1664,13 @@ class SpotFocusPanel(QWidget):
             "detector_sigma_px": cfg.detector_sigma_px,
         }
         led = self._led_value()
-        self.fault_label.setText("")
+        self._clear_problem(refresh=False)
+        self._camera_missing = False
         self._preview_busy = True
         self.preview_button.setChecked(True)
         self.preview_button.setEnabled(False)
         self.camera_label.setText("opening the camera...")
+        self._refresh_status()
 
         def work() -> SpotFocusService:
             svc = self._ensure_service()
@@ -1559,9 +1708,10 @@ class SpotFocusPanel(QWidget):
             return
         if self.state == "fault":
             self._set_state("idle")
-        self.fault_label.setText(
-            _colored(_NO_CRISP, ATTENTION_COLOR) if svc.crisp_label is None else ""
-        )
+        self._clear_problem(refresh=False)
+        self._camera_missing = False
+        self._crisp_present = svc.crisp_label is not None
+        self._refresh_status()
         self._apply_camera_info(self._camera_info(svc))
         self.live_view.set_service(svc)
         self._show_live_view()
@@ -1571,8 +1721,11 @@ class SpotFocusPanel(QWidget):
         self.preview_button.setEnabled(True)
         self.preview_button.setChecked(False)
         self.camera_label.setText("no camera")
+        self._camera_missing = True
         if self.state != "fault":  # a worker fault already says why
-            self.fault_label.setText(_colored(f"Camera: {message}", ALERT_COLOR))
+            self._set_problem("_camera_error", message)
+        else:
+            self._refresh_status()
         self._owner.dead = True  # build a fresh service on the next Preview
 
     def _stop_preview(self) -> None:
@@ -1581,9 +1734,7 @@ class SpotFocusPanel(QWidget):
         if self.state == "running" or self._busy == "starting":
             # The lock needs the camera: leave it streaming.
             self.preview_button.setChecked(True)
-            self.fault_label.setText(
-                _colored("Preview stays on while the lock runs.", ATTENTION_COLOR)
-            )
+            self._set_problem("_notice", "Preview stays on while the lock runs.")
             return
         self.preview_button.setChecked(False)
         svc = self.service
@@ -1601,6 +1752,7 @@ class SpotFocusPanel(QWidget):
             # space (cleared, not polled) so the layout does not jump.
             self.live_view.hide()
         self.camera_readout.setText("-")
+        self.frame_stats_label.setText(_FRAME_STATS_IDLE)
 
     def _show_live_view(self) -> None:
         """Make the image visible (raise the floating window, or show the view)."""
@@ -1623,7 +1775,7 @@ class SpotFocusPanel(QWidget):
     def set_view_floating(self, floating: bool) -> None:
         """Pop the live view out into its own window, or dock it back.
 
-        Docked (the default) it sits in the splitter above the controls. The
+        Docked (the default) it sits in the panel's layout above the toolbar. The
         scene and zoom are kept either way. The choice is not persisted.
 
         Parameters
@@ -1635,8 +1787,8 @@ class SpotFocusPanel(QWidget):
         floating = bool(floating)
         if floating != view.isWindow():
             if floating:
-                self._split_sizes = self.splitter.sizes()
-                self._view_index = max(self.splitter.indexOf(view), 0)
+                self._view_index = max(self._outer.indexOf(view), 0)
+                self._outer.removeWidget(view)
                 # A window owned by the panel: stays above the app, goes with it.
                 view.setParent(self, Qt.WindowType.Window)
                 view.resize(self._float_size)
@@ -1646,10 +1798,11 @@ class SpotFocusPanel(QWidget):
             else:
                 self._float_size = view.size()
                 self._float_hidden = False
-                self.splitter.insertWidget(self._view_index, view)
+                # Drops the window flag (the layout would not; explicit flags because
+                # setParent(parent) does nothing for an unchanged parent).
+                view.setParent(self, Qt.WindowType.Widget)
+                self._outer.insertWidget(self._view_index, view, 1)
                 view.show()
-                if all(s > 0 for s in self._split_sizes):
-                    self.splitter.setSizes(self._split_sizes)
         self.pop_out_button.blockSignals(True)
         self.pop_out_button.setChecked(floating)
         self.pop_out_button.blockSignals(False)
@@ -1687,6 +1840,10 @@ class SpotFocusPanel(QWidget):
         else:
             sat = html.escape(sat)
         self.camera_readout.setText(f"{fps:.1f} fps | max {max_value} | {sat}")
+        self.frame_stats_label.setText(
+            f"Frame rate: {fps:.0f} fps   Maximum: {max_value}   "
+            f"Saturated pixels: {saturated_pct:.1f} %"
+        )
 
     @staticmethod
     def _camera_info(svc: SpotFocusService) -> dict:
@@ -1699,6 +1856,8 @@ class SpotFocusPanel(QWidget):
 
     def _set_state(self, state: str) -> None:
         self.state = state
+        if state != "running":
+            self._tracking_error_um = None
         alert = state == "fault"
         text = self._busy or state
         self.state_label.setText(
@@ -1715,6 +1874,91 @@ class SpotFocusPanel(QWidget):
             self.lock_active = active
             self.lockActiveChanged.emit(active)
 
+    # ------------------------------------------------------------------
+    # status (the words and the one message line; see CRISPy.piezo_status)
+    # ------------------------------------------------------------------
+
+    _PROBLEM_FIELDS = (
+        "_fault_reason",
+        "_start_error",
+        "_calibrate_error",
+        "_zero_error",
+        "_stop_error",
+        "_camera_error",
+        "_led_error",
+        "_notice",
+    )
+
+    def _clear_problem(self, refresh: bool = True) -> None:
+        """Forget every problem text (what ``fault_label.setText("")`` used to do)."""
+        for field in self._PROBLEM_FIELDS:
+            setattr(self, field, "")
+        if refresh:
+            self._refresh_status()
+
+    def _set_problem(self, field: str, text: str) -> None:
+        """Show *text* as the one problem: it replaces any other, like the old label."""
+        keep = self._fault_reason if self.state == "fault" else ""
+        self._clear_problem(refresh=False)
+        if field != "_fault_reason":
+            # A fault outranks every other text; keep its reason in the message.
+            self._fault_reason = keep
+        setattr(self, field, text)
+        self._refresh_status()
+
+    def _show_derived_hint(self) -> None:
+        """Drop stale problems so the message line shows the derived hint.
+
+        Lock / Calibrate refused (no edge box, detector mismatch): the line says why
+        from the state. A fault is kept (the user acknowledges it with Stop).
+        """
+        if self.state == "fault":
+            self._refresh_status()
+        else:
+            self._clear_problem()
+
+    def status_inputs(self) -> piezo_status.SpotStatusInputs:
+        """The panel's state as plain values for :mod:`CRISPy.piezo_status`."""
+        cal = self._cal
+        return piezo_status.SpotStatusInputs(
+            lock_state=self.state,
+            busy=self._busy,
+            camera_open=self.preview_button.isChecked() or self.state == "running",
+            camera_opening=self._preview_busy,
+            camera_missing=self._camera_missing,
+            camera_error=self._camera_error,
+            crisp_present=self._crisp_present,
+            led_on=self.led_button.isChecked(),
+            led_error=self._led_error,
+            edge_box_set=self._edge_box is not None,
+            calibration_present=cal is not None,
+            detector_mismatch=self._mismatch_text(),
+            box_changed=self._box_changed(),
+            fault_reason=self._fault_reason,
+            start_error=self._start_error,
+            calibrate_error=self._calibrate_error,
+            zero_error=self._zero_error,
+            stop_error=self._stop_error,
+            no_new_frames=self.live_view.no_new_frames,
+            mda_running=self._mda_running,
+            tracking_error_um=self._tracking_error_um,
+        )
+
+    def _refresh_status(self) -> None:
+        """Recompute the message line and tracking error, then emit statusChanged."""
+        inputs = self.status_inputs()
+        # A notice has no status field; a fault outranks it.
+        if self._notice and piezo_status.lock_word(inputs) != piezo_status.LOCK_FAULT:
+            text = self._notice
+        else:
+            text = piezo_status.message(inputs)
+        if self.message_label.text() != text:
+            self.message_label.setText(text)
+        tracking = piezo_status.tracking_error_text(inputs)
+        if self.tracking_error_label.text() != tracking:
+            self.tracking_error_label.setText(tracking)
+        self.statusChanged.emit()
+
     def _update_enabled(self) -> None:
         running = self.state == "running"
         idle = not self._busy and not running
@@ -1728,18 +1972,21 @@ class SpotFocusPanel(QWidget):
         )
         self.stop_button.setEnabled(running or self.state == "fault")
         self.calibrate_button.setEnabled(idle)
-        self.zero_button.setEnabled(idle and self._cal is not None)
+        # Zero re-zeroes the calibration's edges: only a one-edge calibration.
+        self.zero_button.setEnabled(idle and self._single_edge(self._cal) is not None)
         self.draw_edge_button.setEnabled(idle)
-        self.draw_edge2_button.setEnabled(idle)
-        self.clear_edge2_button.setEnabled(idle and self._edge_box2 is not None)
+        self.draw_edge2_button.setEnabled(False)  # one edge only (hidden)
+        self.clear_edge2_button.setEnabled(False)
         if mismatch:
             self.start_button.setToolTip(mismatch)
-        elif self._cal is None:
+        elif self._single_edge(self._cal) is None:
+            # No calibration, or an old two-edge one: Lock sweeps first.
             self.start_button.setToolTip(
                 "Calibrates first (focus on the cells, draw an edge box), then locks"
             )
         else:
             self.start_button.setToolTip("Hold the edge at its zero until Stop")
+        self._refresh_status()
 
     def _on_state(self, state: str) -> None:
         if state == "preview":
@@ -1748,7 +1995,7 @@ class SpotFocusPanel(QWidget):
             self._set_state(state)
 
     def _on_fault(self, reason: str) -> None:
-        self.fault_label.setText(_colored(f"Fault: {reason}", ALERT_COLOR))
+        self._set_problem("_fault_reason", reason)
         if reason == "worker died":
             self._owner.dead = True
         self._set_state("fault")
@@ -1766,13 +2013,14 @@ class SpotFocusPanel(QWidget):
         if self._busy or self.state == "running":
             return
         cfg = get_settings_store().settings
-        cal = cfg.calibration_status()[0]
+        # A calibration made with two edges is not used: calibrate again with one.
+        cal = self._single_edge(cfg.calibration_status()[0])
         boxes = self._drawn_boxes(cfg)
         if cal is None and not boxes:
-            self.fault_label.setText(_colored(NEED_BOX_TEXT, ATTENTION_COLOR))
+            self._show_derived_hint()  # the message line says NEED_BOX_TEXT
             return
-        if why := self._mismatch_text():
-            self.fault_label.setText(_colored(why, ATTENTION_COLOR))
+        if self._mismatch_text():
+            self._show_derived_hint()  # the message line gives the mismatch
             return
         params = cfg.params.to_params()
         sweep = self._sweep_kwargs(cfg)
@@ -1783,7 +2031,7 @@ class SpotFocusPanel(QWidget):
             "detector": cfg.detector,
             "detector_sigma_px": cfg.detector_sigma_px,
         }
-        self.fault_label.setText("")
+        self._clear_problem(refresh=False)
         self._telemetry = None
         self.chart.clear()
         self._busy = "starting"
@@ -1850,20 +2098,21 @@ class SpotFocusPanel(QWidget):
             self.live_view.set_service(svc)
             if self.live_view.polling:  # the view was on: Preview stays checked
                 self.preview_button.setChecked(True)
-        # The service's own state signals may have beaten us here.
-        self._set_state(svc.current_state if svc is not None else "idle")
-        if self.state not in ("running", "fault"):
-            self._set_state("running")
+        # The service's own state signals may have beaten us here. Decide the state
+        # first and set it once: an intermediate "preview"/"idle" would flip
+        # lock_active to False for a moment (and the host would re-enable the wheel).
+        state = svc.current_state if svc is not None else "idle"
+        self._set_state(state if state in ("running", "fault") else "running")
 
     def _on_start_failed(self, message: str) -> None:
         self._busy = ""
-        self.fault_label.setText(_colored(f"Could not start: {message}", ALERT_COLOR))
+        self._set_problem("_start_error", message)
         self._owner.dead = True  # build a fresh service next time
         self._set_state("idle")
 
     def _on_start_refused(self, message: str) -> None:
         self._busy = ""
-        self.fault_label.setText(_colored(message, ATTENTION_COLOR))
+        self._set_problem("_notice", message)
         self._set_state("idle")
 
     def stop(self) -> None:
@@ -1875,11 +2124,11 @@ class SpotFocusPanel(QWidget):
                 self._report_crisp(svc)
             except Exception as err:
                 logger.warning("spot focus stop failed", exc_info=True)
-                self.fault_label.setText(_colored(f"Stop failed: {err}", ALERT_COLOR))
+                self._set_problem("_stop_error", str(err))
         # After a fault the loop is already silent; Stop acknowledges it.
-        self.fault_label.setText(
-            self.fault_label.text() if self.state != "fault" else ""
-        )
+        if self.state == "fault":
+            self._clear_problem(refresh=False)
+        self._notice = ""
         self._set_state("stopped")
         # While locked the worker measured the calibration's boxes: show the drawn
         # ones, with the calibration for the preview error.
@@ -1901,7 +2150,7 @@ class SpotFocusPanel(QWidget):
         cfg = get_settings_store().settings
         boxes = self._drawn_boxes(cfg)
         if not boxes:
-            self.fault_label.setText(_colored(NEED_BOX_TEXT, ATTENTION_COLOR))
+            self._show_derived_hint()  # the message line says NEED_BOX_TEXT
             return
         sweep = self._sweep_kwargs(cfg)
         record = self._record_path()
@@ -1911,7 +2160,7 @@ class SpotFocusPanel(QWidget):
             "detector": cfg.detector,
             "detector_sigma_px": cfg.detector_sigma_px,
         }
-        self.fault_label.setText("")
+        self._clear_problem(refresh=False)
         self._busy = "calibrating"
         self._set_state(self.state)
 
@@ -1933,12 +2182,12 @@ class SpotFocusPanel(QWidget):
     def zero(self) -> None:
         """Make the edge position now the zero, keeping the slope (Zero here)."""
         cal = self._cal
-        if self._busy or self.state == "running" or cal is None:
+        if self._busy or self.state == "running" or self._single_edge(cal) is None:
             return
         cfg = get_settings_store().settings
         exposure, gain, channel = cfg.exposure_ms, cfg.gain, cfg.channel
         roi = cfg.roi or (0, 0, 0, 0)
-        self.fault_label.setText("")
+        self._clear_problem(refresh=False)
         self._busy = "zeroing"
         self._set_state(self.state)
 
@@ -1977,14 +2226,12 @@ class SpotFocusPanel(QWidget):
 
     def _on_calibrate_failed(self, message: str) -> None:
         self._busy = ""
-        self.fault_label.setText(
-            _colored(f"Calibration failed: {message}", ALERT_COLOR)
-        )
+        self._set_problem("_calibrate_error", message)
         self._set_state(self.state)
 
     def _on_zero_failed(self, message: str) -> None:
         self._busy = ""
-        self.fault_label.setText(_colored(f"Zero failed: {message}", ALERT_COLOR))
+        self._set_problem("_zero_error", message)
         self._set_state(self.state)
 
     # ------------------------------------------------------------------
@@ -2002,34 +2249,18 @@ class SpotFocusPanel(QWidget):
                 float(msg["p_cmd_um"]),
             )
         labels = self.readout_labels
-        edges = msg.get("edges") or []
-        edge2 = edges[1] if len(edges) > 1 else None
-        disagreement = msg.get("disagreement_um")
+        # One edge only: edge 2, the disagreement and the held edge are not shown.
         labels["error"].setText("—" if along is None else f"{along:+.3f} µm")
         labels["edge"].setText("-" if edge is None else self._edge_text(0, edge))
-        labels["edge2"].setText(
-            "—"
-            if edge2 is None or edge2.get("edge_px") is None
-            else self._edge_text(1, edge2["edge_px"])
-        )
-        held = msg.get("held_edge")  # 0-based; the panel numbers edges from 1
-        if disagreement is None:
-            labels["disagreement"].setText("—")
-        elif held is None:
-            labels["disagreement"].setText(f"{disagreement:.3f}")
-        else:
-            labels["disagreement"].setText(
-                _colored(
-                    f"{disagreement:.3f} (holding on edge {int(held) + 1})",
-                    ATTENTION_COLOR,
-                )
-            )
-        if edge2 is not None and edge2.get("x") is not None:
-            self.live_view.set_secondary_point(
-                (float(edge2["x"]), float(edge2["y"])), bool(edge2.get("ok", True))
-            )
-        else:
-            self.live_view.set_secondary_point(None)
+        self.live_view.set_secondary_point(None)
+        err = None if along is None else float(along)
+        if err != self._tracking_error_um:
+            self._tracking_error_um = err
+            if (
+                piezo_status.tracking_error_text(self.status_inputs())
+                != self.tracking_error_label.text()
+            ):
+                self._refresh_status()
         note = msg.get("note") or (None if along is not None else msg.get("reason"))
         self.note_label.setText(_colored(str(note), ATTENTION_COLOR) if note else "")
         labels["contrast"].setText("-" if contrast is None else f"{contrast:.0f}")
@@ -2045,6 +2276,12 @@ class SpotFocusPanel(QWidget):
         return f"{text} {_colored(f'(noise {noise:.3f} µm)', noise_color(noise))}"
 
     def _refresh_stats(self) -> None:
+        # Once a second: read the host's MDA flag (not per paint) and re-evaluate.
+        try:
+            self._mda_running = self._mmc.mda.is_running() is True
+        except Exception:
+            self._mda_running = False
+        self._refresh_status()
         svc = self.service
         if svc is None:
             return
