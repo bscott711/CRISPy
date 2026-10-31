@@ -1,6 +1,6 @@
 """The piezo axis widget that carries the spot edge lock.
 
-``PiezoSpotWidget`` replaces ``CrispControlPanel(spot_lock=True)`` for the one piezo
+``PiezoSpotWidget`` replaces the ``CrispControlPanel`` for the one piezo
 that :func:`~CRISPy.spot_choice.choose_spot_index` picks. It shows a header (device
 label, lock word), the four status words, the embedded
 :class:`~CRISPy.spot.panel.SpotFocusPanel` (controls, message line, live image,

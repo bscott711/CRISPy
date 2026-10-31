@@ -12,7 +12,7 @@ from collections.abc import Sequence
 def choose_spot_index(
     actuators: Sequence[tuple[str, str | None]], piezo_override: str | None
 ) -> int | None:
-    """Index of the panel that gets the Spot lock section, or ``None`` for none.
+    """Index of the panel the ``PiezoSpotWidget`` replaces, or ``None`` for none.
 
     Parameters
     ----------

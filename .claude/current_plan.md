@@ -6,8 +6,8 @@ axis (and any non-spot piezo) keeps `CrispControlPanel` unchanged. Function firs
 styling (the user styles later).
 
 ## Status
-- PR 1 (new widget, relayout, single-edge UI, `piezo_status.py` + tests, demo): in review
-- PR 2 (dead-code cleanup of the old spot integration in `ui.py`, `gating.py`, leftovers): NOT started
+- PR 1 (new widget, relayout, single-edge UI, `piezo_status.py` + tests, demo): DONE (merged, PR #5)
+- PR 2 (dead-code cleanup of the old spot integration in `ui.py`, `gating.py`, leftovers): DONE
 - Step 2 (live re-zero while locked, loop pause): NOT started (needs its own design note)
 - Optional removal of the Qt-free two-edge core (`edge_box_2`, fusion): NOT started
 
@@ -24,8 +24,11 @@ styling (the user styles later).
 - Deviations from wireframe v3: Joystick checkbox on its own line under the control row;
   "Display settings" at the right end of the "Tracking edge" row (both to fit 460 px at 100 %).
 
-## PR 2 (approved list A)
+## PR 2 (approved list A, done)
 Delete the `spot_lock=` integration in `ui.py`, `gating.py` spot params and their tests,
 edge-2 code and mirror signals in panel/live_view, hidden leftovers; update
 `run_demo.py`, `docs/spot_focus_lock.md`, `CLAUDE.md`. The stage panel dump must stay identical.
 Keep the Qt-free two-edge core, `edge_box_2` setting, all other tests.
+
+## Follow-up outside this repo
+pymmcore-gui's own tests (`test_spot_live_view`, `test_spot_focus_widget`, `test_crispy_panel_gating`) reference removed CRISPy names (`fault_label`, `EDGE_BOX2_COLOR`, ...); port or delete them there.

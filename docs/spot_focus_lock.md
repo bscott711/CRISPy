@@ -36,10 +36,13 @@ in focus. The method follows Nguyen et al. 2025, Biomed. Opt. Express
 - The **main process** owns the Tiger port. While the lock runs it receives
   move requests and issues `mmc.setPosition(P, target)` with **no wait and no
   readback**. It never polls the Tiger.
-- While the lock is starting, running, calibrating or zeroing, the CRISPy panel
-  pauses its own poll, disables its writing controls (Operation and Calibration
-  buttons, LED, joystick, parameters) and refuses its tools.
-- A config reload rebuilds the CRISPy panel, which stops a running spot lock (the
+- The piezo's spot lock lives in its own widget, `PiezoSpotWidget`
+  (`piezo_ui.py`; its words and messages come from the Qt-free `piezo_status.py`),
+  not in the CRISP control panel. That widget has no poller and no CRISP controls
+  (it owns its LED button), so the lock needs no panel-poll pause or
+  writing-control disable. `gating.py` now covers only the tools, the poll and the
+  MDA.
+- A config reload rebuilds the widget, which stops a running spot lock (the spot
   panel owns the worker and shuts it down when it is destroyed).
 - Moves are rare: a dead band, at most `max_rate_hz` moves per second
   (default 2), and averaging over several frames.
@@ -907,8 +910,7 @@ Files:
   rig-shaped single-edge calibration, the telemetry note, the preview error
   after Calibrate) and its dock action.
 - `test_spot_live_view.py`: the live view (zoom, ROI and edge-box drawing,
-  the second box, the edge2 draw mode, the second cross and ring, overlays,
-  levels).
+  overlays, levels).
 - `test_spot_frame_shm.py`: the shared-memory frame buffer (seqlock, no torn
   frames).
 - `test_spot_tracking.py` covers the separate centroid tracker
@@ -997,8 +999,12 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 
 ### GUI
 
-- **Spot panel** (`spot/panel.py`, hosted by the "Spot Focus
-  Lock" action). A vertical splitter holds the live view on top (docked by
+- **Spot panel** (`spot/panel.py`, `SpotFocusPanel`, embedded in
+  `PiezoSpotWidget`). The UI has ONE edge: the second-edge widgets and overlays
+  described below as "optional second edge" were removed; the two-edge core
+  (`spot_focus*.py`, the `edge_box_2` setting) is unchanged. Parts of the layout
+  below predate the `PiezoSpotWidget` relayout (the view is no longer in a splitter).
+  A vertical splitter holds the live view on top (docked by
   default, minimum height 240 px) and, below it, a scroll area with the
   controls, so the image does not scroll away with them. Top to bottom in the
   controls:
@@ -1015,13 +1021,11 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     tooltip; a box narrower than 4x (`halfmax`) or 2x (`gaussderiv`) the
     measured edge width adds a note "box K is narrow for this edge (...):
     widen it across the edge". A line in
-    the attention colour shows the warnings (for example "edge 2 dropped:
-    ..."), and "edge box changed since the calibration; recalibrate" when a
+    the attention colour shows the warnings, and "edge box changed since the calibration; recalibrate" when a
     saved box snaps to a different box than the calibration's (checked for
     both boxes).
   - Group **Edge box and calibration sweep**: a **Draw edge box** toggle and
-    the saved box as x, y, w, h ("none" until drawn); **Draw edge box 2** and
-    **Clear box 2** with box 2 shown as x, y, w, h or "none (optional)"; then
+    the saved box as x, y, w, h ("none" until drawn); then
     spins for span (um), steps and frames per step.
   - Group **Camera**:
     - SDK folder: a line edit plus Browse, saved to
@@ -1035,7 +1039,7 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
       the floating window is owned by the panel so it stays above the app.
     - An **LED** toggle and a live **LED %** spin (saved, default 50), next to
       a readout of CRISP's state and device label, read once after each
-      change. With no CRISP device the fault label says "no CRISP device
+      change. With no CRISP device the message line says "no CRISP device
       (no CRISP label)".
     - Exposure (ms), gain and channel (red or sum). Each applies live and is
       saved.
@@ -1045,23 +1049,18 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
       only valid for the detector it was made with".
     - ROI x, y, w, h, with **Apply ROI** and **Full frame**.
     - Readouts: fps, max value, % saturated.
-    - Camera errors show in the panel's fault label.
+    - Camera errors show in the panel's message line.
   - A strip chart.
-  - Readouts: Moves / min, Move time (mean / max), Edge 1 (px), Edge 2 (px)
-    (a dash when there is no second edge), Disagreement (um), Contrast, Frame
-    rate, Error (along). The error is the fused one and shows a dash when
-    `along_um` is None, else the error in um. A note line shows the telemetry
-    `note` or `reason`, for example "edge 2 lost; using edge 1". When a frame
-    holds on one edge (`held_edge` in the telemetry), the Disagreement
-    readout turns orange and reads for example "1.230 (holding on edge 2)",
-    and the note line gives the full text.
+  - Readouts: Moves / min, Move time (mean / max), Edge (px), Contrast, Frame
+    rate. A note line shows the telemetry `note` or `reason`. The tracking error
+    is shown by `PiezoSpotWidget` (`tracking_error_label`).
   - Group **Parameters**: Deadband, Kp, Ki, Max step, Max rate, Min contrast
     (counts), Min valid rows (fraction), Max angle change (degrees), Max
     edge residual (px), Edge disagreement limit (um, default 1.0) and Hold
     band (um, default 0.15; 0 turns holding off). `avg_frames` and
     `max_saturated_frac` have no spin.
 - Panel behaviour:
-  - **Calibrate** needs a saved edge box, else the fault label says "Draw an
+  - **Calibrate** needs a saved edge box, else the message line says "Draw an
     edge box across the edge that moves with focus". It passes `[box1]` or
     `[box1, box2]` to the service and runs the sweep on a thread. On success it
     saves the calibration, resets the offset to 0 and moves the setpoint ring
@@ -1073,9 +1072,6 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     Stop, the panel calls `svc.set_calibration(cal)` and
     `svc.set_edge_boxes(boxes)`, so the preview shows the fused error (and the
     chart fills) before Lock.
-  - **Draw edge box 2** and **Clear box 2** work like the box 1 button; box 2
-    is optional and is saved in `spot_focus.edge_box_2`. The panel advises
-    drawing it across a different edge, wide along its normal.
   - **Draw edge box** puts the live view in edge-box draw mode, makes it
     visible (raises it when floating) and starts Preview if it is not on. The
     panel tells the user to draw the box wide along the edge normal (about 14 x
@@ -1102,27 +1098,21 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     cancels the 2x2 colour mosaic (otherwise it aliases into a Moire grid at
     fractional zoom). The pixel readout and the edge measurement use the raw
     values. Turn it off for a mono camera or to inspect the raw mosaic.
-  - **Draw ROI**, **Draw edge box** and **Draw edge box 2** buttons are mutually
-    exclusive draw modes (`draw_target` is `"roi"`, `"edge"`, `"edge2"` or
-    None).
+  - **Draw ROI** and **Draw edge box** buttons are mutually exclusive draw
+    modes (`draw_target` is `"roi"`, `"edge"` or None).
     - Draw ROI: dragging a rectangle (snapped to even ints, clamped to the
       sensor) emits `roiDrawn(x, y, w, h)`. The panel fills its ROI spins and
       applies them.
     - Draw edge box: the same drag (minimum 16 px) emits
       `edgeBoxDrawn(x, y, w, h)`. The panel stores the box and sends it to the
       worker.
-    - Draw edge box 2: the same drag emits `edgeBox2Drawn(x, y, w, h)`.
     - A valid drag turns its button off (one box per click); a click or a
       sliver keeps the mode. The panel can switch the mode with
       `set_edge_draw_mode(on)` and follows it through `edgeDrawModeChanged`.
   - Overlays: the sensor outline, the current ROI, the edge box (dashed
     violet), the edge point (a cross at the box centre on the measured edge)
-    and the zero edge point (a ring). For the optional second edge there is a
-    second dashed box in its own colour (`set_edge_box2(box | None)`), a
-    second cross (`set_secondary_point(xy | None)`, fed by the panel from
-    telemetry `edges[1]`) and a second ring (`set_secondary_setpoint(xy |
-    None)`). The edge boxes are user data: frames and `clear()` do not remove
-    them. The status text reads "edge (x, y)", plus "(not ok)" for a failed
+    and the zero edge point (a ring). The edge box is user data: frames and
+    `clear()` do not remove it. The status text reads "edge (x, y)", plus "(not ok)" for a failed
     fix.
   - Levels are linear. The fixed range is 0 to 2^bits-1, with an **Auto
     levels** option (min to max). Auto levels is display only; the measurement
@@ -1177,6 +1167,10 @@ edge point is picked" and the notebook.
 ## Rig test plan (GO / NO-GO)
 
 Do these in order. Stop at the first NO-GO and fix it before going on.
+
+Note: this plan was written for the two-edge UI. The UI now has one edge, so
+steps 3 and 7 (Draw edge box 2, the two-edge calibration, the Disagreement
+readout) cannot be done from the GUI; skip them.
 
 1. **Find the edge.** Preview on, LED on, exposure so the patch is about
    100-180 counts with 0 % saturated. Watch the patch while jogging P by +-1 um

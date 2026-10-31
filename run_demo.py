@@ -612,7 +612,7 @@ def build_demo_controls() -> QWidget:
 
 
 def install_demo_spot_store() -> None:
-    """Give the piezo panel's Spot lock section a simulated camera (no hardware)."""
+    """Give the piezo spot widget (PiezoSpotWidget) a simulated camera (no hardware)."""
     from CRISPy.spot.store import MemorySpotSettingsStore, set_settings_store
 
     store = MemorySpotSettingsStore()
