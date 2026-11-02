@@ -11438,7 +11438,7 @@ true,
 "max_edge_residual_px": 3.0,
 "p_min_um": null,
 "p_max_um": null,
-"max_excursion_um": 5.0,
+"max_excursion_um": null,
 "strikes": 5
 },
 "loop_params_from_dict": {
@@ -11456,7 +11456,7 @@ true,
 "max_edge_residual_px": 3.0,
 "p_min_um": 0.0,
 "p_max_um": null,
-"max_excursion_um": 5.0,
+"max_excursion_um": null,
 "strikes": 5
 },
 "edge_cal_defaults": {

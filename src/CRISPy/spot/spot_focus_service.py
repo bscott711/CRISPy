@@ -285,8 +285,8 @@ class SpotFocusService:
         limits if the piezo exposes them (a one-time read, like ``getPosition``;
         nothing is polled while locked). Any failure, a missing property or a
         range that does not contain *p_start* leaves the bounds at None: a
-        missing limit source never faults the lock, and the excursion limit
-        from the start P remains the guard.
+        missing limit source never faults the lock, which then has no absolute
+        P bound (only the per-step clamp and the rate limit apply).
         """
         if params.p_min_um is not None or params.p_max_um is not None:
             return params
@@ -312,8 +312,8 @@ class SpotFocusService:
         except Exception:
             logger.debug("Could not read the piezo limits.", exc_info=True)
         logger.info(
-            "Spot focus: no piezo travel limits found; guarding by the "
-            "excursion limit from the start P %.2f um.",
+            "Spot focus: no piezo travel limits found; the lock has no "
+            "absolute P bound (start P %.2f um).",
             p_start,
         )
         return params

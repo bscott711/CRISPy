@@ -1158,8 +1158,11 @@ class SpotLoopParams:
     """Lowest allowed absolute P; None = no absolute lower bound known."""
     p_max_um: float | None = None
     """Highest allowed absolute P; None = no absolute upper bound known."""
-    max_excursion_um: float = 5.0
-    """Largest allowed distance of the commanded P from the start P."""
+    max_excursion_um: float | None = None
+    """Optional cap on the distance of the commanded P from the start P.
+
+    None (default) = no cap: the lock may follow focus anywhere inside the
+    absolute piezo range (``p_min_um`` / ``p_max_um``)."""
     strikes: int = 5
     """Consecutive bad measurements before a fault."""
 
@@ -1184,10 +1187,11 @@ class SpotFocusController:
     and the error is inside the calibrated linear range. Beyond the linear
     range the sign of the error is still right, so the step is a full
     ``-sign(e) * max_step_um`` (no search needed). A target outside the piezo
-    range (only the bounds that are set) or further than ``max_excursion_um``
-    from the start sets
-    :attr:`fault` instead of moving, and after a fault :meth:`update` never
-    returns a target again.
+    range (only the bounds that are set) or, if ``max_excursion_um`` is set,
+    further than that from the start sets :attr:`fault` instead of moving, and
+    after a fault :meth:`update` never returns a target again. By default
+    there is no excursion cap, so the commanded P may drift anywhere inside the
+    piezo range as it holds focus.
 
     Parameters
     ----------
@@ -1266,7 +1270,10 @@ class SpotFocusController:
                 f"[{lo_t}, {hi_t}] um (start P {self.p_start_um:.2f} um)"
             )
             return None
-        if abs(target - self.p_start_um) > p.max_excursion_um:
+        if (
+            p.max_excursion_um is not None
+            and abs(target - self.p_start_um) > p.max_excursion_um
+        ):
             self._fault = (
                 f"range limit: target {target:.2f} um is more than "
                 f"{p.max_excursion_um:g} um from the start P "

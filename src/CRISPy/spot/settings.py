@@ -34,7 +34,8 @@ class SpotLoopParamsSettings(BaseModel):
     """Persisted form of ``CRISPy.spot.spot_focus.SpotLoopParams``.
 
     Keys written by older versions and no longer used (the two-edge
-    ``max_edge_disagreement_um`` and ``hold_band_um``) are ignored on load.
+    ``max_edge_disagreement_um`` and ``hold_band_um``, and the old 5 um
+    ``max_excursion_um`` cap) are ignored on load.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -53,7 +54,6 @@ class SpotLoopParamsSettings(BaseModel):
     max_edge_residual_px: float = 3.0
     p_min_um: float | None = None
     p_max_um: float | None = None
-    max_excursion_um: float = 5.0
     strikes: int = 5
 
     @model_validator(mode="before")

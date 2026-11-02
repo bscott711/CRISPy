@@ -677,6 +677,58 @@ def test_explicit_limits_fault_with_the_range_in_the_message():
     assert "[-inf, -45]" in (half.fault or "")
 
 
+def test_default_has_no_excursion_cap():
+    assert SpotLoopParams().max_excursion_um is None
+    p = SpotLoopParams(kp=1.0, ki=0.0)
+    ctrl = SpotFocusController(p, -45.5)
+    now = 0.0
+    for _ in range(32):  # 32 steps of 0.4 um (< max_step_um), all the same way
+        assert ctrl.update(-0.4, now) is not None
+        assert ctrl.fault is None
+        now += 1.0 / p.max_rate_hz + 0.1
+    assert ctrl.n_moves == 32
+    assert abs(ctrl.p_cmd_um - -45.5) > 12
+
+
+def test_single_large_error_moves_one_clamped_step():
+    p = SpotLoopParams(max_step_um=0.5)
+    free = SpotFocusController(p, 50.0)
+    assert free.update(+20.0, 0.0) == pytest.approx(49.5)
+    assert free.n_moves == 1
+    ranged = SpotFocusController(p, 50.0, linear_range_um=1.0)
+    assert ranged.update(-20.0, 0.0) == pytest.approx(50.5)
+    assert ranged.n_moves == 1
+    assert ranged.fault is None
+
+
+def test_absolute_range_still_faults_with_no_excursion_cap():
+    p = SpotLoopParams(p_min_um=-60.0, p_max_um=-30.0, max_rate_hz=1000.0)
+    ctrl = SpotFocusController(p, -45.5)
+    now = 0.0
+    while ctrl.fault is None and now < 100:
+        ctrl.update(-5.0, now)  # P walks up towards -30
+        now += 1.0
+    assert ctrl.fault is not None and "outside piezo range" in ctrl.fault
+    assert ctrl.p_cmd_um <= -30.0 + 1e-9
+    assert abs(ctrl.p_cmd_um - -45.5) > 10  # well past the old 5 um cap
+
+
+def test_explicit_max_excursion_still_faults():
+    p = SpotLoopParams(max_excursion_um=1.0, max_rate_hz=1000.0, ki=0.0)
+    ctrl = SpotFocusController(p, 50.0)
+    now = 0.0
+    while ctrl.fault is None and now < 100:
+        ctrl.update(-5.0, now)
+        now += 1.0
+    assert ctrl.fault is not None and "more than 1 um" in ctrl.fault
+
+
+def test_legacy_saved_max_excursion_is_ignored():
+    s = SpotLoopParamsSettings.model_validate({"max_excursion_um": 5.0})
+    assert s.to_params().max_excursion_um is None
+    assert "max_excursion_um" not in SpotLoopParamsSettings().model_dump()
+
+
 def test_strikes_and_good_reset():
     ctrl = SpotFocusController(SpotLoopParams(strikes=3), 50.0)
     ctrl.bad("a")
