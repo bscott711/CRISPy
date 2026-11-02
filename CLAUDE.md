@@ -32,7 +32,9 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
   `actuator_label`, joystick lockout, lock-offset setpoint
 - `ui.py` — `CrispControlPanel`: Qt-native control/calibration/telemetry panel with
   a collapsible Dither section in the panel and the Focus curve / Hold test tabs in
-  a separate `_ToolsWindow`
+  a separate `_ToolsWindow`; the hardware-CRISP panel of every axis except the spot
+  piezo
+- `_section.py` — `_Section`, the small collapsible section widget used by `ui.py`
 - `dither.py` — Qt-free Dither assistant: `read_dither_sample`, `DitherTracker`
   (median |Err|, steady-only peak-hold, Sum band check)
 - `focus_curve.py` — Qt-free `run_focus_curve` (step the actuator, read the error,
@@ -49,18 +51,18 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
   splitter, 3+=tabs); the one chosen piezo gets a `PiezoSpotWidget` instead of a
   `CrispControlPanel`
 - `piezo_ui.py` — `PiezoSpotWidget` (Qt): the piezo's spot-lock interface (status words,
-  one message line, sections), built around `spot/panel.py`'s `SpotFocusPanel`; no
-  poller and no CRISP controls
-- `piezo_status.py` — Qt-free status words, the one contextual message and the joystick
-  policy for `PiezoSpotWidget`
+  one message line, four exclusive sections, a Joystick checkbox), built around
+  `spot/panel.py`'s `SpotFocusPanel`; no poller and no CRISP controls
+- `piezo_status.py` — Qt-free status words and the one contextual message for
+  `PiezoSpotWidget`
 - `gating.py` — Qt-free serial-line rules (may the poller run, may a tool start, given
   MDA / tool); `ui.py` applies them
 - `spot_choice.py` — Qt-free `choose_spot_index()`: which piezo gets the spot widget
   (the one matching the store's `piezo_label`, else the first piezo)
-- `spot/` — the spot edge focus lock, moved verbatim from pymmcore-gui: `panel.py`
-  (`SpotFocusPanel`, embedded in `PiezoSpotWidget`; one edge in the UI), `store.py` (the
+- `spot/` — the spot edge focus lock (one edge box end to end), moved from pymmcore-gui:
+  `panel.py` (`SpotFocusPanel`, embedded in `PiezoSpotWidget`), `store.py` (the
   host settings hook), `settings.py`, and the Qt-free lock itself (`spot_focus*.py`,
-  `spot_frame_shm.py`, `spot_synthetic.py`, `toupcam_source.py`; still two-edge capable);
+  `spot_frame_shm.py`, `spot_synthetic.py`, `toupcam_source.py`);
   see `docs/spot_focus_lock.md`
 
 ## Architectural boundaries (do not cross)
@@ -81,16 +83,21 @@ N CRISP autofocus axes on ASI Tiger controllers via pymmcore-plus.
   Focus curve and Hold test each claim the port (`_begin_tool` / `_end_tool`), which
   pauses the slow poll; they stop on hide, close and MDA start. Don't run a tool and the
   slow poll together, or two tools at once.
-- **The spot lock is a controller, not a tool.** It is the one exception that writes
-  `CRISP State` and `LED Intensity` (it never saves Averages, Update rate, Loop Gain or
-  LED settings). It lives in the dedicated `PiezoSpotWidget` (`piezo_ui.py`), which has no
-  poller and no CRISP controls, so the old rules (panel poll paused while the lock is
-  active, writing controls disabled, tool section disabled) no longer apply to the spot
-  piezo. `gating.py` (Qt-free, tested in `tests/test_gating.py`) now covers only the tools,
-  the poll and the MDA for the `CrispControlPanel`s; `ui.py` only applies it.
-  Keep `spot_focus*.py`, `spot_frame_shm.py`, `spot_synthetic.py`, `toupcam_source.py`,
-  `settings.py`, `store.py`, `spot_choice.py` and `piezo_status.py` Qt-free (only
-  `panel.py`, `live_view.py` and `piezo_ui.py` are Qt).
+- **The spot lock is a controller, not a tool.** It lives in the dedicated
+  `PiezoSpotWidget` (`piezo_ui.py`), which has no poller and no CRISP controls, so the lock
+  needs no serial-line arbitration with them: `gating.py` (Qt-free, tested in
+  `tests/test_gating.py`) covers only the tools, the poll and the MDA for the
+  `CrispControlPanel`s, and `ui.py` only applies it. The lock lights the CRISP LED with
+  the raw serial commands `LK F=90` / `LK F=79` (`ASICrispController.set_led`) and sets
+  `LED Intensity`; it never writes `CRISP State` (it stays Idle) and never saves
+  Averages, Update rate, Loop Gain or LED settings. `SpotFocusService` is the only
+  owner of the joystick lockout: it disables the wheel (`set_joystick_enabled`) while
+  the lock runs and restores it on Stop, a fault, a dead worker and shutdown; calibrate,
+  zero and preview do not touch it. The widget's Joystick checkbox shows that state and
+  is a manual override (a direct write). The LED and joystick behaviour is
+  rig-unverified. Keep `spot_focus*.py`, `spot_frame_shm.py`, `spot_synthetic.py`,
+  `toupcam_source.py`, `settings.py`, `store.py`, `spot_choice.py` and `piezo_status.py`
+  Qt-free (only `panel.py`, `live_view.py` and `piezo_ui.py` are Qt).
 - **Measure, don't tune.** The tools never write lock settings (Averages, Update rate,
   Loop Gain, LED). The user changes one setting at a time and the Hold test judges it
   (the user's "verify one step at a time on the bench" rule; no closed-loop auto-tuner).

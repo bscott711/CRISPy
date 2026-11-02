@@ -41,7 +41,7 @@ uv pip install -e .
 uv pip install git+https://github.com/bscott711/CRISPy.git
 ```
 
-Once installed, launch `pymmcore-gui`. pymmcore-gui embeds CRISPy itself (its CRISP widget calls `CRISPy.plugin.launch_crisp_plugin()`) and sets the host hooks CRISPy offers: `CRISPy.imaging` (snap and image view for the Focus curve) and `CRISPy.spot.store.set_settings_store` (where the Spot lock keeps its settings). Without a host, `launch_crisp_plugin()` works on its own and `run_demo.py` shows it.
+Once installed, launch `pymmcore-gui`. pymmcore-gui embeds CRISPy itself (its CRISP widget calls `CRISPy.plugin.launch_crisp_plugin()`) and sets the host hooks CRISPy offers: `CRISPy.imaging` (snap and image view for the Focus curve) and `CRISPy.spot.store.set_settings_store` (where the camera spot lock keeps its settings). Without a host, `launch_crisp_plugin()` works on its own and `run_demo.py` shows it.
 
 ## 🚀 Usage
 
@@ -151,7 +151,7 @@ uv run pytest -q
 
 ## Spot lock
 
-The spot-lock piezo gets a dedicated `PiezoSpotWidget` instead of a CRISP panel: no poller, no CRISP detector controls and no diagnostic tools. It has its own LED button and a Joystick checkbox (off while the lock is active, back on at stop). It holds the piezo at the sample plane by watching the edge of the CRISP LED spot on a second camera, and runs as a separate worker process. It is a controller, not a diagnostic tool: it writes CRISP State and LED Intensity through the service. A config reload rebuilds the widget and stops a running lock. How it works, its calibration and its rules are in [docs/spot_focus_lock.md](docs/spot_focus_lock.md). `just demo` shows it with a simulated camera.
+The spot-lock piezo gets a dedicated `PiezoSpotWidget` instead of a CRISP panel: no poller, no CRISP detector controls and no diagnostic tools. It shows status words (state, LED, joystick, ...), one message line and four exclusive sections around the spot-lock panel, and has its own LED button and a Joystick checkbox. It holds the piezo at the sample plane by watching one edge of the CRISP LED spot on a second camera, and runs as a separate worker process. It is a controller, not a diagnostic tool: it lights the LED with the raw serial commands `LK F=90` / `LK F=79` (CRISP stays Idle, `CRISP State` is never written) and sets `LED Intensity`. The spot-lock service turns the joystick wheel off while the lock runs and restores it on Stop, a fault, a dead worker or shutdown; the Joystick checkbox shows that state and is a manual override. The LED and joystick behaviour is unverified on the rig. A config reload rebuilds the widget and stops a running lock. How it works, its calibration and its rules are in [docs/spot_focus_lock.md](docs/spot_focus_lock.md). `just demo` shows it with a simulated camera.
 
 ## 🏗️ Architecture
 
@@ -163,5 +163,6 @@ CRISPy strictly adheres to Separation of Concerns (SoC) and DRY principles. All 
 - **`sampling.py`**: The fast reader thread and read helpers the diagnostics share.
 - **`ui.py`** and **`plot.py`**: The Visuals. `CrispControlPanel` is a Qt-native panel for one axis that reuses `pymmcore-widgets` property controls for the adjustable parameters; `plot.py` is a small QPainter plot for the diagnostics.
 - **`plugin.py`**: The Entry Point. `launch_crisp_plugin()` is what pymmcore-gui calls to embed CRISPy (the `pyproject.toml` entry point names the same function). Acts as the orchestrator, querying discovery, instantiating controllers, and building the panels (single, splitter or tabs); it picks the one piezo that gets the `PiezoSpotWidget` (`spot_choice.py`).
+- **`_section.py`**: The collapsible section widget `ui.py` uses.
 - **`imaging.py`**: Qt-free camera images for the Focus curve, with the host hooks `set_snap_provider()` and `set_image_view_factory()`.
 - **`spot/`**: The spot edge focus lock (moved here from pymmcore-gui): a worker process that reads the AmScope camera and holds the piezo, its panel, and the `store.py` settings hook. See [docs/spot_focus_lock.md](docs/spot_focus_lock.md).

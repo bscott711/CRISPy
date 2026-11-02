@@ -204,23 +204,6 @@ def _fn_edgecal_roundtrip(m: SimpleNamespace, a: dict[str, Any], arrays: Any) ->
     return {"cal": cal.to_dict(), "again": _ecal(m, cal.to_dict()).to_dict()}
 
 
-def _fn_focuscal_roundtrip(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
-    cal = _fcal(m, a["cal"])
-    again = _fcal(m, cal.to_dict())
-    return {
-        "cal": cal.to_dict(),
-        "again": again.to_dict(),
-        "boxes": cal.boxes,
-        "linear_range_um": cal.linear_range_um,
-    }
-
-
-def _fn_focuscal_rezeroed(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
-    cal = _fcal(m, a["cal"])
-    new = cal.rezeroed(a["e0_px"], a["p0_um"])
-    return {"new": new.to_dict(), "old_unchanged": cal.to_dict()}
-
-
 def _fn_rezero(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
     cal = _ecal(m, a["cal"])
     return m.spot_focus.rezero(cal, e0_px=a["e0_px"], p0_um=a["p0_um"]).to_dict()
@@ -229,13 +212,6 @@ def _fn_rezero(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
 def _fn_load_calibration(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
     cal, msg = m.spot_focus.load_calibration(a["d"])
     return [None if cal is None else cal.to_dict(), msg]
-
-
-def _fn_fuse_edges(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
-    fixes = [_fix(m, f) for f in a["fixes"]]
-    return m.spot_focus.fuse_edges(
-        fixes, _fcal(m, a["cal"]), _params(m, a.get("params"))
-    )
 
 
 def _fn_controller(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
@@ -314,7 +290,6 @@ def _fn_defaults(m: SimpleNamespace, a: dict[str, Any], arrays: Any) -> Any:
             "SPOT_MAX_AGE_S": w.SPOT_MAX_AGE_S,
             "FRAME_WAIT_S": w.FRAME_WAIT_S,
             "CHANNELS": w.CHANNELS,
-            "MAX_EDGES": w.MAX_EDGES,
         },
     }
 
@@ -328,11 +303,8 @@ FUNCS = {
     "detector_mismatch": _fn_detector_mismatch,
     "fit_edge_calibration": _fn_fit_edge_calibration,
     "edgecal_roundtrip": _fn_edgecal_roundtrip,
-    "focuscal_roundtrip": _fn_focuscal_roundtrip,
-    "focuscal_rezeroed": _fn_focuscal_rezeroed,
     "rezero": _fn_rezero,
     "load_calibration": _fn_load_calibration,
-    "fuse_edges": _fn_fuse_edges,
     "controller": _fn_controller,
     "settle_time_s": _fn_settle_time_s,
     "settle": _fn_settle,
@@ -801,7 +773,6 @@ def build_cases(
             "halfmax",
             9.0,
         ),
-        ("two-second-mismatch", two_mixed, "gaussderiv", 6.0),
         ("two-first-mismatch", two_mixed, "halfmax", 6.0),
     ]:
         a: dict[str, Any] = {"cal": cal, "detector": det}
@@ -985,129 +956,17 @@ def build_cases(
         ("error-missing", {"kind": "edge", "box": [0, 0, 32, 32]}),
     ]:
         add("edgecal_roundtrip", cid, {"cal": d})
-    for cid, d in [
-        ("one-edge", one),
-        ("two-edges", _fcald(_ecald(), _ecal_b())),
-        ("single-edge-dict", _ecald()),
-        ("error-three", _fcald(_ecald(), _ecal_b(), _ecald())),
-        ("error-none", _fcald()),
-        ("error-kind", _fcald(_ecald(), kind="bogus")),
-        ("error-p0", _fcald(_ecald(), p0_um=NAN)),
-        ("error-missing-edges", {"kind": "edges", "p0_um": 1.0}),
-    ]:
-        add("focuscal_roundtrip", cid, {"cal": d})
-    two = _fcald(_ecald(), _ecal_b())
-    add("focuscal_rezeroed", "two", {"cal": two, "e0_px": [101.5, 49.0], "p0_um": 10.4})
-    add("focuscal_rezeroed", "one", {"cal": one, "e0_px": [90.0], "p0_um": 2.0})
-    add("focuscal_rezeroed", "error-count", {"cal": two, "e0_px": [90.0], "p0_um": 2.0})
     add("rezero", "a", {"cal": _ecald(), "e0_px": 101.25, "p0_um": 10.5})
 
-    # rig-shaped single-edge dict: saved before two-edge fusion and before the
-    # detector was selectable (no detector keys; halfmax)
-    rig = {
-        "kind": "edge",
-        "box": [762, 590, 176, 114],
-        "axis": "y",
-        "polarity": 1,
-        "slope_px_per_um": 1.92,
-        "e0_px": 640.25,
-        "p0_um": 21.5,
-        "r2": 0.993,
-        "residual_px": 0.07,
-        "linear_range_um": 1.0,
-        "noise_px": 0.04,
-        "angle_deg": 0.3,
-        "contrast": 90.0,
-        "n_points": 9,
-        "sweep": [[20.5, 638.3], [21.5, 640.25], [22.5, 642.2]],
-        "warnings": [],
-        "record_path": "spot_calibration_20261028.npz",
-        "created": "2026-10-28T15:01:02",
-    }
     for cid, d in [
         ("none", None),
         ("empty", {}),
         ("garbage-str", "junk"),
         ("garbage-list", [1, 2]),
-        ("rig-single-edge", rig),
-        (
-            "rig-single-edge-gaussderiv",
-            {
-                **rig,
-                "detector": "gaussderiv",
-                "detector_sigma_px": 6.0,
-                "edge_width_px": 22.0,
-                "box_normal_px": 114,
-            },
-        ),
         ("old-gaussian-spot", {"kind": "gaussian", "x0": 1.0}),
-        ("two-edges", two),
-        ("one-edge", one),
         ("bad-slope", _ecald(slope_px_per_um=0.0)),
     ]:
         add("load_calibration", cid, {"d": d})
-
-    # -- fuse_edges ---------------------------------------------------------
-    # edge A: slope +2.0, e0 100 -> a = (pos - 100) / 2 ; edge B: slope -1.8, e0 50
-    def pa(a_um: float) -> float:
-        return 100.0 + 2.0 * a_um
-
-    def pb(a_um: float) -> float:
-        return 50.0 - 1.8 * a_um
-
-    fa = lambda a_um, **o: _fixd(pa(a_um), "x", **o)
-    fb = lambda a_um, **o: _fixd(pb(a_um), "y", **o)
-    cal2 = _fcald(_ecald(), _ecal_b())
-    cal2_noisy = _fcald(_ecald(noise_px=0.6), _ecal_b(noise_px=0.7))
-    fuse = [
-        ("one-edge-good", one, [fa(0.2)], None),
-        ("one-edge-offset", one, [fa(0.2)], {"offset_um": 0.5}),
-        ("one-edge-bad", one, [fa(0.2, ok=False, reason="edge lost (x)")], None),
-        ("one-edge-rotated", one, [fa(0.2, angle_deg=9.0)], None),
-        ("two-agree", cal2, [fa(0.20), fb(0.25)], None),
-        ("two-agree-offset", cal2, [fa(0.20), fb(0.25)], {"offset_um": -0.3}),
-        ("two-agree-edge-limit", cal2, [fa(0.0), fb(0.99)], None),
-        ("two-disagree-hold-edge1", cal2, [fa(0.05), fb(1.9)], None),
-        ("two-disagree-hold-edge2", cal2, [fa(2.2), fb(-0.1)], None),
-        ("two-disagree-hold-offset", cal2, [fa(0.45), fb(2.4)], {"offset_um": 0.5}),
-        ("two-disagree-no-hold", cal2, [fa(0.5), fb(2.0)], None),
-        ("two-disagree-hold-off", cal2, [fa(0.05), fb(1.9)], {"hold_band_um": 0.0}),
-        ("two-disagree-hold-edge-of-band", cal2, [fa(0.15), fb(1.9)], None),
-        (
-            "two-disagree-wide-limit",
-            cal2,
-            [fa(0.0), fb(1.5)],
-            {"max_edge_disagreement_um": 2.0},
-        ),
-        ("two-noisy-limit-from-noise", cal2_noisy, [fa(0.0), fb(1.5)], None),
-        (
-            "two-edge2-lost",
-            cal2,
-            [fa(0.3), fb(0.0, ok=False, reason="saturated")],
-            None,
-        ),
-        (
-            "two-edge1-lost",
-            cal2,
-            [fa(0.0, ok=False, reason="edge left the box"), fb(0.4)],
-            {"offset_um": 0.1},
-        ),
-        (
-            "two-both-bad",
-            cal2,
-            [fa(0.0, ok=False, reason="r1"), fb(0.0, ok=False, reason="r2")],
-            None,
-        ),
-        (
-            "two-rotated-and-bad",
-            cal2,
-            [fa(0.0, angle_deg=8.0), fb(0.0, residual_px=4.0)],
-            None,
-        ),
-        ("error-count", cal2, [fa(0.2)], None),
-    ]
-    for cid, cal, fixes, params in fuse:
-        add("fuse_edges", cid, {"cal": cal, "fixes": fixes, "params": params})
 
     # -- SpotFocusController -------------------------------------------------
     def U(a_: float, t: float) -> list[Any]:

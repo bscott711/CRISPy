@@ -11,6 +11,13 @@ every case against an implementation and compares.
 - ``SPOT_GOLDEN_EXACT=1`` compares floats bit for bit; otherwise rtol = atol =
   1e-12, nan equal to nan.
 
+The spot lock is single-edge now, so the cases whose outputs changed by design
+(``fuse_edges``, the ``FocusCalibration`` round trips / rezero and calibration
+load cases that print the saved form, the second-edge detector mismatch, the two
+removed ``SpotLoopParams`` fields) were dropped from ``golden.json`` / edited by
+hand; those are covered in ``tests/test_spot_focus.py``. Running against a legacy
+dir therefore only matches for the remaining cases (not ``defaults``).
+
 Regenerate with ``tests/spot_golden/make_golden.py`` (legacy code only).
 Qt-free: numpy, stdlib and pytest.
 """

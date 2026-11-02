@@ -333,8 +333,8 @@ def test_inputs_have_no_second_edge_field():
         assert not low.endswith("_2")
 
 
-def test_two_edge_calibration_is_stale():
-    # The caller reports box_changed when the calibration's edge count is not 1.
+def test_changed_box_is_stale():
+    # The caller reports box_changed when the drawn box differs from the calibration's.
     inp = _ready(box_changed=True)
     assert ps.calibration_word(inp) == "Stale (edge box changed)"
     assert ps.message(inp) == "edge box changed since the calibration; recalibrate"
@@ -365,16 +365,6 @@ def test_no_text_mentions_a_second_edge():
         ]
         for t in texts:
             assert not any(w in t.lower() for w in forbidden), t
-
-
-# -- joystick -------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("active", "enabled"), [(True, False), (False, True)])
-def test_joystick_for_lock(active, enabled):
-    # NEGATIVE CONTROL (b): an inverted ``joystick_for_lock`` (``return
-    # lock_active``) fails both rows.
-    assert ps.joystick_for_lock(active) is enabled
 
 
 # -- Qt-free --------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Persisted settings of the spot focus lock (plain pydantic models).
 
 Moved unchanged from pymmcore-gui's settings module so the host's saved ``spot_focus``
-settings (calibration, edge boxes, detector, ROI, SDK folder) load as before. The
+settings (calibration, edge box, detector, ROI, SDK folder) load as before. The
 host owns where they are stored: see :mod:`~CRISPy.spot.store`.
 """
 
@@ -31,7 +31,13 @@ class SpotSourceSettingsV1(BaseModel):
 
 
 class SpotLoopParamsSettings(BaseModel):
-    """Persisted form of ``CRISPy.spot.spot_focus.SpotLoopParams``."""
+    """Persisted form of ``CRISPy.spot.spot_focus.SpotLoopParams``.
+
+    Keys written by older versions and no longer used (the two-edge
+    ``max_edge_disagreement_um`` and ``hold_band_um``) are ignored on load.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     kp: float = 0.6
     ki: float = 0.05
@@ -45,9 +51,6 @@ class SpotLoopParamsSettings(BaseModel):
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
-    max_edge_disagreement_um: float = 1.0
-    hold_band_um: float = 0.15
-    """When the two edges disagree, hold on an edge this close to the target."""
     p_min_um: float | None = None
     p_max_um: float | None = None
     max_excursion_um: float = 5.0
@@ -99,12 +102,11 @@ class SpotFocusSettingsV1(BaseModel):
     """CRISP LED intensity set on Start; ``None`` leaves it as it is."""
     params: SpotLoopParamsSettings = Field(default_factory=SpotLoopParamsSettings)
     calibration: dict[str, Any] | None = None
-    """``FocusCalibration.to_dict()`` of the last calibration (a single-edge
-    ``EdgeCalibration`` dict from older versions also loads)."""
+    """``FocusCalibration.to_dict()`` of the last calibration (the older
+    two-edge form and a bare ``EdgeCalibration`` dict also load)."""
     edge_box: tuple[int, int, int, int] | None = None
-    """The edge box ``(x, y, w, h)`` in sensor pixels; ``None`` until drawn."""
-    edge_box_2: tuple[int, int, int, int] | None = None
-    """The optional second edge box, same convention as ``edge_box``."""
+    """The edge box ``(x, y, w, h)`` in sensor pixels; ``None`` until drawn.
+    A saved ``edge_box_2`` from older versions is ignored."""
     detector: Literal["gaussderiv", "halfmax"] = "gaussderiv"
     """How the edge point is found in each row (``measure_edge``). A calibration
     is only valid for the detector it was made with; the stored one wins for

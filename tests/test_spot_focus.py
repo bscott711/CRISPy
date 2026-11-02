@@ -17,9 +17,9 @@ from CRISPy.spot.spot_focus import (
     EDGE_DETECTOR_LABELS,
     EDGE_DETECTORS,
     EdgeCalibration,
+    EdgeError,
     EdgeFix,
     FocusCalibration,
-    FusedError,
     SpotFocusController,
     SpotLoopParams,
     check_fix,
@@ -27,12 +27,13 @@ from CRISPy.spot.spot_focus import (
     edge_error,
     edge_noise_um,
     fit_edge_calibration,
-    fuse_edges,
     load_calibration,
+    loop_error,
     measure_edge,
     rezero,
     snap_box,
 )
+from CRISPy.spot.settings import SpotFocusSettingsV1, SpotLoopParamsSettings
 from CRISPy.spot.spot_synthetic import add_noise, render_led_patch
 from CRISPy.spot.toupcam_source import (
     FakeSpotSource,
@@ -474,7 +475,7 @@ def test_calibration_round_trip_and_json():
     assert isinstance(via_json.box, tuple) and isinstance(via_json.sweep[0], tuple)
     loaded, msg = load_calibration(json.loads(json.dumps(cal.to_dict())))
     assert isinstance(loaded, FocusCalibration) and msg == ""
-    assert loaded.edges == [cal] and loaded.p0_um == cal.p0_um
+    assert loaded.edge == cal and loaded.p0_um == cal.p0_um
     assert loaded.created == cal.created and loaded.warnings == ["hello"]
     assert loaded.record_path == "x.npz"
 
@@ -816,7 +817,7 @@ def test_closed_loop_with_the_sign_flipped_diverges():
 
 
 # ---------------------------------------------------------------------------
-# FocusCalibration: one or two edges
+# FocusCalibration: one edge
 # ---------------------------------------------------------------------------
 
 RIG_EDGE = {
@@ -854,57 +855,93 @@ def _edge(box, axis, slope, e0, *, p0=50.0, noise_px=0.05, **kw):
     )
 
 
-def _two(**kw):
-    """Left edge (x, 2.1 px/um) and top edge (y, 1.9 px/um) of the synthetic patch."""
+def _one(**kw):
+    """Left edge (x, 2.1 px/um) of the synthetic patch."""
     left = _edge(BOX_LEFT, "x", 2.1, CX - HALF_W, **kw)
-    top = _edge(BOX_TOP, "y", 1.9, CY - HALF_H, **kw)
-    return FocusCalibration(edges=[left, top], p0_um=50.0, created="t")
+    return FocusCalibration(edge=left, p0_um=50.0, created="t")
 
 
 def test_focus_calibration_round_trip_and_json():
-    cal = _two()
+    cal = _one()
     cal.warnings.append("careful")
     cal.record_path = "r.npz"
     d = json.loads(json.dumps(cal.to_dict()))
-    assert d["kind"] == "edges" and len(d["edges"]) == 2
-    assert d["edges"][0] == cal.edges[0].to_dict()
+    assert d["kind"] == "edge" and "edges" not in d
+    assert d["edge"] == cal.edge.to_dict()
+    assert set(d) == {"kind", "edge", "p0_um", "created", "record_path", "warnings"}
     again = FocusCalibration.from_dict(d | {"junk": 1})
     assert again == cal
-    assert isinstance(again.edges[0].box, tuple)
+    assert isinstance(again.edge.box, tuple)
     loaded, msg = load_calibration(d)
     assert loaded == cal and msg == ""
-    one = FocusCalibration(edges=[cal.edges[0]], p0_um=50.0)
-    assert load_calibration(json.loads(json.dumps(one.to_dict())))[0] == one
 
 
-def test_focus_calibration_boxes_and_linear_range():
-    cal = _two()
-    assert cal.boxes == [BOX_LEFT, BOX_TOP]
+def test_focus_calibration_box_and_linear_range():
+    cal = _one()
+    assert cal.box == BOX_LEFT
     assert cal.linear_range_um == 1.0
-    cal.edges[1].linear_range_um = 0.6
+    cal.edge.linear_range_um = 0.6
     assert cal.linear_range_um == 0.6
-    assert FocusCalibration(edges=[cal.edges[0]], p0_um=50.0).linear_range_um == 1.0
 
 
 def test_single_edge_dict_is_wrapped():
     cal, msg = load_calibration(json.loads(json.dumps(RIG_EDGE)))
     assert msg == "" and isinstance(cal, FocusCalibration)
-    assert len(cal.edges) == 1 and cal.kind == "edges"
-    e = cal.edges[0]
+    assert cal.kind == "edge"
+    e = cal.edge
     assert e == EdgeCalibration.from_dict(RIG_EDGE)
     assert (e.axis, e.slope_px_per_um, e.box) == ("y", 1.919, (762, 590, 176, 114))
     assert cal.p0_um == -45.497
     assert cal.created == "2026-10-28T13:11:49"
     assert cal.record_path == RIG_EDGE["record_path"]
     assert cal.warnings == RIG_EDGE["warnings"]
-    assert cal.boxes == [(762, 590, 176, 114)]
+    assert cal.box == (762, 590, 176, 114)
     # saving the wrapped calibration gives the new format, which loads again
     assert load_calibration(cal.to_dict())[0] == cal
 
 
+def _old_two_edge_dict():
+    """What the two-edge version saved: ``kind == "edges"`` with a list of edges."""
+    left = _edge(BOX_LEFT, "x", 2.1, CX - HALF_W)
+    top = _edge(BOX_TOP, "y", 1.9, CY - HALF_H)
+    return {
+        "kind": "edges",
+        "edges": [left.to_dict(), top.to_dict()],
+        "p0_um": 50.0,
+        "created": "t",
+        "record_path": "r.npz",
+        "warnings": ["careful"],
+    }
+
+
+def test_old_two_edge_calibration_loads_with_the_first_edge_and_a_warning():
+    old = json.loads(json.dumps(_old_two_edge_dict()))
+    cal, msg = load_calibration(old)
+    assert msg == "" and isinstance(cal, FocusCalibration)
+    assert cal.edge == _edge(BOX_LEFT, "x", 2.1, CX - HALF_W)
+    assert cal.box == BOX_LEFT and cal.kind == "edge"
+    assert (cal.p0_um, cal.created, cal.record_path) == (50.0, "t", "r.npz")
+    assert cal.warnings == ["careful", "edge 2 dropped: single edge box only"]
+    # saving it gives the new single-edge form, which loads again
+    d = cal.to_dict()
+    assert d["kind"] == "edge" and "edges" not in d
+    assert load_calibration(d)[0] == cal
+    # from_dict never raises on it either
+    assert FocusCalibration.from_dict(old).edge == cal.edge
+
+
+def test_old_one_edge_list_calibration_loads_without_a_warning():
+    old = _old_two_edge_dict()
+    old["edges"] = old["edges"][:1]
+    cal, msg = load_calibration(old)
+    assert msg == "" and cal is not None
+    assert cal.edge.box == BOX_LEFT and cal.warnings == ["careful"]
+
+
 def test_load_calibration_legacy_and_garbage():
     old = {"x0": 320, "y0": 240, "ux": 0.6, "uy": 0.8, "slope_px_per_um": 10}
-    good = _two().to_dict()
+    good = _one().to_dict()
+    old_good = _old_two_edge_dict()
     bad_edge = RIG_EDGE | {"box": [1, 2, 3]}
     junk = (
         old,
@@ -914,12 +951,15 @@ def test_load_calibration_legacy_and_garbage():
         {"kind": "edges"},
         {"kind": "edges", "edges": []},
         {"kind": "edges", "edges": "no", "p0_um": 1.0},
-        {"kind": "edges", "edges": [good["edges"][0]] * 3, "p0_um": 50.0},
         {"kind": "edges", "edges": [bad_edge], "p0_um": 1.0},
+        {"kind": "edges", "edges": [old_good["edges"][0]]},
+        {"kind": "edge", "edge": bad_edge, "p0_um": 1.0},
+        {"kind": "edge", "edge": "no", "p0_um": 1.0},
         good | {"p0_um": "far"},
         good | {"p0_um": float("nan")},
         {k: v for k, v in good.items() if k != "p0_um"},
-        {"kind": "spot", "edges": good["edges"], "p0_um": 50.0},
+        {"kind": "spot", "edges": old_good["edges"], "p0_um": 50.0},
+        {"kind": "spot", "edge": good["edge"], "p0_um": 50.0},
         bad_edge,
         RIG_EDGE | {"slope_px_per_um": 0.0},
         {"kind": "edge"},
@@ -935,19 +975,16 @@ def test_load_calibration_legacy_and_garbage():
 
 
 def test_focus_calibration_rezeroed():
-    cal = _two()
+    cal = _one()
     cal.warnings.append("w")
-    new = cal.rezeroed([281.5, 190.25], 51.5)
+    new = cal.rezeroed(281.5, 51.5)
     assert new.p0_um == 51.5
-    assert [e.e0_px for e in new.edges] == [281.5, 190.25]
-    assert [e.p0_um for e in new.edges] == [51.5, 51.5]
-    assert [e.slope_px_per_um for e in new.edges] == [2.1, 1.9]
-    assert new.edges[0].sweep == cal.edges[0].sweep
+    assert new.edge.e0_px == 281.5 and new.edge.p0_um == 51.5
+    assert new.edge.slope_px_per_um == 2.1
+    assert new.edge.sweep == cal.edge.sweep
     assert (new.created, new.warnings) == (cal.created, ["w"])
     # the original is untouched
-    assert cal.p0_um == 50.0 and cal.edges[0].e0_px == CX - HALF_W
-    with pytest.raises(ValueError):
-        cal.rezeroed([1.0], 50.0)
+    assert cal.p0_um == 50.0 and cal.edge.e0_px == CX - HALF_W
 
 
 def test_edge_noise_um():
@@ -961,328 +998,135 @@ def test_edge_noise_um():
 
 
 # ---------------------------------------------------------------------------
-# fuse_edges
+# loop_error
 # ---------------------------------------------------------------------------
 
 
-def _fuse_cal():
-    """Edge 1: 2 px/um, noise 0.05 um. Edge 2: 4 px/um, noise 0.1 um."""
-    e1 = _edge(BOX_LEFT, "x", 2.0, 272.0, noise_px=0.1)
-    e2 = _edge(BOX_TOP, "y", 4.0, 194.0, noise_px=0.4)
-    return FocusCalibration(edges=[e1, e2], p0_um=50.0)
-
-
-def _fixes(a1, a2, cal=None):
-    """Fixes whose per-edge errors are exactly a1 and a2 um."""
-    cal = cal or _fuse_cal()
-    e1, e2 = cal.edges
-    return [
-        _fix(e1.e0_px + e1.slope_px_per_um * a1),
-        _fix(e2.e0_px + e2.slope_px_per_um * a2, axis="y"),
-    ]
-
-
-def test_fuse_two_consistent_edges_is_the_inverse_variance_mean():
-    cal, params = _fuse_cal(), SpotLoopParams()
-    out = fuse_edges(_fixes(0.30, 0.40), cal, params)
-    assert isinstance(out, FusedError)
-    # weights 1/0.05**2 = 400 and 1/0.1**2 = 100
-    assert out.along_um == pytest.approx((400 * 0.30 + 100 * 0.40) / 500)
-    assert out.sigma_um == pytest.approx(1 / math.sqrt(500))
-    assert out.sigma_um < min(0.05, 0.1)
-    assert out.used == (True, True)
-    assert out.per_edge_um == pytest.approx((0.30, 0.40))
-    assert out.disagreement_um == pytest.approx(0.10)
-    assert out.reason == "" and out.note == ""
-
-
-def test_fuse_equal_edges_average_and_sigma_drops_by_sqrt2():
-    e1 = _edge(BOX_LEFT, "x", 2.0, 272.0, noise_px=0.1)
-    e2 = _edge(BOX_TOP, "y", 2.0, 194.0, noise_px=0.1)
-    cal = FocusCalibration(edges=[e1, e2], p0_um=50.0)
-    out = fuse_edges(_fixes(-0.2, -0.1, cal), cal, SpotLoopParams())
-    assert out.along_um == pytest.approx(-0.15)
-    assert out.sigma_um == pytest.approx(0.05 / math.sqrt(2))
-
-
-def test_fuse_subtracts_the_offset_once():
-    cal = _fuse_cal()
-    base = fuse_edges(_fixes(0.30, 0.40), cal, SpotLoopParams())
-    out = fuse_edges(_fixes(0.30, 0.40), cal, SpotLoopParams(offset_um=0.1))
-    assert out.along_um == pytest.approx(base.along_um - 0.1)
-    assert out.per_edge_um == base.per_edge_um  # per-edge values are raw
-    # a plant sitting at P = p0 + offset reads edges moved by slope * offset
-    at_offset = fuse_edges(_fixes(0.1, 0.1), cal, SpotLoopParams(offset_um=0.1))
-    assert at_offset.along_um == pytest.approx(0.0, abs=1e-12)
-
-
-def test_fuse_disagreement_is_a_bad_measurement():
-    cal = _fuse_cal()
-    params = SpotLoopParams(max_edge_disagreement_um=0.3)
-    out = fuse_edges(_fixes(0.30, -0.30), cal, params)  # 0.6 > max(0.3, 0.447)
-    assert out.along_um is None  # neither edge is within the hold band
-    assert out.disagreement_um == pytest.approx(0.6)
-    assert out.reason.startswith("edges disagree by 0.60 um")
-    assert "lateral drift" in out.reason
-    assert out.used == (True, True)
-    assert out.held_edge is None
-    # just under the limit still fuses
-    assert fuse_edges(_fixes(0.0, 0.44), cal, params).reason == ""
-    # the default limit (1.0 um) lets the same pair through
-    assert fuse_edges(_fixes(0.30, -0.30), cal, SpotLoopParams()).reason == ""
-    # noisy edges widen the limit: 4 * sqrt(0.5**2 + 0.5**2) = 2.83 um
-    noisy = FocusCalibration(
-        edges=[
-            _edge(BOX_LEFT, "x", 2.0, 272.0, noise_px=1.0),
-            _edge(BOX_TOP, "y", 2.0, 194.0, noise_px=1.0),
-        ],
-        p0_um=50.0,
-    )
-    out = fuse_edges(_fixes(1.2, -1.2, noisy), noisy, SpotLoopParams())
-    assert out.reason == "" and out.along_um == pytest.approx(0.0, abs=1e-12)
-    assert out.held_edge is None
-
-
-def test_fuse_default_limit_is_about_one_micron():
-    cal, params = _fuse_cal(), SpotLoopParams()
-    assert fuse_edges(_fixes(0.40, -0.55), cal, params).reason == ""  # 0.95
-    out = fuse_edges(_fixes(0.60, -0.60), cal, params)  # 1.2, neither near
-    assert out.along_um is None and out.reason.startswith("edges disagree by 1.20")
-
-
-def test_fuse_disagreement_holds_on_edge_1_when_it_is_at_target():
-    cal, params = _fuse_cal(), SpotLoopParams()
-    out = fuse_edges(_fixes(0.04, 1.50), cal, params)
-    assert out.reason == ""
-    assert out.held_edge == 0
-    assert out.along_um == pytest.approx(0.04)
-    assert out.sigma_um == pytest.approx(edge_noise_um(cal.edges[0]))
-    assert out.used == (True, True)
-    assert out.disagreement_um == pytest.approx(1.46)
-    assert out.note == (
-        "edges disagree by 1.46 um; holding on edge 1 (0.04 um from target)"
-    )
-
-
-def test_fuse_disagreement_holds_on_edge_2_when_it_is_at_target():
-    cal, params = _fuse_cal(), SpotLoopParams()
-    out = fuse_edges(_fixes(-1.20, -0.10), cal, params)
-    assert out.reason == ""
-    assert out.held_edge == 1
-    assert out.along_um == pytest.approx(-0.10)
-    assert out.sigma_um == pytest.approx(edge_noise_um(cal.edges[1]))
-    assert out.used == (True, True)
-    assert "holding on edge 2 (0.10 um from target)" in out.note
-
-
-def test_fuse_hold_band_edges_and_param():
-    cal = _fuse_cal()
-    # just outside the default 0.15 um band: bad
-    assert fuse_edges(_fixes(0.20, 1.5), cal, SpotLoopParams()).along_um is None
-    # a wider band holds it
-    wide = SpotLoopParams(hold_band_um=0.25)
-    assert fuse_edges(_fixes(0.20, 1.5), cal, wide).held_edge == 0
-    # a zero band never holds
-    none = SpotLoopParams(hold_band_um=0.0)
-    assert fuse_edges(_fixes(0.04, 1.5), cal, none).along_um is None
-
-
-def test_fuse_hold_respects_the_offset():
-    cal = _fuse_cal()
-    fixes = _fixes(0.50, 2.00)
-    # target 0.5 um: edge 1 sits on it, so hold on edge 1 (error ~0)
-    out = fuse_edges(fixes, cal, SpotLoopParams(offset_um=0.5))
-    assert out.held_edge == 0
-    assert out.along_um == pytest.approx(0.0, abs=1e-12)
-    # target 0: edge 1 is 0.5 away, edge 2 further: bad
-    out = fuse_edges(fixes, cal, SpotLoopParams())
-    assert out.held_edge is None and out.along_um is None
-    assert out.reason.startswith("edges disagree")
-    # edge 2 close to a target of 2.0
-    out = fuse_edges(fixes, cal, SpotLoopParams(offset_um=2.0))
-    assert out.held_edge == 1
-    assert out.along_um == pytest.approx(0.0, abs=1e-12)
-
-
-def _run_controller(fixes, params, frames=60):
-    ctrl = SpotFocusController(params, 50.0)
-    cal = _fuse_cal()
-    k = 0
-    for k in range(frames):
-        out = fuse_edges(fixes, cal, params)
-        if out.reason:
-            ctrl.bad(out.reason)
-        else:
-            ctrl.good()
-            assert out.along_um is not None
-            ctrl.update(out.along_um, k * 0.5)
-        if ctrl.fault:
-            break
-    return ctrl, k
-
-
-def test_persistent_disagreement_with_neither_edge_near_faults_after_strikes():
-    params = SpotLoopParams(strikes=5, deadband_um=0.1)
-    ctrl, k = _run_controller(_fixes(0.60, -0.60), params)
-    assert ctrl.fault is not None and "edges disagree" in ctrl.fault
-    assert k == 4  # the 5th consecutive bad frame
-    assert ctrl.n_moves == 0
-
-
-def test_persistent_disagreement_with_one_edge_near_never_faults():
-    params = SpotLoopParams(strikes=5, deadband_um=0.1)
-    ctrl, _ = _run_controller(_fixes(0.04, 1.50), params, frames=200)
-    assert ctrl.fault is None
-    assert ctrl.n_moves == 0  # held inside the dead band
-
-
-def test_a_held_frame_resets_the_strike_count():
-    params = SpotLoopParams(strikes=3, deadband_um=0.1)
-    ctrl = SpotFocusController(params, 50.0)
-    cal = _fuse_cal()
-    for _ in range(2):
-        ctrl.bad(fuse_edges(_fixes(0.60, -0.60), cal, params).reason)
-    held = fuse_edges(_fixes(0.04, 1.50), cal, params)
-    assert held.reason == "" and held.along_um is not None
-    ctrl.good()
-    ctrl.update(held.along_um, 0.0)
-    for _ in range(2):
-        ctrl.bad(fuse_edges(_fixes(0.60, -0.60), cal, params).reason)
-    assert ctrl.fault is None
-
-
-def test_fuse_one_bad_edge_uses_the_other_with_a_note():
-    cal, params = _fuse_cal(), SpotLoopParams(offset_um=0.05)
-    f1, f2 = _fixes(0.30, 0.40)
-    lost = _fix(f2.position, ok=False, reason="edge lost (contrast 1.0 < 10)")
-    out = fuse_edges([f1, lost], cal, params)
-    assert out.reason == ""
-    assert out.along_um == pytest.approx(0.30 - 0.05)
-    assert out.sigma_um == pytest.approx(edge_noise_um(cal.edges[0]))
-    assert out.used == (True, False)
-    assert out.per_edge_um[1] is None and out.per_edge_um[0] == pytest.approx(0.30)
-    assert out.disagreement_um is None
-    assert out.note == "edge 2 lost (edge lost (contrast 1.0 < 10)); using edge 1"
-    # edge 1 lost; a rotated edge counts as lost too
-    rotated = _fix(f1.position, angle_deg=20.0)
-    out = fuse_edges([rotated, f2], cal, params)
-    assert out.reason == ""
-    assert out.along_um == pytest.approx(0.40 - 0.05)
-    assert out.sigma_um == pytest.approx(0.1)
-    assert out.used == (False, True)
-    assert out.note == "edge 1 lost (edge rotated; the feature changed); using edge 2"
-    assert fuse_edges([f1, _fix(f2.position, residual_px=5.0)], cal, params).used == (
-        True,
-        False,
-    )
-
-
-def test_fuse_both_bad_is_a_strike_with_the_reason_of_edge_1():
-    cal, params = _fuse_cal(), SpotLoopParams()
-    f1 = _fix(272.0, ok=False, reason="saturated")
-    f2 = _fix(194.0, ok=False, reason="edge lost")
-    out = fuse_edges([f1, f2], cal, params)
-    assert out.along_um is None and out.reason == "saturated"
-    assert out.used == (False, False) and out.per_edge_um == (None, None)
-    assert math.isnan(out.sigma_um) and out.disagreement_um is None
-    assert out.note == ""
-
-
-def test_fuse_single_edge_calibration_matches_the_old_path():
+def test_loop_error_is_the_edge_error_with_its_noise():
     e = _edge(BOX_LEFT, "x", -4.0, 272.0, noise_px=0.08, residual_px=0.2)
-    cal = FocusCalibration(edges=[e], p0_um=50.0)
+    cal = FocusCalibration(edge=e, p0_um=50.0)
     params = SpotLoopParams(offset_um=0.2)
     fix = _fix(272.0 - 4.0 * 0.35)
-    out = fuse_edges([fix], cal, params)
+    out = loop_error(fix, cal, params)
+    assert isinstance(out, EdgeError)
     assert out.along_um == pytest.approx(edge_error(fix, e, params.offset_um))
     assert out.along_um == pytest.approx(0.15)
     assert out.sigma_um == pytest.approx(0.2 / 4.0)
-    assert out.used == (True,) and out.note == "" and out.reason == ""
-    assert out.disagreement_um is None
-    bad = _fix(272.0, ok=False, reason="edge left the box")
-    out = fuse_edges([bad], cal, params)
-    assert (out.along_um, out.reason, out.note) == (None, "edge left the box", "")
-    assert out.used == (False,)
+    assert out.reason == ""
 
 
-def test_fuse_edges_needs_one_fix_per_edge():
-    cal = _fuse_cal()
-    with pytest.raises(ValueError):
-        fuse_edges(_fixes(0, 0)[:1], cal, SpotLoopParams())
-    with pytest.raises(ValueError):
-        fuse_edges(_fixes(0, 0) * 2, cal, SpotLoopParams())
+def test_loop_error_subtracts_the_offset_once():
+    cal = _one()
+    fix = _fix(CX - HALF_W + 2.1 * 0.3)
+    base = loop_error(fix, cal, SpotLoopParams())
+    out = loop_error(fix, cal, SpotLoopParams(offset_um=0.1))
+    assert base.along_um == pytest.approx(0.3)
+    assert out.along_um == pytest.approx(0.2)
+    # a plant sitting at P = p0 + offset reads the edge moved by slope * offset
+    at_offset = loop_error(
+        _fix(CX - HALF_W + 2.1 * 0.1), cal, SpotLoopParams(offset_um=0.1)
+    )
+    assert at_offset.along_um == pytest.approx(0.0, abs=1e-12)
 
 
-def test_params_have_the_disagreement_limit():
-    assert SpotLoopParams().max_edge_disagreement_um == 1.0
-    assert SpotLoopParams().hold_band_um == 0.15
-    p = SpotLoopParams(max_edge_disagreement_um=0.5, hold_band_um=0.2)
-    back = SpotLoopParams.from_dict(p.to_dict())
-    assert back.max_edge_disagreement_um == 0.5
-    assert back.hold_band_um == 0.2
-    # an old dict without the new key loads with the default
-    old = {k: v for k, v in p.to_dict().items() if k != "hold_band_um"}
-    assert SpotLoopParams.from_dict(old).hold_band_um == 0.15
+def test_loop_error_bad_fix_is_a_strike_with_its_reason():
+    cal, params = _one(), SpotLoopParams()
+    out = loop_error(_fix(272.0, ok=False, reason="edge left the box"), cal, params)
+    assert (out.along_um, out.reason) == (None, "edge left the box")
+    assert math.isnan(out.sigma_um)
+    rotated = loop_error(_fix(272.0, angle_deg=20.0), cal, params)
+    assert rotated.along_um is None
+    assert rotated.reason == "edge rotated; the feature changed"
+    assert loop_error(_fix(272.0, residual_px=5.0), cal, params).reason == (
+        "edge not straight"
+    )
+
+
+def test_loop_params_no_longer_have_the_two_edge_fields():
+    params = SpotLoopParams()
+    assert not hasattr(params, "max_edge_disagreement_um")
+    assert not hasattr(params, "hold_band_um")
+    assert "hold_band_um" not in params.to_dict()
+    assert "max_edge_disagreement_um" not in params.to_dict()
+
+
+def test_old_loop_params_dict_with_removed_keys_still_loads():
+    old = SpotLoopParams(kp=0.9, offset_um=0.1).to_dict() | {
+        "max_edge_disagreement_um": 0.5,
+        "hold_band_um": 0.2,
+        "bogus": 1,
+    }
+    back = SpotLoopParams.from_dict(old)
+    assert (back.kp, back.offset_um) == (0.9, 0.1)
+    assert back == SpotLoopParams(kp=0.9, offset_um=0.1)
+
+
+def test_old_persisted_settings_still_load():
+    old = {
+        "edge_box": [10, 20, 64, 48],
+        "edge_box_2": [100, 20, 64, 48],
+        "params": {
+            "kp": 0.8,
+            "max_edge_disagreement_um": 0.5,
+            "hold_band_um": 0.2,
+        },
+        "calibration": _old_two_edge_dict(),
+    }
+    settings = SpotFocusSettingsV1.model_validate(old)
+    assert settings.edge_box == (10, 20, 64, 48)
+    assert not hasattr(settings, "edge_box_2")
+    assert "edge_box_2" not in settings.model_dump()
+    assert "hold_band_um" not in settings.params.model_dump()
+    assert "max_edge_disagreement_um" not in settings.params.model_dump()
+    assert settings.params.to_params().kp == 0.8
+    cal = settings.to_calibration()
+    assert cal is not None and cal.box == BOX_LEFT
+    assert settings.calibration_status()[1] == ""
+    # the loose params model alone ignores the removed keys too
+    loose = SpotLoopParamsSettings.model_validate({"hold_band_um": 0.3, "kp": 0.7})
+    assert loose.kp == 0.7
 
 
 # ---------------------------------------------------------------------------
-# Two edges on synthetic images
+# One edge on synthetic images
 # ---------------------------------------------------------------------------
 
 SX, SY = 2.1, 1.9  # image motion of the patch in px per um of P
 
 
-def _patch_fixes(p, p0=50.0, dx=0.0, dy=0.0):
-    """Both edge fixes of a patch that follows P diagonally (plus a lateral shift)."""
+def _patch_fix(p, p0=50.0, dx=0.0, dy=0.0):
+    """The edge fix of a patch that follows P diagonally (plus a lateral shift)."""
     q = p - p0
     img = clean(CX + SX * q + dx, CY + SY * q + dy, edge_sigma=2.0 + abs(q))
-    return [measure_edge(img, BOX_LEFT), measure_edge(img, BOX_TOP)]
+    return measure_edge(img, BOX_LEFT)
 
 
 def _synthetic_cal():
-    ref = _patch_fixes(50.0)
-    assert all(f.ok for f in ref)
-    left = _edge(BOX_LEFT, "x", SX, ref[0].position, noise_px=0.05)
-    top = _edge(BOX_TOP, "y", SY, ref[1].position, noise_px=0.05)
-    return FocusCalibration(edges=[left, top], p0_um=50.0)
+    ref = _patch_fix(50.0)
+    assert ref.ok
+    left = _edge(BOX_LEFT, "x", SX, ref.position, noise_px=0.05)
+    return FocusCalibration(edge=left, p0_um=50.0)
 
 
 @pytest.mark.parametrize("q", [-0.8, -0.3, 0.0, 0.45, 0.9])
-def test_diagonal_motion_gives_agreeing_estimates(q):
+def test_diagonal_motion_gives_the_error(q):
     cal, params = _synthetic_cal(), SpotLoopParams()
-    out = fuse_edges(_patch_fixes(50.0 + q), cal, params)
-    assert out.reason == "" and out.note == ""
-    assert out.per_edge_um[0] == pytest.approx(q, abs=0.03)
-    assert out.per_edge_um[1] == pytest.approx(q, abs=0.03)
+    out = loop_error(_patch_fix(50.0 + q), cal, params)
+    assert out.reason == ""
     assert out.along_um == pytest.approx(q, abs=0.03)
-    assert out.disagreement_um < 0.05
 
 
-def test_lateral_move_gives_a_disagreement():
+def test_lateral_move_along_the_normal_reads_as_an_error():
+    """With one edge a lateral shift along its normal cannot be told from focus."""
     cal, params = _synthetic_cal(), SpotLoopParams()
-    # P is 0.5 um off, so neither edge is at the target once x shifts too
-    out = fuse_edges(_patch_fixes(50.5, dx=3.0), cal, params)  # only x moves
-    assert out.per_edge_um[0] == pytest.approx(0.5 + 3.0 / SX, abs=0.03)
-    assert out.per_edge_um[1] == pytest.approx(0.5, abs=0.03)
-    assert out.along_um is None
-    assert out.reason.startswith("edges disagree by")
-    # a vertical shift disagrees in the other direction
-    out = fuse_edges(_patch_fixes(50.5, dy=-3.0), cal, params)
-    assert out.along_um is None and out.reason
-    # a 1 px shift stays under the default limit and still fuses
-    assert fuse_edges(_patch_fixes(50.0, dx=1.0), cal, params).reason == ""
+    out = loop_error(_patch_fix(50.0, dx=3.0), cal, params)
+    assert out.reason == "" and out.along_um == pytest.approx(3.0 / SX, abs=0.03)
+    # a shift along the edge does not move it
+    out = loop_error(_patch_fix(50.0, dy=-3.0), cal, params)
+    assert out.reason == "" and out.along_um == pytest.approx(0.0, abs=0.03)
 
 
-def test_lateral_move_holds_on_the_edge_that_is_at_target():
-    cal, params = _synthetic_cal(), SpotLoopParams()
-    out = fuse_edges(_patch_fixes(50.0, dx=3.0), cal, params)  # only x moves
-    assert out.reason == "" and out.held_edge == 1  # the y edge did not move
-    assert out.along_um == pytest.approx(0.0, abs=0.03)
-    out = fuse_edges(_patch_fixes(50.0, dy=-3.0), cal, params)
-    assert out.reason == "" and out.held_edge == 0
-
-
-def _two_edge_loop(*, start_off=0.8, steps=40, dx=0.0):
+def _edge_loop(*, start_off=0.8, steps=40, dx=0.0):
     cal, p0 = _synthetic_cal(), 50.0
     ctrl = SpotFocusController(
         SpotLoopParams(max_excursion_um=3.0, avg_frames=1),
@@ -1292,7 +1136,7 @@ def _two_edge_loop(*, start_off=0.8, steps=40, dx=0.0):
     params = ctrl.params
     history = [ctrl.p_cmd_um]
     for k in range(steps):
-        out = fuse_edges(_patch_fixes(ctrl.p_cmd_um, dx=dx), cal, params)
+        out = loop_error(_patch_fix(ctrl.p_cmd_um, dx=dx), cal, params)
         if out.reason:
             ctrl.bad(out.reason)
         else:
@@ -1305,31 +1149,30 @@ def _two_edge_loop(*, start_off=0.8, steps=40, dx=0.0):
     return ctrl, np.asarray(history) - p0
 
 
-def test_two_edge_closed_loop_converges_without_search():
-    ctrl, hist = _two_edge_loop()
+def test_edge_closed_loop_converges_without_search():
+    ctrl, hist = _edge_loop()
     assert ctrl.fault is None
     assert hist[0] == pytest.approx(0.8)
     assert abs(hist[-1]) < 0.04
     assert ctrl.n_moves <= 8
     assert np.all(np.diff(np.abs(hist)) <= 1e-9)  # straight in, no overshoot
-    ctrl2, hist2 = _two_edge_loop(start_off=-0.8)
+    ctrl2, hist2 = _edge_loop(start_off=-0.8)
     assert ctrl2.fault is None and abs(hist2[-1]) < 0.04
 
 
-def test_two_edge_loop_stops_on_a_lateral_shift():
-    """A lateral shift is a strike, not a move: the piezo is held, then faults."""
-    ctrl, hist = _two_edge_loop(start_off=0.5, dx=3.0)
+def test_persistent_bad_fix_faults_after_strikes():
+    params = SpotLoopParams(strikes=5, deadband_um=0.1)
+    ctrl, cal = SpotFocusController(params, 50.0), _one()
+    bad = _fix(272.0, ok=False, reason="edge lost (test)")
+    k = 0
+    for k in range(60):
+        out = loop_error(bad, cal, params)
+        ctrl.bad(out.reason)
+        if ctrl.fault:
+            break
+    assert ctrl.fault == "edge lost (test)"
+    assert k == 4  # the 5th consecutive bad frame
     assert ctrl.n_moves == 0
-    assert ctrl.fault is not None and "edges disagree" in ctrl.fault
-    assert np.all(hist == 0.5)
-
-
-def test_two_edge_loop_holds_through_a_lateral_shift_at_target():
-    """The y edge stays at target, so the loop holds on it and never faults."""
-    ctrl, hist = _two_edge_loop(start_off=0.0, dx=3.0, steps=60)
-    assert ctrl.fault is None
-    assert ctrl.n_moves == 0
-    assert np.all(np.abs(hist) < 0.04)
 
 
 # ---------------------------------------------------------------------------
@@ -1714,14 +1557,13 @@ def test_old_calibration_without_the_new_keys_loads_as_halfmax():
     assert math.isnan(loaded.edge_width_px) and loaded.box_normal_px == 0
     assert loaded.slope_px_per_um == cal.slope_px_per_um
     # through the persisted forms: the two-level one and the old single-edge dict
-    focus = FocusCalibration(edges=[cal], p0_um=50.0).to_dict()
-    for e in focus["edges"]:
-        for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
-            e.pop(k)
+    focus = FocusCalibration(edge=cal, p0_um=50.0).to_dict()
+    for k in ("detector", "detector_sigma_px", "edge_width_px", "box_normal_px"):
+        focus["edge"].pop(k)
     got, msg = load_calibration(focus)
-    assert msg == "" and got is not None and got.edges[0].detector == "halfmax"
+    assert msg == "" and got is not None and got.edge.detector == "halfmax"
     got, msg = load_calibration(old)
-    assert msg == "" and got is not None and got.edges[0].detector == "halfmax"
+    assert msg == "" and got is not None and got.edge.detector == "halfmax"
 
 
 def test_calibration_nan_width_is_json_clean_and_unknown_detector_is_rejected():
@@ -1738,17 +1580,17 @@ def test_rezero_keeps_the_detector():
     cal = _fit(*_sweep(), detector="gaussderiv", detector_sigma_px=5.0)
     new = rezero(cal, e0_px=280.5, p0_um=51.25)
     assert (new.detector, new.detector_sigma_px) == ("gaussderiv", 5.0)
-    focus = FocusCalibration(edges=[cal], p0_um=50.0).rezeroed([281.0], 51.0)
-    assert (focus.edges[0].detector, focus.edges[0].detector_sigma_px) == (
+    focus = FocusCalibration(edge=cal, p0_um=50.0).rezeroed(281.0, 51.0)
+    assert (focus.edge.detector, focus.edge.detector_sigma_px) == (
         "gaussderiv",
         5.0,
     )
 
 
 def test_detector_mismatch():
-    hm = FocusCalibration(edges=[_edge(BOX_LEFT, "x", 2.0, 272.0)], p0_um=50.0)
+    hm = FocusCalibration(edge=_edge(BOX_LEFT, "x", 2.0, 272.0), p0_um=50.0)
     gd = FocusCalibration(
-        edges=[_edge(BOX_LEFT, "x", 2.0, 272.0, detector="gaussderiv")], p0_um=50.0
+        edge=_edge(BOX_LEFT, "x", 2.0, 272.0, detector="gaussderiv"), p0_um=50.0
     )
     assert detector_mismatch(hm, "halfmax") == ""
     assert detector_mismatch(hm, "halfmax", 9.0) == ""  # sigma is ignored by halfmax
@@ -1761,12 +1603,3 @@ def test_detector_mismatch():
     )
     why = detector_mismatch(gd, "gaussderiv", 8.0)
     assert "sigma 6 px" in why and "sigma 8 px" in why and "recalibrate" in why
-    # two edges: one stale edge is enough
-    mixed = FocusCalibration(
-        edges=[
-            _edge(BOX_LEFT, "x", 2.0, 272.0, detector="gaussderiv"),
-            _edge(BOX_TOP, "y", 1.9, 194.0),
-        ],
-        p0_um=50.0,
-    )
-    assert "calibrated with halfmax" in detector_mismatch(mixed, "gaussderiv")

@@ -6,10 +6,13 @@ label, lock word), the four status words, the embedded
 :class:`~CRISPy.spot.panel.SpotFocusPanel` (controls, message line, live image,
 toolbars, sections) and a Joystick checkbox in the panel's control row.
 
-It holds the ``ASICrispController`` only for ``set_joystick_enabled``: no reads, no
-poller, no serial-line gating. The spot service is the only writer of CRISP State and
-LED. The panel is a child, so it shuts the lock down (restoring CRISP) when this
-widget is destroyed or the application quits.
+It holds the ``ASICrispController`` and hands it to the panel's spot service: no reads,
+no poller, no serial-line gating. The service lights the LED with raw ``LK F=90/79``
+(it never writes CRISP State) and owns the joystick lock: it turns the wheel off while
+the lock runs and restores it on Stop, fault, worker death and shutdown. The Joystick
+checkbox only shows that state, and is a manual override (a direct write). The panel is
+a child, so it shuts the lock down (restoring the wheel) when this widget is destroyed
+or the application quits.
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ from contextlib import suppress
 from typing import Any
 
 from qtpy.QtWidgets import (
-    QApplication,
     QCheckBox,
     QGridLayout,
     QHBoxLayout,
@@ -31,20 +33,6 @@ from . import piezo_status
 from .controller import ASICrispController
 from .spot.panel import SpotFocusPanel
 from .spot.store import get_settings_store
-
-
-class _WheelGuard:
-    """Re-enables the wheel at teardown if the lock had disabled it (no Qt refs)."""
-
-    def __init__(self, controller: ASICrispController) -> None:
-        self.controller = controller
-        self.lock_active = False
-
-    def restore(self) -> None:
-        if self.lock_active:
-            self.lock_active = False
-            with suppress(Exception):
-                self.controller.set_joystick_enabled(True)
 
 
 class PiezoSpotWidget(QWidget):
@@ -95,7 +83,11 @@ class PiezoSpotWidget(QWidget):
         crisp = store.crisp_label if store.crisp_label is not None else controller.label
         # The panel stops its worker when it is destroyed, i.e. with this widget.
         self.panel = SpotFocusPanel(
-            mmcore, parent=self, piezo_label=piezo, crisp_label=crisp
+            mmcore,
+            parent=self,
+            piezo_label=piezo,
+            crisp_label=crisp,
+            controller=controller,
         )
         layout.addWidget(self.panel, 1)
 
@@ -104,26 +96,8 @@ class PiezoSpotWidget(QWidget):
         self.joystick_chk.setChecked(True)
         self.panel.control_extra_layout.addWidget(self.joystick_chk)
         self.joystick_chk.toggled.connect(self._on_joystick_toggled)
-        self.panel.lockActiveChanged.connect(self._on_lock_active)
-
-        # The lock turns the wheel off on lock-active. If this widget is destroyed
-        # (config reload) or the app quits while the lock is active, nothing else
-        # would turn it back on and the wheel would stay off with no UI. The holder
-        # does not reference self, so the destroyed/aboutToQuit connections stay
-        # valid after the C++ object is gone.
-        self._wheel_guard = holder = _WheelGuard(controller)
-        app = QApplication.instance()
-
-        def _on_destroyed(*_: object) -> None:
-            holder.restore()
-            if app is not None:
-                # Drop the quit hook so reloads do not pile up connections.
-                with suppress(Exception):
-                    app.aboutToQuit.disconnect(holder.restore)
-
-        self.destroyed.connect(_on_destroyed)
-        if app is not None:
-            app.aboutToQuit.connect(holder.restore)
+        self._wheel_locked = False  # mirrors the service's joystick lock
+        self.panel.lockActiveChanged.connect(self._sync_joystick_box)
 
         self.panel.statusChanged.connect(self._refresh)
         self._refresh()
@@ -138,25 +112,27 @@ class PiezoSpotWidget(QWidget):
         """Manual override; allowed at any time, including while the lock is active."""
         self._write_joystick(checked)
 
-    def _on_lock_active(self, active: bool) -> None:
-        """Set the box and the wheel from the lock's activity (a lock edge).
+    def _sync_joystick_box(self, *_: object) -> None:
+        """Show the service's joystick lock in the box (display only, no write).
 
-        The wheel is written explicitly on every edge, not only when the box
-        changes: the box and the wheel can disagree (the user may have toggled the
-        box while locked, or the box may already show the wanted value).
+        The service writes the wheel itself; this only follows its flag, and only
+        when the flag changes, so a manual toggle of the box persists until then.
         """
-        want = piezo_status.joystick_for_lock(active)
+        svc = self.panel.service
+        locked = bool(svc is not None and svc.joystick_locked)
+        if locked == self._wheel_locked:
+            return
+        self._wheel_locked = locked
         blocked = self.joystick_chk.blockSignals(True)
         try:
-            self.joystick_chk.setChecked(want)
+            self.joystick_chk.setChecked(not locked)
         finally:
             self.joystick_chk.blockSignals(blocked)
-        self._write_joystick(want)
-        self._wheel_guard.lock_active = bool(active)
 
     # -------------------------------------------------------------- status
     def _refresh(self) -> None:
         """Update the lock word and the four status words (cheap, no I/O)."""
+        self._sync_joystick_box()
         words = piezo_status.status_words(self.panel.status_inputs())
         self.lock_status_label.setText(f"Lock: {words.lock}")
         self.camera_status_label.setText(f"Camera: {words.camera}")

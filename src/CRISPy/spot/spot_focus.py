@@ -16,9 +16,8 @@ sub-pixel number that needs no search.
   px/um and linear range from a piezo sweep; persistence that never raises.
 - :func:`edge_error` / :func:`check_fix` -- the focus error in um and the
   per-frame sanity checks.
-- :class:`FocusCalibration` / :func:`fuse_edges` -- one or two calibrated
-  edges and their inverse-variance fusion, with a disagreement check that
-  catches lateral image shifts (holds on the edge already at target, else bad).
+- :class:`FocusCalibration` / :func:`loop_error` -- the calibrated edge with its
+  piezo zero, and the per-frame focus error (or bad-frame reason) for the loop.
 - :class:`SpotLoopParams` / :class:`SpotFocusController` -- dead band, PI
   control, step clamp, rate cap and fault logic. It only ever returns targets;
   sending them to the stage is somebody else's job.
@@ -45,6 +44,7 @@ _RED_SITE = {"RGGB": (0, 0), "BGGR": (1, 1), "GRBG": (0, 1), "GBRG": (1, 0)}
 _BAND = 0.15  # outer fraction of the box (along the normal) used for the levels
 _OLD_CAL_MSG = "old spot calibration ignored; recalibrate"
 _NO_CAL_MSG = "no spot calibration yet; press Calibrate"
+_EDGE2_DROPPED_MSG = "edge 2 dropped: single edge box only"
 
 #: The edge detectors :func:`measure_edge` knows; the first is the default.
 EDGE_DETECTORS = ("gaussderiv", "halfmax")
@@ -670,38 +670,34 @@ class EdgeCalibration:
 
 @dataclass
 class FocusCalibration:
-    """One or two calibrated edges that share a zero piezo position.
+    """One calibrated edge and the piezo position of its zero."""
 
-    ``edges[0]`` is box 1 (the main edge); the optional ``edges[1]`` is box 2.
-    Each edge has its own slope and sign; :func:`fuse_edges` combines them.
-    """
-
-    edges: list[EdgeCalibration]
-    """The calibrated edges, one or two."""
+    edge: EdgeCalibration
+    """The calibrated edge."""
     p0_um: float
-    """Piezo P at the zero (the same for every edge)."""
+    """Piezo P at the zero."""
     created: str = ""
     """ISO timestamp of the calibration."""
     record_path: str = ""
     """Where the raw calibration frames were saved, if anywhere."""
     warnings: list[str] = field(default_factory=list)
-    kind: str = "edges"
+    kind: str = "edge"
 
     @property
-    def boxes(self) -> list[tuple[int, int, int, int]]:
-        """The edge boxes, box 1 first."""
-        return [e.box for e in self.edges]
+    def box(self) -> tuple[int, int, int, int]:
+        """The edge box ``(x, y, w, h)``."""
+        return self.edge.box
 
     @property
     def linear_range_um(self) -> float:
-        """Smallest calibrated half-range over the edges."""
-        return min(e.linear_range_um for e in self.edges)
+        """Calibrated half-range of the edge."""
+        return self.edge.linear_range_um
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly dict."""
         return {
             "kind": self.kind,
-            "edges": [e.to_dict() for e in self.edges],
+            "edge": self.edge.to_dict(),
             "p0_um": float(self.p0_um),
             "created": str(self.created),
             "record_path": str(self.record_path),
@@ -712,69 +708,74 @@ class FocusCalibration:
     def from_dict(cls, d: Mapping[str, Any]) -> FocusCalibration:
         """Build from :meth:`to_dict` output; unknown keys are ignored.
 
-        A single ``"edge"`` dict (:meth:`EdgeCalibration.to_dict`, the format
-        saved before two-edge fusion) is wrapped into a one-edge calibration;
-        its ``p0_um``, ``created``, ``record_path`` and ``warnings`` carry over.
+        Older formats also load: ``{"edges": [e1, e2?]}`` (two-edge fusion,
+        ``kind == "edges"``) keeps only ``edges[0]`` and, if a second edge was
+        there, adds the warning "edge 2 dropped: single edge box only"; a bare
+        :meth:`EdgeCalibration.to_dict` (``kind == "edge"`` with no nested
+        ``"edge"``) is wrapped, its ``p0_um``, ``created``, ``record_path`` and
+        ``warnings`` carrying over.
 
         Raises
         ------
         ValueError
-            If ``kind`` is neither ``"edges"`` nor ``"edge"`` (for example an
-            old Gaussian spot calibration), the edge count is not 1 or 2, a
-            required key is missing or a value is malformed.
+            If ``kind`` is not an edge calibration (for example an old Gaussian
+            spot calibration), there is no edge, a required key is missing or a
+            value is malformed.
         """
         try:
             kind = d.get("kind")
-            if kind == "edge":
+            if kind == "edge" and "edge" not in d:
                 edge = EdgeCalibration.from_dict(d)
                 return cls(
-                    edges=[edge],
+                    edge=edge,
                     p0_um=edge.p0_um,
                     created=edge.created,
                     record_path=edge.record_path,
                     warnings=list(edge.warnings),
                 )
-            if kind != "edges":
+            warnings = [str(w) for w in d.get("warnings", [])]
+            if kind == "edges":
+                edges = list(d["edges"])
+                if not edges:
+                    raise ValueError("a focus calibration needs an edge")
+                edge = EdgeCalibration.from_dict(edges[0])
+                if len(edges) > 1:
+                    warnings.append(_EDGE2_DROPPED_MSG)
+            elif kind == "edge":
+                edge = EdgeCalibration.from_dict(d["edge"])
+            else:
                 raise ValueError("not an edge calibration")
-            edges = [EdgeCalibration.from_dict(e) for e in d["edges"]]
-            if len(edges) not in (1, 2):
-                raise ValueError("a focus calibration needs 1 or 2 edges")
             p0 = float(d["p0_um"])
             if not math.isfinite(p0):
                 raise ValueError("non-finite p0_um")
             return cls(
-                edges=edges,
+                edge=edge,
                 p0_um=p0,
                 created=str(d.get("created", "")),
                 record_path=str(d.get("record_path", "")),
-                warnings=[str(w) for w in d.get("warnings", [])],
+                warnings=warnings,
             )
         except (KeyError, TypeError, AttributeError) as exc:
             raise ValueError(f"malformed focus calibration: {exc!r}") from exc
 
-    def rezeroed(self, e0_px: Sequence[float], p0_um: float) -> FocusCalibration:
-        """Return a copy with a new zero for every edge.
+    def rezeroed(self, e0_px: float, p0_um: float) -> FocusCalibration:
+        """Return a copy with a new zero.
 
         Parameters
         ----------
-        e0_px : Sequence[float]
-            The edge position that now counts as in focus, one per edge.
+        e0_px : float
+            The edge position that now counts as in focus.
         p0_um : float
             Piezo P at that zero.
 
         Returns
         -------
         FocusCalibration
-            Slopes, ranges and sweeps are kept.
+            Slope, range and sweep are kept.
         """
-        if len(e0_px) != len(self.edges):
-            raise ValueError(f"need {len(self.edges)} zero positions, got {len(e0_px)}")
         return replace(
             self,
-            edges=[
-                rezero(e, e0_px=e0, p0_um=p0_um)
-                for e, e0 in zip(self.edges, e0_px, strict=True)
-            ],
+            edge=rezero(self.edge, e0_px=float(e0_px), p0_um=p0_um),
             p0_um=float(p0_um),
             warnings=list(self.warnings),
         )
@@ -789,7 +790,7 @@ def load_calibration(
     ----------
     d : Mapping[str, Any] | None
         What :meth:`FocusCalibration.to_dict` (or, from older versions,
-        :meth:`EdgeCalibration.to_dict`) produced, or anything else.
+        the two-edge form or :meth:`EdgeCalibration.to_dict`) produced, or anything else.
 
     Returns
     -------
@@ -819,7 +820,7 @@ def detector_mismatch(
     Parameters
     ----------
     cal : FocusCalibration
-        The calibration (its edges carry the detector they were made with).
+        The calibration (its edge carries the detector it was made with).
     detector : str
         The detector in the settings.
     sigma_px : float
@@ -828,21 +829,21 @@ def detector_mismatch(
     Returns
     -------
     str
-        "" when every edge was calibrated with this detector, else a plain
+        "" when the edge was calibrated with this detector, else a plain
         message such as "calibrated with halfmax; the detector setting is
         gaussderiv: recalibrate".
     """
-    for e in cal.edges:
-        if e.detector != detector:
-            return (
-                f"calibrated with {e.detector}; the detector setting is "
-                f"{detector}: recalibrate"
-            )
-        if detector == "gaussderiv" and abs(e.detector_sigma_px - sigma_px) > 1e-6:
-            return (
-                f"calibrated with gaussderiv sigma {e.detector_sigma_px:g} px; "
-                f"the setting is sigma {sigma_px:g} px: recalibrate"
-            )
+    e = cal.edge
+    if e.detector != detector:
+        return (
+            f"calibrated with {e.detector}; the detector setting is "
+            f"{detector}: recalibrate"
+        )
+    if detector == "gaussderiv" and abs(e.detector_sigma_px - sigma_px) > 1e-6:
+        return (
+            f"calibrated with gaussderiv sigma {e.detector_sigma_px:g} px; "
+            f"the setting is sigma {sigma_px:g} px: recalibrate"
+        )
     return ""
 
 
@@ -1088,124 +1089,46 @@ def check_fix(fix: EdgeFix, cal: EdgeCalibration, params: SpotLoopParams) -> str
 
 
 @dataclass(frozen=True)
-class FusedError:
-    """The focus error from one or two edges, with its health information."""
+class EdgeError:
+    """The focus error from the calibrated edge, with its health information."""
 
     along_um: float | None
-    """Fused error minus ``params.offset_um``; None when unusable."""
+    """``edge_error(fix, edge, params.offset_um)``; None when unusable."""
     sigma_um: float
-    """``1 / sqrt(sum w)`` of the edges used (nan if none was good)."""
-    used: tuple[bool, ...]
-    """Per edge: it passed :func:`check_fix` (and so entered the fusion)."""
-    per_edge_um: tuple[float | None, ...]
-    """Per edge ``edge_error(fix, edge, 0)``, or None if that edge is bad."""
-    disagreement_um: float | None
-    """``|a1 - a2|`` when two edges are good, else None."""
+    """Single-measurement noise of the edge (:func:`edge_noise_um`); nan when the
+    fix is bad."""
     reason: str = ""
     """Non-empty: a bad measurement (counts as a strike, no move)."""
-    note: str = ""
-    """Informational, e.g. "edge 2 lost (...); using edge 1" (not a strike)."""
-    held_edge: int | None = None
-    """0-based index of the edge used alone because the two edges disagreed
-    (the panel's "Edge 1" is 0); None otherwise."""
 
 
-def fuse_edges(
-    fixes: Sequence[EdgeFix], cal: FocusCalibration, params: SpotLoopParams
-) -> FusedError:
-    """Combine the edge fixes of one frame into one focus error.
+def loop_error(
+    fix: EdgeFix, cal: FocusCalibration, params: SpotLoopParams
+) -> EdgeError:
+    """Turn one frame's edge fix into the focus error for the loop.
 
-    Every edge is checked with :func:`check_fix`. Two good edges give two
-    estimates ``a_i = edge_error(fix_i, edge_i, 0)``; if they differ by more
-    than ``max(params.max_edge_disagreement_um, 4 * sqrt(n1**2 + n2**2))``
-    (``n_i`` = :func:`edge_noise_um`) a lateral shift moved one edge but not
-    the other, so the mean cannot be trusted. If the edge nearest the target
-    (``params.offset_um``) is within ``params.hold_band_um`` of it, the frame
-    holds on that edge alone (``held_edge`` and ``note`` say so, no strike);
-    otherwise the frame is bad. When the edges agree the inverse-variance mean
-    is used.
-    With only one good edge of two it is used alone and the loss is reported in
-    ``note``. With none the frame is bad. ``params.offset_um`` is subtracted
-    once at the end.
+    The fix is checked with :func:`check_fix`; a bad fix gives ``along_um=None``
+    and the reason. Otherwise ``along_um`` is
+    ``edge_error(fix, cal.edge, params.offset_um)``.
 
     Parameters
     ----------
-    fixes : Sequence[EdgeFix]
-        One fix per calibrated edge, in the order of ``cal.edges``.
+    fix : EdgeFix
+        The measurement of the (single) edge box.
     cal : FocusCalibration
-        The calibration (zeros, signed slopes and noise).
+        The calibration (zero, signed slope and noise).
     params : SpotLoopParams
-        Check limits, the disagreement limit and the offset.
+        Check limits and the offset.
 
     Returns
     -------
-    FusedError
+    EdgeError
         ``along_um`` is None whenever ``reason`` is non-empty.
-
-    Raises
-    ------
-    ValueError
-        If ``len(fixes) != len(cal.edges)``.
     """
-    n = len(cal.edges)
-    if len(fixes) != n:
-        raise ValueError(f"need {n} edge fix(es), got {len(fixes)}")
-    reasons = [check_fix(f, e, params) for f, e in zip(fixes, cal.edges, strict=True)]
-    per_edge: tuple[float | None, ...] = tuple(
-        None if r else edge_error(f, e, 0.0)
-        for f, e, r in zip(fixes, cal.edges, reasons, strict=True)
-    )
-    used = tuple(not r for r in reasons)
-    estimates = {i: v for i, v in enumerate(per_edge) if v is not None}
-    good = list(estimates)
-    if not good:
-        return FusedError(None, float("nan"), used, per_edge, None, reason=reasons[0])
-
-    noise = {i: edge_noise_um(cal.edges[i]) for i in good}
-    weight = {i: 1.0 / noise[i] ** 2 for i in good}
-    total = sum(weight.values())
-    sigma = 1.0 / math.sqrt(total)
-    disagreement: float | None = None
-    note = ""
-    if len(good) == 2:
-        disagreement = abs(estimates[0] - estimates[1])
-        limit = max(
-            params.max_edge_disagreement_um,
-            4.0 * math.sqrt(noise[0] ** 2 + noise[1] ** 2),
-        )
-        if disagreement > limit:
-            k = min(good, key=lambda i: abs(estimates[i] - params.offset_um))
-            near = abs(estimates[k] - params.offset_um)
-            if near <= params.hold_band_um:
-                return FusedError(
-                    estimates[k] - params.offset_um,
-                    noise[k],
-                    used,
-                    per_edge,
-                    disagreement,
-                    note=(
-                        f"edges disagree by {disagreement:.2f} um; holding on "
-                        f"edge {k + 1} ({near:.2f} um from target)"
-                    ),
-                    held_edge=k,
-                )
-            return FusedError(
-                None,
-                sigma,
-                used,
-                per_edge,
-                disagreement,
-                reason=(
-                    f"edges disagree by {disagreement:.2f} um "
-                    "(lateral drift or a changed image)"
-                ),
-            )
-    elif n == 2:
-        lost = 1 - good[0]
-        note = f"edge {lost + 1} lost ({reasons[lost]}); using edge {good[0] + 1}"
-    fused = sum(weight[i] * estimates[i] for i in good) / total
-    return FusedError(
-        fused - params.offset_um, sigma, used, per_edge, disagreement, note=note
+    reason = check_fix(fix, cal.edge, params)
+    if reason:
+        return EdgeError(None, float("nan"), reason=reason)
+    return EdgeError(
+        edge_error(fix, cal.edge, params.offset_um), edge_noise_um(cal.edge)
     )
 
 
@@ -1231,11 +1154,6 @@ class SpotLoopParams:
     min_valid_fraction: float = 0.5
     max_angle_change_deg: float = 5.0
     max_edge_residual_px: float = 3.0
-    max_edge_disagreement_um: float = 1.0
-    """Two edges whose um estimates differ by more disagree (a bad measurement
-    unless one of them is within ``hold_band_um`` of the target)."""
-    hold_band_um: float = 0.15
-    """A disagreeing frame is held on the edge within this of the target."""
     p_min_um: float | None = None
     """Lowest allowed absolute P; None = no absolute lower bound known."""
     p_max_um: float | None = None

@@ -1,4 +1,4 @@
-"""Status words, the one contextual message and the joystick policy (Qt-free).
+"""Status words and the one contextual message of the piezo spot panel (Qt-free).
 
 The piezo panel's spot-lock section shows five status words (Lock, Camera, LED,
 Edge box, Calibration), a tracking-error label and ONE contextual message line. This
@@ -6,9 +6,9 @@ module maps the spot panel's existing state to them. It is pure: no Qt, no I/O, 
 hardware. The caller (the panel) fills a :class:`SpotStatusInputs` from its own
 attributes and asks for the words and the message.
 
-Only ONE edge box exists in this UI. A saved ``edge_box_2`` is ignored by the caller,
-and a calibration made with two edges is reported as stale: the caller sets
-``box_changed`` when the calibration's edge count differs from 1.
+Only ONE edge box exists, in the UI and in the core. A saved ``edge_box_2`` is
+ignored when settings load, and an old two-edge calibration loads with its first edge.
+The caller sets ``box_changed`` when the drawn box differs from the calibration's box.
 
 Message priority (the first match wins; the wording is copied from
 ``spot/panel.py`` and ``spot/spot_focus*.py``, the source line is named at each
@@ -137,18 +137,16 @@ class SpotStatusInputs:
     led_error : str
         The LED failure text ("" when none; panel.py ``_on_led_failed``).
     edge_box_set : bool
-        The single edge box is drawn (``_edge_box`` is not None). A saved second
-        box is ignored by the caller.
+        The single edge box is drawn (``_edge_box`` is not None).
     calibration_present : bool
         A usable calibration is loaded (``_cal`` is not None).
     detector_mismatch : str
         Why the calibration does not fit the detector setting ("" if it does;
         panel.py ``_mismatch_text()``).
     box_changed : bool
-        The drawn box differs from the calibration's box, or the calibration was
-        made with other than exactly one edge (panel.py ``_refresh_calibration``
-        compares the snapped boxes). A two-edge calibration is reported here so it
-        comes out as "Stale (edge box changed)".
+        The drawn box differs from the calibration's box (panel.py
+        ``_refresh_calibration`` compares the snapped boxes); it comes out as
+        "Stale (edge box changed)".
     fault_reason : str
         The lock's fault reason ("" when none; panel.py ``_on_fault``).
     start_error, calibrate_error, zero_error, stop_error : str
@@ -334,14 +332,3 @@ def message(inp: SpotStatusInputs) -> str:
         return LOCKED_TEXT
     # 11. ready
     return READY_TEXT
-
-
-def joystick_for_lock(lock_active: bool) -> bool:
-    """Return whether the joystick should be enabled for the lock's activity.
-
-    The joystick is enabled iff the lock is not active. The checkbox starts checked;
-    ``lockActiveChanged(True)`` unchecks it (returns False) and
-    ``lockActiveChanged(False)`` checks it again (returns True). The user may still
-    toggle it manually at any time.
-    """
-    return not lock_active
