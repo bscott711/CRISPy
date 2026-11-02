@@ -9,7 +9,7 @@ toolbars, sections) and a Joystick checkbox in the panel's control row.
 It holds the ``ASICrispController`` and hands it to the panel's spot service: no reads,
 no poller, no serial-line gating. The service lights the LED with raw ``LK F=90/79``
 (it never writes CRISP State) and owns the joystick lock: it turns the wheel off while
-the lock runs and restores it on Stop, fault, worker death and shutdown. The Joystick
+the lock runs and restores it on unlock, fault, worker death and shutdown. The Joystick
 checkbox only shows that state, and is a manual override (a direct write). The panel is
 a child, so it shuts the lock down (restoring the wheel) when this widget is destroyed
 or the application quits.
@@ -88,6 +88,7 @@ class PiezoSpotWidget(QWidget):
             piezo_label=piezo,
             crisp_label=crisp,
             controller=controller,
+            auto_preview=True,  # the docked panel opens with the camera live
         )
         layout.addWidget(self.panel, 1)
 

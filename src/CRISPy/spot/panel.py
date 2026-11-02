@@ -5,12 +5,13 @@ straight edge of the CRISP LED patch on a side camera in a worker
 process and holds piezo P by nudging it rarely. This panel
 
 - lets the user draw the edge box across the edge that moves with focus (in the
-  live view; ONE edge),
-  calibrates it (**Calibrate**: a piezo sweep around the present P, on a
+  live view; ONE edge; Calibration section, **1. Draw Edge**),
+  calibrates it (**2. Calibrate**: a piezo sweep around the present P, on a
   background thread), makes the present edge position the zero (**Zero here**)
   and sets a focus **Offset**;
-- locks and unlocks the loop (**Lock** / **Stop**; it runs until Stop,
-  independent of any MDA; Lock with no valid calibration calibrates first);
+- locks and unlocks the loop (one **Locked** / **Unlocked** toggle; it runs until
+  unlocked, independent of any MDA; locking with no valid calibration calibrates
+  first);
 - runs the camera: SDK folder, Preview (which streams into the full-resolution
   :class:`~CRISPy.spot.live_view.SpotLiveView`, docked in the panel's layout or
   popped out into its own window), exposure, gain, channel and ROI, all applied
@@ -22,13 +23,14 @@ process and holds piezo P by nudging it rarely. This panel
 
 The panel is one plain column: control row, offset / tracking error, ONE message
 line (:func:`CRISPy.piezo_status.message`), the live image, toolbar rows, the frame
-statistics and four section buttons (Camera, Calibration settings, Diagnostics,
-Advanced; one open at a time). A host puts the status words above it from
+statistics and four section buttons (Camera, Calibration, Diagnostics, Advanced;
+one open at a time). A host puts the status words above it from
 :meth:`SpotFocusPanel.status_inputs` (re-read on ``statusChanged``).
 
 Everything is written to the settings store's ``spot_focus`` settings
 (:mod:`~CRISPy.spot.store`). The service is created
-lazily on Preview, Lock, Calibrate or Zero and shut down with the panel or the app.
+lazily on Preview, Lock, Calibrate or Zero (or at once, with ``auto_preview``)
+and shut down with the panel or the app.
 Its signals come from the reader thread, so each goes through a GUI-thread
 :class:`QObject` signal (Qt queues the call).
 """
@@ -67,6 +69,7 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -109,8 +112,11 @@ NOISE_GOOD_UM = 0.03
 NOISE_WARN_UM = 0.06
 #: A box must be this many edge widths long across the edge, per detector.
 _BOX_WIDTH_FACTOR = {"halfmax": 4.0, "gaussderiv": 2.0}
-#: Shown when Calibrate or Lock has no edge box to measure.
-NEED_BOX_TEXT = "Draw an edge box across the edge that moves with focus"
+#: Shown when Calibrate or Lock has no edge box to measure. Keep it equal to
+#: :data:`CRISPy.piezo_status.NEED_BOX_TEXT`.
+NEED_BOX_TEXT = (
+    "Draw an edge box across the edge that moves with focus (Calibration: 1. Draw Edge)"
+)
 
 #: Strip chart history, seconds.
 CHART_WINDOW_S = 300.0
@@ -484,6 +490,10 @@ class SpotFocusPanel(QWidget):
     controller : CrispController | None
         The host's CRISP controller, handed to the service for the raw LED
         commands and the joystick lock; ``None`` builds one from *crisp_label*.
+    auto_preview : bool
+        Start Preview once, when the panel is first shown (deferred to the event
+        loop). Off by default, so a panel built without a camera stays lazy; the
+        docked widget turns it on.
 
     Attributes
     ----------
@@ -491,8 +501,11 @@ class SpotFocusPanel(QWidget):
         ``True`` while the lock is starting, running, calibrating or zeroing (the
         host must not poll the Tiger then). :attr:`lockActiveChanged` fires when it changes.
     control_extra_layout : QHBoxLayout
-        An empty layout in its own row directly under the control row (Calibrate,
-        Zero here ... Lock, Stop): the host adds the Joystick checkbox here.
+        An empty layout in its own row directly under the control row (Zero here
+        ... Locked / Unlocked): the host adds the Joystick checkbox here.
+    lock_button : QPushButton
+        The one Lock toggle: checked and "Locked" while the lock runs (or has
+        faulted, until acknowledged), else "Unlocked".
     message_label : QLabel
         The one contextual line (plain text, from :func:`piezo_status.message`).
     tracking_error_label : QLabel
@@ -516,6 +529,7 @@ class SpotFocusPanel(QWidget):
         crisp_label: str | None = None,
         piezo_label: str | None = None,
         controller: CrispController | None = None,
+        auto_preview: bool = False,
     ) -> None:
         super().__init__(parent)
         self._mmc = mmcore
@@ -527,6 +541,9 @@ class SpotFocusPanel(QWidget):
         self._loading = False
         self._busy = ""  # "starting" / "calibrating" / "zeroing" while a thread works
         self._preview_busy = False  # a thread is opening the camera
+        self._auto_preview = auto_preview
+        self._auto_preview_done = False  # the one auto-start has fired
+        self._shut_down = False  # set by shutdown(); nothing starts again
         self._sensor: tuple[int, int] | None = None  # known once the camera is open
         self.state = "idle"
         self._telemetry: dict | None = None
@@ -548,9 +565,9 @@ class SpotFocusPanel(QWidget):
         self._tracking_error_um: float | None = None
 
         # -- controls ------------------------------------------------------
-        self.calibrate_button = QPushButton("Calibrate")
+        self.calibrate_button = QPushButton("2. Calibrate")
         self.calibrate_button.setToolTip(
-            "Focus on the cells first; sweeps P around here"
+            "Focus on the cells first; sweeps P around here, across the saved edge box"
         )
         self.calibrate_button.clicked.connect(self.calibrate)
         self.zero_button = QPushButton("Zero here")
@@ -559,19 +576,19 @@ class SpotFocusPanel(QWidget):
             "resets the offset"
         )
         self.zero_button.clicked.connect(self.zero)
-        self.start_button = QPushButton("Lock")
-        self.start_button.clicked.connect(self.start)
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop)
+        # One toggle: "Locked" while the lock runs (or faulted, until it is
+        # acknowledged), else "Unlocked". _update_enabled keeps text and state in
+        # step; the click only asks for the other state.
+        self.lock_button = QPushButton("Unlocked")
+        self.lock_button.setCheckable(True)
+        self.lock_button.clicked.connect(self._on_lock_clicked)
         #: An empty layout in its own row under the control row: the host puts the
         #: Joystick checkbox in it.
         self.control_extra_layout = QHBoxLayout()
         control_row = QHBoxLayout()
-        control_row.addWidget(self.calibrate_button)
         control_row.addWidget(self.zero_button)
         control_row.addStretch()
-        control_row.addWidget(self.start_button)
-        control_row.addWidget(self.stop_button)
+        control_row.addWidget(self.lock_button)
 
         self.offset_spin = self._spin(
             -5.0,
@@ -601,7 +618,7 @@ class SpotFocusPanel(QWidget):
         # -- edge box -------------------------------------------------------
         # The Draw edge button is this mirror of the view's: it also starts the
         # preview when needed. The view's own button stays hidden.
-        self.draw_edge_button = QPushButton("Draw edge")
+        self.draw_edge_button = QPushButton("1. Draw Edge")
         self.draw_edge_button.setCheckable(True)
         self.draw_edge_button.setToolTip(
             "Drag a rectangle in the Spot camera window across the edge of the LED "
@@ -712,7 +729,7 @@ class SpotFocusPanel(QWidget):
         section_row = QHBoxLayout()
         for name, title, page in (
             ("camera", "Camera", camera_page),
-            ("calibration", "Calibration settings", calibration_page),
+            ("calibration", "Calibration", calibration_page),
             ("diagnostics", "Diagnostics", diagnostics_page),
             ("advanced", "Advanced", advanced_page),
         ):
@@ -759,16 +776,12 @@ class SpotFocusPanel(QWidget):
         toolbar1.addWidget(view.one_to_one_button)
         toolbar1.addWidget(self.pop_out_button)
         toolbar1.addStretch()
+        toolbar1.addWidget(self.display_settings_button)
         toolbar2 = QHBoxLayout()
         toolbar2.addWidget(QLabel("Image region:"))
         toolbar2.addWidget(view.draw_roi_button)
         toolbar2.addWidget(self.full_frame_button)
         toolbar2.addStretch()
-        toolbar3 = QHBoxLayout()
-        toolbar3.addWidget(QLabel("Tracking edge:"))
-        toolbar3.addWidget(self.draw_edge_button)
-        toolbar3.addStretch()
-        toolbar3.addWidget(self.display_settings_button)
 
         # -- layout --------------------------------------------------------
         self._view_index = 0  # where the view goes back to
@@ -784,7 +797,6 @@ class SpotFocusPanel(QWidget):
         view.show()  # setParent hid it
         outer.addLayout(toolbar1)
         outer.addLayout(toolbar2)
-        outer.addLayout(toolbar3)
         outer.addWidget(self.frame_stats_label)
         outer.addLayout(section_row)
         for page in self.section_pages.values():
@@ -925,7 +937,7 @@ class SpotFocusPanel(QWidget):
         return page
 
     def _build_calibration_page(self) -> QWidget:
-        """The Calibration settings section: sweep, edge detector, box, summary."""
+        """The Calibration section: the two numbered steps, then the settings."""
         self.detector_combo = QComboBox()
         for name in EDGE_DETECTORS:
             self.detector_combo.addItem(EDGE_DETECTOR_LABELS[name], name)
@@ -966,9 +978,18 @@ class SpotFocusPanel(QWidget):
         box_row.addWidget(QLabel("Edge box (x, y, w, h)"))
         box_row.addWidget(self.edge_box_label, 1)
 
+        # The two steps, in order (like the CRISP Z panel's Calibration box). The
+        # saved edge box is reused: step 2 needs no redraw.
+        steps_box = QGroupBox("Calibration")
+        steps_box.setToolTip("In order: 1. Draw Edge -> 2. Calibrate.")
+        steps = QHBoxLayout(steps_box)
+        steps.addWidget(self.draw_edge_button)
+        steps.addWidget(self.calibrate_button)
+
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(steps_box)
         lay.addLayout(grid)
         lay.addLayout(box_row)
         lay.addWidget(self.calibration_label)
@@ -977,6 +998,7 @@ class SpotFocusPanel(QWidget):
     def _build_display_menu(self) -> QMenu:
         """The Display settings popup: Auto levels, Bayer to grey, zoom %."""
         view = self.live_view
+        view.auto_levels.setChecked(True)  # on by default (the view's own is off)
         menu = QMenu(self)
         # The view created these hidden; show them first (the menu sizes a widget
         # action from the widget as it is when the action is added).
@@ -1089,6 +1111,7 @@ class SpotFocusPanel(QWidget):
         if self.live_view.isWindow():
             self.live_view.hide()  # no orphan window; it is deleted with the panel
         self.preview_button.setChecked(False)
+        self._shut_down = True
         self._owner.shutdown()
         self._set_state("idle")
 
@@ -1149,9 +1172,12 @@ class SpotFocusPanel(QWidget):
 
     def _show_edge_box_text(self) -> None:
         box = self._edge_box
-        self.edge_box_label.setText(
-            "none" if box is None else ", ".join(str(int(v)) for v in box)
-        )
+        if box is None:
+            text = "none: 1. Draw Edge first"
+        else:
+            text = ", ".join(str(int(v)) for v in box)
+            text += " (saved; 1. Draw Edge to change)"
+        self.edge_box_label.setText(text)
 
     @staticmethod
     def _zero_point(edge: Any) -> tuple[float, float]:
@@ -1461,7 +1487,7 @@ class SpotFocusPanel(QWidget):
 
     def _on_edge_box_drawn(self, x: int, y: int, w: int, h: int) -> None:
         if self._busy or self.state == "running":
-            self._set_problem("_notice", "Stop the lock before moving the edge box.")
+            self._set_problem("_notice", "Unlock before moving the edge box.")
             return
         self.set_edge_box((x, y, w, h))
 
@@ -1706,6 +1732,23 @@ class SpotFocusPanel(QWidget):
             self._float_hidden = False
             if self.live_view.isWindow():
                 self.live_view.show()
+        if self._auto_preview and not self._auto_preview_done:
+            # Once, on the first show: later hides / shows never restart it, nor
+            # does turning Preview off.
+            self._auto_preview_done = True
+            QTimer.singleShot(0, self._auto_start_preview)
+
+    def _auto_start_preview(self) -> None:
+        """Start Preview after the first show, unless something else got there."""
+        if (
+            self._shut_down
+            or self.preview_button.isChecked()
+            or self._preview_busy
+            or self._busy
+            or self.state == "running"
+        ):
+            return
+        self._start_preview()  # no camera: the message line says so
 
     def _on_view_stats(self, fps: float, max_value: int, saturated_pct: float) -> None:
         self.frame_stats_label.setText(
@@ -1773,7 +1816,7 @@ class SpotFocusPanel(QWidget):
         """Drop stale problems so the message line shows the derived hint.
 
         Lock / Calibrate refused (no edge box, detector mismatch): the line says why
-        from the state. A fault is kept (the user acknowledges it with Stop).
+        from the state. A fault is kept (the user acknowledges it by unlocking).
         """
         if self.state == "fault":
             self._refresh_status()
@@ -1826,26 +1869,37 @@ class SpotFocusPanel(QWidget):
         running = self.state == "running"
         idle = not self._busy and not running
         mismatch = self._mismatch_text()
-        # Lock with no valid calibration calibrates first (needs an edge box).
+        # After a fault the lock session still holds the LED and the wheel until
+        # it is acknowledged, so the toggle stays "Locked" (the message line and
+        # the status word show the fault); clicking it unlocks through stop().
+        locked = running or self.state == "fault"
+        # Locking with no valid calibration calibrates first (needs an edge box).
         # A calibration made with another detector cannot be locked on.
-        self.start_button.setEnabled(idle and not mismatch)
+        self.lock_button.setChecked(locked)
+        self.lock_button.setText("Locked" if locked else "Unlocked")
+        self.lock_button.setEnabled(not self._busy and (locked or not mismatch))
         self.detector_combo.setEnabled(not self._busy)
         self.detector_sigma_spin.setEnabled(
             not self._busy and self._detector_setting()[0] == "gaussderiv"
         )
-        self.stop_button.setEnabled(running or self.state == "fault")
         self.calibrate_button.setEnabled(idle)
         self.zero_button.setEnabled(idle and self._cal is not None)
         self.draw_edge_button.setEnabled(idle)
-        if mismatch:
-            self.start_button.setToolTip(mismatch)
+        if self.state == "fault":
+            self.lock_button.setToolTip("Acknowledge the fault and unlock")
+        elif locked:
+            self.lock_button.setToolTip(
+                "Unlock: stop holding focus, release the LED and joystick"
+            )
+        elif mismatch:
+            self.lock_button.setToolTip(mismatch)
         elif self._cal is None:
-            # No calibration: Lock sweeps first.
-            self.start_button.setToolTip(
+            # No calibration: locking sweeps first.
+            self.lock_button.setToolTip(
                 "Calibrates first (focus on the cells, draw an edge box), then locks"
             )
         else:
-            self.start_button.setToolTip("Hold the edge at its zero until Stop")
+            self.lock_button.setToolTip("Hold the edge at its zero until unlocked")
         self._refresh_status()
 
     def _on_state(self, state: str) -> None:
@@ -1864,8 +1918,20 @@ class SpotFocusPanel(QWidget):
     # start / stop
     # ------------------------------------------------------------------
 
+    def _on_lock_clicked(self) -> None:
+        """The Locked / Unlocked toggle: unlock a running or faulted lock, else lock.
+
+        Locking is asynchronous, so the button is resynced to the real state rather
+        than left as clicked: it reads "Locked" only once the lock runs.
+        """
+        if self.state in ("running", "fault"):
+            self.stop()
+        else:
+            self.start()
+        self._update_enabled()
+
     def start(self) -> None:
-        """Lock (the Lock button); with no valid calibration, calibrate first.
+        """Lock (Unlocked -> Locked); with no valid calibration, calibrate first.
 
         The user has focused on the cells by eye, so the calibration's centre P
         becomes the zero and the lock starts on success.
@@ -1975,7 +2041,7 @@ class SpotFocusPanel(QWidget):
         self._set_state("idle")
 
     def stop(self) -> None:
-        """Stop the loop and release the LED and joystick (the Stop button).
+        """Stop the loop and release the LED and joystick (Locked -> Unlocked).
 
         Never moves P.
         """
@@ -1987,7 +2053,7 @@ class SpotFocusPanel(QWidget):
             except Exception as err:
                 logger.warning("spot focus stop failed", exc_info=True)
                 self._set_problem("_stop_error", str(err))
-        # After a fault the loop is already silent; Stop acknowledges it.
+        # After a fault the loop is already silent; unlocking acknowledges it.
         if self.state == "fault":
             self._clear_problem(refresh=False)
         self._notice = ""
@@ -2076,7 +2142,7 @@ class SpotFocusPanel(QWidget):
         self._refresh_calibration()
         self._update_enabled()
         # The preview shows the error from the new calibration (the lock keeps
-        # the one it started with; Stop sends it again).
+        # the one it started with; unlocking sends it again).
         if self.state != "running" and self._busy != "starting":
             self._send_preview_state()
 

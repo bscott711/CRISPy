@@ -88,7 +88,9 @@ NOT_AVAILABLE = "Not available"
 # -- message texts (copied; the panel will point here later) --------------------
 
 #: panel.py:107 ``NEED_BOX_TEXT``.
-NEED_BOX_TEXT = "Draw an edge box across the edge that moves with focus"
+NEED_BOX_TEXT = (
+    "Draw an edge box across the edge that moves with focus (Calibration: 1. Draw Edge)"
+)
 #: panel.py:1119-1121 (the single-box wording; two boxes are not reported).
 BOX_CHANGED_TEXT = "edge box changed since the calibration; recalibrate"
 #: Wording copied from the old panel text.

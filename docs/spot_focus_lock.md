@@ -450,10 +450,12 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   edge is still inside the box, so the loop walks back without any search.
 - **Anti-windup.** The integral only accumulates when the step is not clamped
   and the error is inside the linear range.
-- **Range.** A target more than `max_excursion_um` (5) from the lock's start P
-  sets a fault and no move is sent; this is the primary guard, since the real
-  piezo P can be negative (about -45 um on the rig). `p_min_um` / `p_max_um`
-  are optional absolute bounds (None = unknown, not checked). On Start the
+- **Range.** A target outside `p_min_um` / `p_max_um` sets a fault and no move
+  is sent. These are optional absolute bounds (None = unknown, not checked);
+  the real piezo P can be negative (about -45 um on the rig). There is no
+  limit on how far the commanded P may drift from the start P while holding
+  focus: `max_excursion_um` is an optional cap, None (default) = off. The
+  per-step clamp (`max_step_um`) still bounds each move. On Start the
   service reads the piezo's `Position` property limits once, if the device
   exposes them and they contain the start P, and fills the bounds; a missing
   or unreadable limit never faults. A fault names the target, the range and
@@ -540,8 +542,9 @@ old params are ignored (`SpotLoopParams.from_dict`, settings `extra="ignore"`).
   - frame checks: `min_contrast` 10.0, `max_saturated_frac` 0.002,
     `min_valid_fraction` 0.5, `max_angle_change_deg` 5.0,
     `max_edge_residual_px` 3.0;
-  - range: `max_excursion_um` 5.0 (from the start P); `p_min_um` and
-    `p_max_um` None (no absolute bound unless set or read at Start).
+  - range: `p_min_um` and `p_max_um` None (no absolute bound unless set or
+    read at Start); `max_excursion_um` None (optional cap on the distance from
+    the start P, off by default).
 - `SpotFocusController(params, p_start_um, *, linear_range_um=None)`:
   `update(along_um, now_s) -> float | None` returns the new target P or None;
   `bad(reason)` counts a strike; `good()` resets it. Properties: `p_cmd_um`,
@@ -876,8 +879,8 @@ Files:
     preview box messages.
 - `test_spot_focus_widget.py`: settings (defaults, round trip, old and
   malformed calibrations, old `mode: image` files, old files with `edge_box_2`)
-  and the Spot panel (buttons Calibrate / Zero here / Lock / Stop, offset, the
-  edge box, sweep spins, camera, LED, ROI, a lock run, Calibrate and Zero here
+  and the Spot panel (buttons 1. Draw Edge / 2. Calibrate / Zero here / the
+  Lock toggle, offset, the edge box, sweep spins, camera, LED, ROI, a lock run, Calibrate and Zero here
   off the GUI thread, Lock without a calibration, the rig-shaped single-edge
   calibration, the preview error after Calibrate) and its dock action.
 - `test_spot_live_view.py`: the live view (zoom, ROI and edge-box drawing,
@@ -974,10 +977,13 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 - **Spot panel** (`spot/panel.py`, `SpotFocusPanel`, embedded in
   `PiezoSpotWidget`). There is one edge box and no second one. The panel is one
   plain column. Top to bottom:
-  - The control row: buttons **Calibrate** (tooltip: focus on the cells first;
-    sweeps P around here), **Zero here**, **Lock** and **Stop**. Lock is enabled
-    whenever the panel is idle, because Lock without a calibration calibrates
-    first. `PiezoSpotWidget` adds its Joystick checkbox to this row.
+  - The control row: **Zero here** and one **Locked** / **Unlocked** toggle
+    (`lock_button`). It reads Locked while the lock runs or has faulted (the
+    fault is acknowledged by unlocking) and Unlocked otherwise; it is enabled
+    whenever the panel is idle, because locking without a calibration
+    calibrates first, and disabled while a start, Calibrate or Zero here
+    works. Clicking it while Locked stops the lock (releases the LED and the
+    joystick). `PiezoSpotWidget` adds its Joystick checkbox to the row below.
   - **Offset (um)** spin (-5 to 5): live, persisted, reset to 0 by Zero here
     and Calibrate; beside it the **Tracking error** (`tracking_error_label`),
     "Not available" unless the lock is running.
@@ -986,10 +992,12 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     the edge that moves with focus", a calibration or detector problem, a camera
     error, or "no CRISP device". `PiezoSpotWidget` shows the status words above
     the panel.
-  - The live view (docked by default, minimum height 240 px) with three toolbar
-    rows: **Preview**, Fit, 1:1 and **Pop out** / **Dock**; **Draw ROI** and
-    **Full frame**; **Draw edge** and **Display settings** (Auto levels, Bayer to
-    grey, zoom). Preview lights the LED and turning it off turns the LED off,
+  - The live view (docked by default, minimum height 240 px) with two toolbar
+    rows: **Preview**, Fit, 1:1, **Pop out** / **Dock** and **Display settings**
+    (Auto levels, on by default, Bayer to grey, zoom); **Draw ROI** and
+    **Full frame**. In the docked widget (`PiezoSpotWidget`) Preview starts by
+    itself, once, when the panel is first shown (`auto_preview`); turning it off
+    stays off. Preview lights the LED and turning it off turns the LED off,
     unless the lock is running. Pop out floats the live view as its own window;
     Dock (or closing that window) puts it back. Below the view, a frame
     statistics line (frame rate, maximum, % saturated).
@@ -1001,12 +1009,14 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
       **LED %** spin (saved, default 50). The LED button and Preview go
       through the service's LED claims (see "Rules"); with no CRISP device the
       message line says so. Each setting applies live and is saved.
-    - **Calibration settings**: the sweep span (um), steps and frames per step;
+    - **Calibration**: the two numbered steps, **1. Draw Edge** and
+      **2. Calibrate**, then the sweep span (um), steps and frames per step;
       the **Edge detector** (Gaussian derivative or Half-max) and **Detector
       width** (px, used by the Gaussian derivative), which apply live and are
       saved (changing the detector does not recalibrate: see "A calibration is
       only valid for the detector it was made with"); the saved edge box as x,
-      y, w, h ("none" until drawn); and the calibration label, two lines: the
+      y, w, h ("none" until drawn; a saved box is reused, step 2 needs no
+      redraw); and the calibration label, two lines: the
       edge (axis, signed slope px/um, R2, residual, noise in um from
       `edge_noise_um`), then the detector the calibration was made with, the
       zero P, range and created time. A detector mismatch is shown in the
@@ -1025,26 +1035,27 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
       (degrees) and Max edge residual (px). `avg_frames` and `max_saturated_frac`
       have no spin.
 - Panel behaviour:
-  - **Calibrate** needs a saved edge box, else the message line says "Draw an
-    edge box across the edge that moves with focus". It passes the box to the
+  - **2. Calibrate** needs a saved edge box, else the message line says "Draw an
+    edge box across the edge that moves with focus (Calibration: 1. Draw
+    Edge)". It passes the box to the
     service and runs the sweep on a thread. On success it saves the
     calibration, resets the offset to 0 and moves the setpoint ring to the zero
     edge point. A failure shows "Calibration failed: ...".
   - **Zero here** is enabled with a valid calibration and the lock stopped. A
     failure shows "Zero failed: ...".
   - After a Calibrate, a Zero here, loading the settings at service start, and
-    Stop, the panel calls `svc.set_calibration(cal)` and
+    unlocking, the panel calls `svc.set_calibration(cal)` and
     `svc.set_edge_box(box)`, so the preview shows the error (and the chart
     fills) before Lock.
-  - **Draw edge box** puts the live view in edge-box draw mode, makes it
+  - **1. Draw Edge** puts the live view in edge-box draw mode, makes it
     visible (raises it when floating) and starts Preview if it is not on. The
     panel tells the user to draw the box wide along the edge normal (about 14 x
     the edge sigma). The box is saved in `spot_focus.edge_box` and sent to the
     worker with `set_edge_box` (also when the service is created, and again
-    after Stop).
-  - While the lock runs, Zero here, Calibrate and the Draw edge box button are
-    disabled, and a box drawn then is refused ("Stop the lock before moving the
-    edge box.").
+    after unlocking).
+  - While the lock runs, Zero here, Calibrate and the Draw Edge button are
+    disabled, and a box drawn then is refused ("Unlock before moving the edge
+    box.").
   - The LED button, Preview, Calibrate, Zero here and Lock all go through
     `svc.led_on` / `svc.led_off` with their own owner, so the LED lights on any
     of them and goes off when the last one ends. The joystick is turned off by
@@ -1125,8 +1136,8 @@ edge point is picked" and the notebook.
   static frames, 0.017 um) understates the single-frame noise during a sweep.
 - **Range fault, fixed.** The first Lock faulted because
   `p_min_um` / `p_max_um` defaulted to 0..150 um while piezo P sits at about
-  -45.5 um on this rig. They now default to None; the excursion limit is the
-  main guard, and the service reads the piezo `Position` limits at Start only
+  -45.5 um on this rig. They now default to None (the 5 um excursion cap that was the
+  guard then has since been made opt-in), and the service reads the piezo `Position` limits at Start only
   if they contain the start P. Fault messages print the range and the start P.
 - **Advice.** Move the edge box off the rounded corner: a clean top box (about
   x 850-970) has noise 0.022 um and straightness 0.8 px, although its slope is

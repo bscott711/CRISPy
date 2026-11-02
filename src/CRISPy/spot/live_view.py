@@ -244,6 +244,7 @@ class _View(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.draw_mode = False
+        self._crop: QRectF | None = None
         self._drag_start: QPointF | None = None
         self._rubber = QGraphicsRectItem()
         pen = QPen(QColor("#ffe14d"), 1.5, Qt.PenStyle.DashLine)
@@ -257,6 +258,21 @@ class _View(QGraphicsView):
     def zoom(self) -> float:
         """View pixels per image pixel."""
         return self.transform().m11()
+
+    def set_crop(self, rect: QRectF | None) -> None:
+        """Keep the whole of *rect* the furthest the view zooms out (``None``: off)."""
+        self._crop = rect
+
+    @property
+    def min_zoom(self) -> float:
+        """The zoom-out limit: :data:`MIN_ZOOM`, or the zoom that fits the crop."""
+        crop, viewport = self._crop, self.viewport()
+        if crop is None or crop.isEmpty() or viewport is None:
+            return MIN_ZOOM
+        vp = viewport.rect()
+        # the same maths as fitInView (KeepAspectRatio), which leaves 2 px around
+        fit = min((vp.width() - 4) / crop.width(), (vp.height() - 4) / crop.height())
+        return min(max(fit, MIN_ZOOM), MAX_ZOOM)
 
     def set_draw_mode(self, on: bool) -> None:
         """Switch between pan (hand) and rectangle drawing (cross cursor)."""
@@ -279,7 +295,7 @@ class _View(QGraphicsView):
         """
         if at is None:
             at = self.viewport().rect().center()
-        new = min(max(self.zoom * factor, MIN_ZOOM), MAX_ZOOM)
+        new = min(max(self.zoom * factor, self.min_zoom), MAX_ZOOM)
         factor = new / self.zoom
         if abs(factor - 1.0) > 1e-9:
             anchor = self.mapToScene(at)
@@ -383,6 +399,8 @@ class SpotLiveView(QWidget):
         self._last_seq: int | None = None
         self._frame: LiveFrame | None = None
         self._sensor: tuple[int, int] | None = None
+        # The frame's ROI when it is smaller than the sensor: the view shows only it.
+        self._crop: QRectF | None = None
         self._buf: np.ndarray | None = None  # keeps the QImage buffer alive
         self._fit = True
         self._setpoint: tuple[float, float] | None = None
@@ -466,7 +484,7 @@ class SpotLiveView(QWidget):
         # calls show() on them). They are children of this view so none is a stray
         # top-level window.
         self.fit_button = QPushButton("Fit", self)
-        self.fit_button.setToolTip("Scale the whole sensor to the window")
+        self.fit_button.setToolTip("Scale the whole sensor (or the ROI) to the window")
         self.fit_button.clicked.connect(self.fit)
         self.one_to_one_button = QPushButton("1:1", self)
         self.one_to_one_button.setToolTip("One image pixel per screen pixel")
@@ -643,6 +661,11 @@ class SpotLiveView(QWidget):
         self._pixmap_item.setPixmap(QPixmap())
         self._spot_item.setVisible(False)
         self._roi_item.setVisible(False)
+        if self._crop is not None:  # a later full-frame preview must not stay cropped
+            self._crop = None
+            self._apply_view_limits()
+            if self._fit:
+                self.fit()
         self.status_label.setText("Waiting for the camera...")
         self.cursor_label.setText("")
         self._set_stale(False)
@@ -704,6 +727,13 @@ class SpotLiveView(QWidget):
         sensor = (int(frame.sensor[0]), int(frame.sensor[1]))
         if sensor != self._sensor:
             self._set_sensor(sensor)
+        # The frame's own ROI decides (the settings change before the first new frame).
+        x, y, w, h = (int(v) for v in frame.roi)
+        crop = None if w >= sensor[0] and h >= sensor[1] else QRectF(x, y, w, h)
+        if crop != self._crop:
+            self._crop = crop
+            self._apply_view_limits()
+            self.fit()
         self._update_fps(frame.seq, now)
         self._redraw()
         self._place_overlays(frame)
@@ -744,14 +774,28 @@ class SpotLiveView(QWidget):
         self._sensor = sensor
         rect = QRectF(0, 0, sensor[0], sensor[1])
         self.scene.setSceneRect(rect)
-        # The view may pan past the sensor edge, so a spot near a corner can
-        # still be centred; Fit and 1:1 use the sensor rect itself.
-        margin = max(sensor) / 2
-        self.view.setSceneRect(rect.adjusted(-margin, -margin, margin, margin))
+        self._apply_view_limits()
         self._sensor_item.setRect(rect)
         self._place_setpoint()
         if first or self._fit:
             self.fit()
+
+    def _apply_view_limits(self) -> None:
+        """Set how far the view may pan and zoom out (the scene stays the sensor)."""
+        sensor = self._sensor
+        if sensor is None:
+            return
+        crop = self._crop
+        if crop is None:
+            # The view may pan past the sensor edge, so a spot near a corner can
+            # still be centred; Fit and 1:1 use the sensor rect itself.
+            rect = QRectF(0, 0, sensor[0], sensor[1])
+            margin = max(sensor) / 2
+            self.view.setSceneRect(rect.adjusted(-margin, -margin, margin, margin))
+        else:
+            # Cropped to the camera ROI: no margin, so it cannot pan away from it.
+            self.view.setSceneRect(crop)
+        self.view.set_crop(crop)
 
     def _place_overlays(self, frame: LiveFrame) -> None:
         x, y, w, h = (int(v) for v in frame.roi)
@@ -838,11 +882,12 @@ class SpotLiveView(QWidget):
     # ------------------------------------------------------------------
 
     def fit(self) -> None:
-        """Scale the whole sensor into the window."""
+        """Scale the whole sensor (or the camera ROI, if cropped) into the window."""
         self._fit = True
         if self._sensor is None:
             return
-        self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        rect = self.scene.sceneRect() if self._crop is None else self._crop
+        self.view.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
         self._update_zoom_label()
 
     def one_to_one(self) -> None:
