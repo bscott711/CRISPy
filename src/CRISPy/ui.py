@@ -121,6 +121,7 @@ from .hold import (
 from .imaging import FrameStore, image_view_factory, snap_images, snap_provider
 from .plot import LinePlot, RefLine, Series
 from .sampling import Sampler, device_present, read_str
+from .theme import micro, readout_pair, set_readout, set_state_pill, set_tone
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -336,6 +337,13 @@ _GREEN, _DARK_GREEN, _ORANGE, _RED, _GREY = (
     "#9e9e9e",
 )
 _BLUE = "#1e88e5"
+
+_TONE_OF = {_GREEN: "ok", _DARK_GREEN: "ok", _ORANGE: "warn", _RED: "bad"}
+
+
+def _tone_of(color: str) -> str:
+    """Map a legacy status colour to a theme tone (``idle`` for anything else)."""
+    return _TONE_OF.get(color, "idle")
 
 
 def _close(a: float | None, b: float | None, *, rtol: float = 1e-3) -> bool:
@@ -731,11 +739,11 @@ class CrispControlPanel(QWidget):
         # --- header: device + actuator badge + current state --------------
         header = QHBoxLayout()
         title = QLabel(self.controller.label)
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        title.setProperty("role", "header")
         header.addWidget(title)
         header.addWidget(self._make_actuator_badge())
         self.state_lbl = QLabel("State: --")
-        self.state_lbl.setStyleSheet("font-weight: bold;")
+        set_state_pill(self.state_lbl, "idle")
         self.state_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         header.addStretch()
         header.addWidget(self.state_lbl)
@@ -766,21 +774,27 @@ class CrispControlPanel(QWidget):
         layout.addLayout(poll_row)
 
         # --- readouts -----------------------------------------------------
-        ro_box = self.readouts_box = QGroupBox("Readouts")
+        ro_box = self.readouts_box = QGroupBox()
         grid = QGridLayout(ro_box)
+        grid.addWidget(micro("Readouts"), 0, 0, 1, 4)
+        for col, stretch in enumerate((3, 2, 3, 2)):
+            grid.setColumnStretch(col, stretch)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(7)
         for i, (prop, label, tip) in enumerate(_READOUTS):
             row, col = divmod(i, 2)
+            row += 1  # row 0 is the section header
             name = QLabel(f"{label}:")
-            val = QLabel("--")
-            val.setStyleSheet("font-weight: bold;")
+            val, unit, pair = readout_pair()
             name.setToolTip(tip)
             val.setToolTip(tip)
+            unit.setToolTip(tip)
             grid.addWidget(name, row, col * 2)
-            grid.addWidget(val, row, col * 2 + 1)
+            grid.addLayout(pair, row, col * 2 + 1)
             self._readouts[prop] = val
 
         # Derived, full-width rows: physical scaling and fluctuation of the error.
-        next_row = (len(_READOUTS) + 1) // 2
+        next_row = (len(_READOUTS) + 1) // 2 + 1
         self.sensitivity_lbl = QLabel("Sensitivity: --")
         self.sensitivity_lbl.setToolTip(
             "How many counts of the error readout one µm of focus makes, measured by\n"
@@ -804,8 +818,10 @@ class CrispControlPanel(QWidget):
         layout.addWidget(ro_box)
 
         # --- operation (2x2 grid to stay compact) -------------------------
-        op_box = QGroupBox("Operation")
+        op_box = QGroupBox()
         op = QGridLayout(op_box)
+        op.setVerticalSpacing(8)
+        op.addWidget(micro("Operation"), 0, 0, 1, 2)
         self.btn_idle_ready = QPushButton("Set Ready")
         self.btn_idle_ready.clicked.connect(self._on_idle_ready)
         self.btn_lock = QPushButton("Lock")
@@ -814,10 +830,10 @@ class CrispControlPanel(QWidget):
         self.btn_offset.clicked.connect(self._on_reset_offset)
         self.btn_save = QPushButton("Save to Controller")
         self.btn_save.clicked.connect(lambda: self._do(self.controller.set_save))
-        op.addWidget(self.btn_idle_ready, 0, 0)
-        op.addWidget(self.btn_lock, 0, 1)
-        op.addWidget(self.btn_offset, 1, 0)
-        op.addWidget(self.btn_save, 1, 1)
+        op.addWidget(self.btn_idle_ready, 1, 0)
+        op.addWidget(self.btn_lock, 1, 1)
+        op.addWidget(self.btn_offset, 2, 0)
+        op.addWidget(self.btn_save, 2, 1)
         self.btn_led = QPushButton("LED On")
         self.btn_led.setCheckable(True)
         self.btn_led.setToolTip(
@@ -828,13 +844,13 @@ class CrispControlPanel(QWidget):
             "and re-lock to apply it (the panel does not relight a locked axis)."
         )
         self.btn_led.clicked.connect(self._on_led_clicked)
-        op.addWidget(self.btn_led, 2, 0, 1, 2)
+        op.addWidget(self.btn_led, 3, 0, 1, 2)
         # Shown only while the last LED write failed; cleared on the next success.
         self.led_error_lbl = QLabel()
         self.led_error_lbl.setWordWrap(True)
-        self.led_error_lbl.setStyleSheet(f"color: {_RED};")
+        set_tone(self.led_error_lbl, "bad")
         self.led_error_lbl.hide()
-        op.addWidget(self.led_error_lbl, 3, 0, 1, 2)
+        op.addWidget(self.led_error_lbl, 4, 0, 1, 2)
         # Debounces LED Intensity edits into one relight (see _on_led_intensity_edited).
         self._led_timer = QTimer(self)
         self._led_timer.setSingleShot(True)
@@ -850,14 +866,19 @@ class CrispControlPanel(QWidget):
             " locked."
         )
         self.joystick_chk.toggled.connect(self._on_joystick_toggled)
-        op.addWidget(self.joystick_chk, 4, 0, 1, 2)
+        op.addWidget(self.joystick_chk, 5, 0, 1, 2)
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
-        cal_box = QGroupBox("Calibration")
+        cal_box = QGroupBox()
         cal_box.setToolTip("In order: 1. Log Cal → 2. Dither → 3. Set Gain.")
-        cal = QHBoxLayout(cal_box)
+        cal_col = QVBoxLayout(cal_box)
+        cal_col.setSpacing(8)
+        cal_col.addWidget(micro("Calibration"))
+        cal = QHBoxLayout()
+        cal_col.addLayout(cal)
         self.btn_log = QPushButton("1. Log Cal")
+        self.btn_log.setProperty("primary", True)
         self.btn_log.clicked.connect(self._on_log_cal_clicked)
         self.btn_dither = QPushButton("2. Dither")
         self.btn_dither.clicked.connect(self._on_dither_clicked)
@@ -893,7 +914,7 @@ class CrispControlPanel(QWidget):
         )
         self.tools_btn.clicked.connect(lambda: self.tools_window.show_tab())
         self.tools_running_lbl = QLabel()
-        self.tools_running_lbl.setStyleSheet(f"color: {_ORANGE}; font-weight: bold;")
+        set_tone(self.tools_running_lbl, "warn")
         tools_row.addWidget(self.tools_btn)
         tools_row.addWidget(self.tools_running_lbl)
         tools_row.addStretch()
@@ -922,13 +943,14 @@ class CrispControlPanel(QWidget):
         row = QHBoxLayout()
         self.dither_level_lbl = QLabel("|Err| --")
         self.dither_level_lbl.setWordWrap(True)
-        self.dither_level_lbl.setStyleSheet("font-weight: bold; font-size: 22px;")
+        self.dither_level_lbl.setProperty("role", "value")
+        self.dither_level_lbl.setStyleSheet("font-size: 22px;")
         self.dither_level_lbl.setToolTip(
             "Median of |Dither Err| over the smoothing window, so the brief jumps\n"
             "from moving the detector are ignored."
         )
         self.dither_peak_lbl = QLabel("peak --")
-        self.dither_peak_lbl.setStyleSheet("font-weight: bold;")
+        self.dither_peak_lbl.setProperty("role", "value")
         row.addWidget(self.dither_level_lbl)
         row.addStretch()
         row.addWidget(self.dither_peak_lbl)
@@ -1179,11 +1201,9 @@ class CrispControlPanel(QWidget):
     def _make_actuator_badge(self) -> QLabel:
         actuator = self.controller.actuator_type
         text = {"piezo": "Piezo", "stage": "Stage"}.get(actuator, "Actuator ?")
-        bg, fg = _ACTUATOR_BADGE.get(actuator, _ACTUATOR_BADGE["unknown"])
-        badge = QLabel(text)
-        badge.setStyleSheet(
-            f"background: {bg}; color: {fg}; border-radius: 6px;"
-            " padding: 1px 6px; font-weight: bold; font-size: 11px;"
+        badge = QLabel(text.upper())
+        badge.setProperty(
+            "badge", actuator if actuator in _ACTUATOR_BADGE else "unknown"
         )
         tip = f"Paired focus actuator: {self.controller.actuator_label or text}."
         if actuator == "piezo":
@@ -1631,9 +1651,7 @@ class CrispControlPanel(QWidget):
             "  settling…" if active and s.level is not None and not s.steady else ""
         )
         self.dither_level_lbl.setText(f"|Err| {_fmt(s.level, '.0f')}{sign}{settling}")
-        self.dither_level_lbl.setStyleSheet(
-            f"font-weight: bold; font-size: 22px; color: {color};"
-        )
+        set_tone(self.dither_level_lbl, _tone_of(color))
         peak = f"peak {_fmt(s.peak, '.0f')}"
         if s.peak_t is not None and active:
             peak += f"  ({max(0.0, now - s.peak_t):.0f} s ago)"
@@ -1654,7 +1672,7 @@ class CrispControlPanel(QWidget):
             )
             sum_color = _ORANGE
         self.dither_sum_lbl.setText(sum_text)
-        self.dither_sum_lbl.setStyleSheet(f"color: {sum_color};")
+        set_tone(self.dither_sum_lbl, _tone_of(sum_color))
         rel = None
         if s.noise is not None and s.level:
             rel = s.noise / s.level * 100
@@ -2463,42 +2481,40 @@ class CrispControlPanel(QWidget):
             # setting that doesn't match the objective this axis moves stands out.
             rng = _to_float(value)
             if rng and rng > 0:
-                lbl.setText(f"{rng:.3f}  (NA {math.sqrt(1.5 / rng):.2f})")
+                set_readout(lbl, f"{rng:.3f}", f"(NA {math.sqrt(1.5 / rng):.2f})")
             else:
-                lbl.setText(str(value))
+                set_readout(lbl, str(value))
         elif prop == "Signal Noise Ratio":
             snr = _to_float(value)
             if snr is None:
-                lbl.setText(str(value))
+                set_readout(lbl, str(value))
                 return
-            lbl.setText(f"{snr:.2f} dB")
+            set_readout(lbl, f"{snr:.2f}", "dB")
             color = _GREEN if snr >= _SNR_GOOD_DB else _RED
-            lbl.setStyleSheet(f"font-weight: bold; color: {color};")
+            set_tone(lbl, _tone_of(color))
         elif prop == _SUM_PROP:
-            lbl.setText(str(value))
+            set_readout(lbl, str(value))
             status = sum_status(_to_float(value))
             color = {"ok": _GREEN, "saturated": _RED, "low": _ORANGE, "high": _ORANGE}
-            lbl.setStyleSheet(
-                f"font-weight: bold; color: {color.get(status or '', _GREY)};"
-            )
+            set_tone(lbl, _tone_of(color.get(status or "", _GREY)))
         elif prop == _ERROR_PROP:
             self._update_error_readout(lbl, value)
         else:
-            lbl.setText(str(value))
+            set_readout(lbl, str(value))
 
     def _update_error_readout(self, lbl: QLabel, value: str) -> None:
         counts = _to_float(value)
         if counts is None:
-            lbl.setText(str(value))
+            set_readout(lbl, str(value))
             return
         # Only the locked error is a focus error; in Dither it is the dither swing.
         if self._last_state in _LOCKED_STATES:
             self._error_history.append(counts)
-        text = f"{counts:g}"
         um = self._to_um(counts)
+        unit = ""
         if um is not None and self._last_state not in DITHER_STATES:
-            text += f"  ({um:+.3f} µm)"
-        lbl.setText(text)
+            unit = f"({um:+.3f} µm)"
+        set_readout(lbl, f"{counts:g}", unit)
 
     def _update_stability(self) -> None:
         if self._last_state not in _LOCKED_STATES:
@@ -2523,15 +2539,15 @@ class CrispControlPanel(QWidget):
             self._error_history.clear()
             self._last_state = state
         if state in _BUSY_STATES:
-            text, color = _BUSY_STATES[state], _ORANGE
+            text, kind = _BUSY_STATES[state], "busy"
         elif state in _GOOD_STATES:
-            text, color = state, _GREEN
+            text, kind = state, "ok"
         elif state in _BAD_STATES:
-            text, color = state, _RED
+            text, kind = state, "bad"
         else:
-            text, color = (state or "--"), _GREY
+            text, kind = (state or "--"), "idle"
         self.state_lbl.setText(f"State: {text}")
-        self.state_lbl.setStyleSheet(f"font-weight: bold; color: {color};")
+        set_state_pill(self.state_lbl, kind)
 
         # Reflect live state on the toggle buttons.
         led_on = bool(state) and state != "Idle"

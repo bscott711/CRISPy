@@ -46,8 +46,11 @@ from qtpy.QtWidgets import (
     QApplication,
     QDockWidget,
     QFormLayout,
+    QComboBox,
     QGroupBox,
+    QLabel,
     QMainWindow,
+    QRadioButton,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -56,6 +59,7 @@ from qtpy.QtWidgets import (
 
 _SERIAL_LATENCY_S = float(os.environ.get("CRISPY_DEMO_LATENCY_MS", "10")) / 1000
 _LOCKED = {"Lock", "In Focus"}
+_THEME_NAME = os.environ.get("CRISPY_DEMO_THEME", "dark")
 
 
 class SimAxis:
@@ -596,13 +600,66 @@ def mock_discover(mmcore=None):
     return list(_AXES)
 
 
+_STATE_PREVIEW = {
+    "Idle": ("idle", "Idle"),
+    "Polling": ("engaged", "Polling"),
+    "In Focus": ("ok", "In Focus"),
+    "Calibrating": ("busy", "Calibrating"),
+    "Fault": ("bad", "Error"),
+}
+
+
+def build_theme_controls(app: QApplication, root: QWidget) -> QGroupBox:
+    """Dark/Light switch and a state-pill previewer (design spike only)."""
+    from CRISPy.theme import THEMES, apply_theme, micro, set_state_pill
+    from CRISPy.ui import CrispControlPanel
+
+    box = QGroupBox()
+    v = QVBoxLayout(box)
+    v.addWidget(micro("Theme"))
+    for name in THEMES:
+        radio = QRadioButton(name.capitalize())
+        radio.setChecked(name == _THEME_NAME)
+        radio.toggled.connect(
+            lambda on, n=name: on and apply_theme(app, THEMES[n])
+        )
+        v.addWidget(radio)
+
+    combo = QComboBox()
+    combo.addItems(["(live)", *_STATE_PREVIEW])
+
+    def preview(key: str) -> None:
+        for panel in root.findChildren(CrispControlPanel):
+            if key not in _STATE_PREVIEW:
+                panel.poll_chk.setChecked(True)
+                continue
+            panel.poll_chk.setChecked(False)  # polling would overwrite the pill
+            kind, text = _STATE_PREVIEW[key]
+            panel.state_lbl.setText(f"State: {text}")
+            set_state_pill(panel.state_lbl, kind)
+
+    combo.currentTextChanged.connect(preview)
+    v.addWidget(QLabel("Preview state pill (pauses Poll)"))
+    v.addWidget(combo)
+    return box
+
+
+def _micro(text: str) -> QWidget:
+    from CRISPy.theme import micro
+
+    return micro(text)
+
+
 def build_demo_controls() -> QWidget:
     """Sliders/spin boxes standing in for the physical screw and the parameters."""
     panel = QWidget()
     layout = QVBoxLayout(panel)
     for ax in _AXES.values():
-        box = QGroupBox(ax.label)
-        form = QFormLayout(box)
+        box = QGroupBox()
+        outer = QVBoxLayout(box)
+        outer.addWidget(_micro(ax.label))
+        form = QFormLayout()
+        outer.addLayout(form)
         screw = QSlider(Qt.Orientation.Horizontal)
         screw.setRange(0, 100)
         screw.setValue(round(ax.screw * 100))
@@ -648,6 +705,9 @@ def install_demo_spot_store() -> None:
 
 def run_demo():
     app = QApplication.instance() or QApplication(sys.argv)
+    from CRISPy.theme import THEMES, apply_theme
+
+    apply_theme(app, THEMES[_THEME_NAME])  # opt-in; the plugin never does this itself
     install_demo_spot_store()  # before the panels are built
 
     # Patch the function in the `plugin` module's namespace
@@ -657,7 +717,9 @@ def run_demo():
         window = QMainWindow()
         window.setCentralWidget(widget)
         dock = QDockWidget("Demo controls")
-        dock.setWidget(build_demo_controls())
+        controls = build_demo_controls()
+        controls.layout().insertWidget(0, build_theme_controls(app, widget))
+        dock.setWidget(controls)
         window.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         window.setWindowTitle("CRISPy - Demo Mode (Pure Python)")
         window.resize(1150, 900)  # wide enough for both axes side-by-side

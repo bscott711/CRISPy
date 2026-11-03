@@ -20,9 +20,11 @@ from __future__ import annotations
 from contextlib import suppress
 from typing import Any
 
+from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
     QCheckBox,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QVBoxLayout,
@@ -33,6 +35,20 @@ from . import piezo_status
 from .controller import ASICrispController
 from .spot.panel import SpotFocusPanel
 from .spot.store import get_settings_store
+from .theme import micro, set_role, set_state_pill, set_tone
+
+# Lock word -> status pill (the same LED logic as the CRISP panel's State pill).
+_LOCK_PILL = {
+    piezo_status.LOCK_RUNNING: "ok",
+    piezo_status.LOCK_STARTING: "busy",
+    piezo_status.LOCK_CALIBRATING: "busy",
+    piezo_status.LOCK_ZEROING: "busy",
+    piezo_status.LOCK_FAULT: "bad",
+}
+# Status words that mean "nothing yet" (dim), or need attention (tone).
+_DIM_WORDS = {"Not set", "Not open", "No camera", "Off", "Not available"}
+_WARN_WORDS = {"Required", "Opening"}
+_BAD_WORDS = {"Error", "Fault", "No CRISP device"}
 
 
 class PiezoSpotWidget(QWidget):
@@ -58,26 +74,48 @@ class PiezoSpotWidget(QWidget):
             else controller.actuator_label
         )
 
-        # --- header: piezo label left, lock word right --------------------
+        # --- header: same look as the CRISP panel (title, badge, state pill) -
         header = QHBoxLayout()
         self.title = QLabel(piezo or controller.label)
+        self.title.setProperty("role", "header")
         header.addWidget(self.title)
+        badge = QLabel("PIEZO")
+        badge.setProperty("badge", "piezo")
+        header.addWidget(badge)
         header.addStretch(1)
         self.lock_status_label = QLabel()
+        set_state_pill(self.lock_status_label, "idle")
         header.addWidget(self.lock_status_label)
         layout.addLayout(header)
 
-        # --- status words: Camera, LED / Edge box, Calibration ------------
-        grid = QGridLayout()
+        # --- readouts: Camera, LED / Edge box, Calibration -----------------
+        ro_box = self.readouts_box = QGroupBox()
+        grid = QGridLayout(ro_box)
+        grid.addWidget(micro("Readouts"), 0, 0, 1, 4)
+        for col, stretch in enumerate((3, 2, 3, 2)):
+            grid.setColumnStretch(col, stretch)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(7)
         self.camera_status_label = QLabel()
         self.led_status_label = QLabel()
         self.edge_box_status_label = QLabel()
         self.calibration_status_label = QLabel()
-        grid.addWidget(self.camera_status_label, 0, 0)
-        grid.addWidget(self.led_status_label, 0, 1)
-        grid.addWidget(self.edge_box_status_label, 1, 0)
-        grid.addWidget(self.calibration_status_label, 1, 1)
-        layout.addLayout(grid)
+        for i, (name, val) in enumerate(
+            (
+                ("Camera:", self.camera_status_label),
+                ("LED:", self.led_status_label),
+                ("Edge box:", self.edge_box_status_label),
+                ("Calibration:", self.calibration_status_label),
+            )
+        ):
+            row, col = divmod(i, 2)
+            val.setProperty("role", "read")
+            val.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            grid.addWidget(QLabel(name), row + 1, col * 2)
+            grid.addWidget(val, row + 1, col * 2 + 1)
+        layout.addWidget(ro_box)
 
         # --- the spot-lock panel ------------------------------------------
         crisp = store.crisp_label if store.crisp_label is not None else controller.label
@@ -136,7 +174,19 @@ class PiezoSpotWidget(QWidget):
         self._sync_joystick_box()
         words = piezo_status.status_words(self.panel.status_inputs())
         self.lock_status_label.setText(f"Lock: {words.lock}")
-        self.camera_status_label.setText(f"Camera: {words.camera}")
-        self.led_status_label.setText(f"LED: {words.led}")
-        self.edge_box_status_label.setText(f"Edge box: {words.edge_box}")
-        self.calibration_status_label.setText(f"Calibration: {words.calibration}")
+        set_state_pill(self.lock_status_label, _LOCK_PILL.get(words.lock, "idle"))
+        for label, word in (
+            (self.camera_status_label, words.camera),
+            (self.led_status_label, words.led),
+            (self.edge_box_status_label, words.edge_box),
+            (self.calibration_status_label, words.calibration),
+        ):
+            label.setText(word)
+            if word in _BAD_WORDS:
+                tone = "bad"
+            elif word in _WARN_WORDS:
+                tone = "warn"
+            else:
+                tone = ""
+            set_role(label, "hint" if word in _DIM_WORDS else "read")
+            set_tone(label, tone)

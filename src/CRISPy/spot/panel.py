@@ -84,6 +84,7 @@ from qtpy.QtWidgets import (
 )
 
 from .. import piezo_status
+from ..theme import micro, set_role
 from .live_view import SpotLiveView
 from .spot_focus import (
     EDGE_DETECTOR_LABELS,
@@ -95,6 +96,7 @@ from .spot_focus import (
 )
 from .spot_focus_service import SpotFocusService
 from .store import get_settings_store
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -132,7 +134,44 @@ DEFAULT_LED_PCT = 50.0
 #: Smallest height of the docked live view, px.
 _VIEW_MIN_H = 240
 #: Frame statistics line before the first frame.
-_FRAME_STATS_IDLE = "Frame rate: -   Maximum: -   Saturated pixels: -"
+
+
+class _FrameStats(QWidget):
+    """The status line under the image: dim labels, mono values, dim units."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._values: list[QLabel] = []
+        for i, (name, unit) in enumerate(
+            (("Frame rate:", "fps"), ("Maximum:", ""), ("Saturated pixels:", "%"))
+        ):
+            if i:
+                row.addSpacing(12)  # 16 px between groups with the 4 px spacing
+            row.addWidget(QLabel(name))
+            val = QLabel("-")
+            val.setProperty("role", "value")
+            row.addWidget(val)
+            self._values.append(val)
+            if unit:
+                u = QLabel(unit)
+                u.setProperty("role", "unit")
+                row.addWidget(u)
+        row.addStretch(1)
+
+    def set_stats(
+        self, fps: float | None, maximum: int | None, saturated_pct: float | None
+    ) -> None:
+        """Show the three figures, or "-" for each that is ``None``."""
+        texts = (
+            None if fps is None else f"{fps:.0f}",
+            None if maximum is None else str(maximum),
+            None if saturated_pct is None else f"{saturated_pct:.1f}",
+        )
+        for lbl, text in zip(self._values, texts):
+            lbl.setText("-" if text is None else text)
 
 # (settings field, label, min, max, step, decimals, suffix, tooltip)
 _PARAMS: tuple[tuple[str, str, float, float, float, int, str, str], ...] = (
@@ -606,6 +645,7 @@ class SpotFocusPanel(QWidget):
         #: "+0.012 µm" while the lock runs, else "Not available" (kept by
         #: :meth:`_refresh_status`).
         self.tracking_error_label = QLabel(piezo_status.NOT_AVAILABLE)
+        self.tracking_error_label.setProperty("role", "hint")
         self.tracking_error_label.setTextFormat(Qt.TextFormat.PlainText)
         offset_row = QHBoxLayout()
         offset_row.addWidget(QLabel("Offset"))
@@ -690,6 +730,7 @@ class SpotFocusPanel(QWidget):
             ("fps", "Frame rate"),
         ):
             label = QLabel("-")
+            label.setProperty("role", "value")
             if key == "edge":
                 label.setTextFormat(Qt.TextFormat.RichText)  # coloured noise
             self.readout_labels[key] = label
@@ -738,6 +779,7 @@ class SpotFocusPanel(QWidget):
             ("advanced", "Advanced", advanced_page),
         ):
             button = QPushButton(title)
+            button.setProperty("role", "tab")
             button.setCheckable(True)
             button.toggled.connect(lambda on, n=name: self._on_section_toggled(n, on))
             page.hide()
@@ -747,6 +789,7 @@ class SpotFocusPanel(QWidget):
 
         # -- toolbar rows under the image -----------------------------------
         self.preview_button = QPushButton("Preview")
+        self.preview_button.setProperty("primary", True)
         self.preview_button.setCheckable(True)
         self.preview_button.setToolTip(
             "Stream the camera into the Spot camera view (full resolution)"
@@ -759,14 +802,13 @@ class SpotFocusPanel(QWidget):
             "the window) to dock it back above the controls"
         )
         self.pop_out_button.toggled.connect(self.set_view_floating)
-        self.frame_stats_label = QLabel(_FRAME_STATS_IDLE)
-        self.frame_stats_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.frame_stats_label.setWordWrap(True)
+        self.frame_stats_label = _FrameStats()
         view = self.live_view
         # A docked child, not the window it was created as. The flags are explicit:
         # setParent(parent) alone does nothing when the parent is unchanged.
         view.setParent(self, Qt.WindowType.Widget)
         self.display_settings_button = QPushButton("Display settings")
+        self.display_settings_button.setProperty("hasmenu", True)
         self.display_settings_button.setToolTip(
             "Auto levels, Bayer to grey and the zoom of the image"
         )
@@ -794,10 +836,13 @@ class SpotFocusPanel(QWidget):
         # The two steps, in order (like the CRISP Z panel's Calibration box), always
         # visible: the workflow reads top to bottom, 1. Draw Edge, 2. Calibrate, then
         # Zero here / Lock. The saved edge box is reused: step 2 needs no redraw.
-        self.calibration_steps_box = QGroupBox("Calibration")
+        self.calibration_steps_box = QGroupBox()
         self.calibration_steps_box.setToolTip("In order: 1. Draw Edge -> 2. Calibrate.")
-        steps = QHBoxLayout(self.calibration_steps_box)
-        steps.setContentsMargins(4, 2, 4, 2)
+        steps_col = QVBoxLayout(self.calibration_steps_box)
+        steps_col.setSpacing(8)
+        steps_col.addWidget(micro("Calibration"))
+        steps = QHBoxLayout()
+        steps_col.addLayout(steps)
         steps.addWidget(self.draw_edge_button)
         steps.addWidget(self.calibrate_button)
         outer = QVBoxLayout(self)
@@ -1661,7 +1706,7 @@ class SpotFocusPanel(QWidget):
             # hide(), not close(): no windowClosed echo. A docked view keeps its
             # space (cleared, not polled) so the layout does not jump.
             self.live_view.hide()
-        self.frame_stats_label.setText(_FRAME_STATS_IDLE)
+        self.frame_stats_label.set_stats(None, None, None)
 
     def _show_live_view(self) -> None:
         """Make the image visible (raise the floating window, or show the view)."""
@@ -1760,10 +1805,7 @@ class SpotFocusPanel(QWidget):
         self._start_preview()  # no camera: the message line says so
 
     def _on_view_stats(self, fps: float, max_value: int, saturated_pct: float) -> None:
-        self.frame_stats_label.setText(
-            f"Frame rate: {fps:.0f} fps   Maximum: {max_value}   "
-            f"Saturated pixels: {saturated_pct:.1f} %"
-        )
+        self.frame_stats_label.set_stats(fps, max_value, saturated_pct)
 
     @staticmethod
     def _camera_info(svc: SpotFocusService) -> dict:
@@ -1872,6 +1914,10 @@ class SpotFocusPanel(QWidget):
         tracking = piezo_status.tracking_error_text(inputs)
         if self.tracking_error_label.text() != tracking:
             self.tracking_error_label.setText(tracking)
+        set_role(
+            self.tracking_error_label,
+            "hint" if tracking == piezo_status.NOT_AVAILABLE else "value",
+        )
         self.statusChanged.emit()
 
     def _update_enabled(self) -> None:
