@@ -722,6 +722,7 @@ class SpotFocusPanel(QWidget):
         self.readout_labels: dict[str, QLabel] = {}
         readouts = QFormLayout()
         readouts.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        readouts.setVerticalSpacing(2)
         for key, text in (
             ("moves", "Moves / min"),
             ("move_ms", "Move time (mean / max)"),
@@ -743,6 +744,7 @@ class SpotFocusPanel(QWidget):
         self.param_spins: dict[str, QDoubleSpinBox] = {"offset_um": self.offset_spin}
         form = QFormLayout()
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setVerticalSpacing(3)
         for field, label, lo, hi, step, decimals, suffix, tip in _PARAMS:
             spin = self._spin(lo, hi, step, decimals, suffix, tip)
             spin.valueChanged.connect(lambda v, f=field: self._set_param(f, v))
@@ -839,7 +841,7 @@ class SpotFocusPanel(QWidget):
         self.calibration_steps_box = QGroupBox()
         self.calibration_steps_box.setToolTip("In order: 1. Draw Edge -> 2. Calibrate.")
         steps_col = QVBoxLayout(self.calibration_steps_box)
-        steps_col.setSpacing(8)
+        steps_col.setSpacing(3)
         steps_col.addWidget(micro("Calibration"))
         steps = QHBoxLayout()
         steps_col.addLayout(steps)
@@ -847,6 +849,7 @@ class SpotFocusPanel(QWidget):
         steps.addWidget(self.calibrate_button)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
         outer.addWidget(self.calibration_steps_box)
         outer.addLayout(control_row)
         outer.addLayout(self.control_extra_layout)

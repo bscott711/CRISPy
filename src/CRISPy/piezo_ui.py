@@ -65,6 +65,8 @@ class PiezoSpotWidget(QWidget):
         self.mmcore = mmcore
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 6, 6, 6)
 
         # The piezo label the panel moves (same derivation as the old section).
         store = get_settings_store()
@@ -94,8 +96,8 @@ class PiezoSpotWidget(QWidget):
         grid.addWidget(micro("Readouts"), 0, 0, 1, 4)
         for col, stretch in enumerate((3, 2, 3, 2)):
             grid.setColumnStretch(col, stretch)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(7)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(1)
         self.camera_status_label = QLabel()
         self.led_status_label = QLabel()
         self.edge_box_status_label = QLabel()

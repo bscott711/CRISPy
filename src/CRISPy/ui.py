@@ -735,6 +735,8 @@ class CrispControlPanel(QWidget):
     # ------------------------------------------------------------------ build
     def _build(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setSpacing(4)
+        layout.setContentsMargins(6, 6, 6, 6)
 
         # --- header: device + actuator badge + current state --------------
         header = QHBoxLayout()
@@ -766,7 +768,7 @@ class CrispControlPanel(QWidget):
         self.poll_interval.setSingleStep(50)
         self.poll_interval.setValue(_POLL_INTERVAL_MS)
         self.poll_interval.setSuffix(" ms")
-        self.poll_interval.setMaximumWidth(110)
+        self.poll_interval.setMaximumWidth(90)
         self.poll_interval.valueChanged.connect(self._on_interval_changed)
         poll_row.addWidget(self.poll_chk)
         poll_row.addWidget(self.poll_interval)
@@ -779,8 +781,8 @@ class CrispControlPanel(QWidget):
         grid.addWidget(micro("Readouts"), 0, 0, 1, 4)
         for col, stretch in enumerate((3, 2, 3, 2)):
             grid.setColumnStretch(col, stretch)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(7)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(1)
         for i, (prop, label, tip) in enumerate(_READOUTS):
             row, col = divmod(i, 2)
             row += 1  # row 0 is the section header
@@ -820,7 +822,8 @@ class CrispControlPanel(QWidget):
         # --- operation (2x2 grid to stay compact) -------------------------
         op_box = QGroupBox()
         op = QGridLayout(op_box)
-        op.setVerticalSpacing(8)
+        op.setVerticalSpacing(3)
+        op.setHorizontalSpacing(4)
         op.addWidget(micro("Operation"), 0, 0, 1, 2)
         self.btn_idle_ready = QPushButton("Set Ready")
         self.btn_idle_ready.clicked.connect(self._on_idle_ready)
@@ -844,7 +847,7 @@ class CrispControlPanel(QWidget):
             "and re-lock to apply it (the panel does not relight a locked axis)."
         )
         self.btn_led.clicked.connect(self._on_led_clicked)
-        op.addWidget(self.btn_led, 3, 0, 1, 2)
+        op.addWidget(self.btn_led, 3, 0)
         # Shown only while the last LED write failed; cleared on the next success.
         self.led_error_lbl = QLabel()
         self.led_error_lbl.setWordWrap(True)
@@ -866,16 +869,17 @@ class CrispControlPanel(QWidget):
             " locked."
         )
         self.joystick_chk.toggled.connect(self._on_joystick_toggled)
-        op.addWidget(self.joystick_chk, 5, 0, 1, 2)
+        op.addWidget(self.joystick_chk, 3, 1)  # beside the LED button
         layout.addWidget(op_box)
 
         # --- calibration --------------------------------------------------
         cal_box = QGroupBox()
         cal_box.setToolTip("In order: 1. Log Cal → 2. Dither → 3. Set Gain.")
         cal_col = QVBoxLayout(cal_box)
-        cal_col.setSpacing(8)
+        cal_col.setSpacing(3)
         cal_col.addWidget(micro("Calibration"))
         cal = QHBoxLayout()
+        cal.setSpacing(4)
         cal_col.addLayout(cal)
         self.btn_log = QPushButton("1. Log Cal")
         self.btn_log.setProperty("primary", True)
@@ -923,6 +927,9 @@ class CrispControlPanel(QWidget):
         # --- parameters (reused pymmcore-widgets property controls) -------
         param_body = QWidget()
         form = QFormLayout(param_body)
+        form.setVerticalSpacing(3)
+        form.setHorizontalSpacing(6)
+        form.setContentsMargins(0, 0, 0, 0)
         self._add_parameter_widgets(form)
         self._param_body = param_body
         self.params_section = _Section("Parameters", param_body)

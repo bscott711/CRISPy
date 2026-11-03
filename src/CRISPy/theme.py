@@ -87,8 +87,8 @@ def _assets(t: dict[str, str]) -> dict[str, str]:
 
 # QSS font sizes are whole pixels (12.5px renders as 13px), so use integers.
 # Qt does not clamp an oversized radius (999px draws square), so a pill is half its
-# height: 11 px font (about 15 px line) + 4 px padding either side = 23 px.
-_PILL = "border-radius: 11px; padding: 4px 12px; font-size: 11px; font-weight: 600;"
+# height: 11 px font (about 15 px line) + 2 px padding either side = 19 px.
+_PILL = "border-radius: 9px; padding: 2px 10px; font-size: 11px; font-weight: 600;"
 
 QSS = Template(
     """
@@ -116,26 +116,26 @@ QLabel[tone="warn"] { color: $warn; }
 QLabel[tone="bad"]  { color: $bad; }
 QLabel[tone="idle"] { color: $text3; }
 
-QGroupBox { background: $surface1; border: 1px solid $line; border-radius: 10px;
-    margin-top: 0; padding: 14px; }
+QGroupBox { background: $surface1; border: 1px solid $line; border-radius: 8px;
+    margin-top: 0; padding: 6px 8px; }
 QGroupBox::title { color: transparent; background: transparent; border: none;
     padding: 0; }
 QGroupBox QLabel, QGroupBox QCheckBox, QGroupBox QRadioButton { background: transparent; }
 QFrame[role="divider"] { background: $hairline; border: none; max-height: 1px; }
 
 QPushButton { background: $surface2; border: 1px solid $line_strong; border-radius: 6px;
-    color: $text; font-size: 13px; font-weight: 500; min-height: 30px; max-height: 30px;
-    padding: 0 14px; }
-QPushButton:hover   { background: $surface3; }
+    color: $text; font-size: 12px; font-weight: 500; min-height: 24px; max-height: 24px;
+    padding: 0 8px; }
+QPushButton:hover  { background: $surface3; }
 QPushButton:pressed { background: $surface2; }
 QPushButton:focus   { border-color: $accent; }
 QPushButton:checked { background: $accent_dim; border-color: $accent; color: $accent; }
 QPushButton:disabled { background: $surface1; border-color: transparent; color: $text3; }
-QPushButton[hasmenu="true"] { padding: 0 28px 0 14px; }
+QPushButton[hasmenu="true"] { padding: 0 24px 0 8px; }
 QPushButton::menu-indicator { image: url($chev_d); width: 10px; height: 6px;
     subcontrol-origin: padding; subcontrol-position: center right; right: 10px; }
 QPushButton[role="tab"] { background: transparent; border: none; border-radius: 0;
-    border-bottom: 2px solid transparent; color: $text2; padding: 0 14px; }
+    border-bottom: 2px solid transparent; color: $text2; padding: 0 8px; }
 QPushButton[role="tab"]:hover { background: transparent; color: $text; }
 QPushButton[role="tab"]:checked { background: transparent; color: $text;
     border-bottom: 2px solid $accent; }
@@ -149,20 +149,20 @@ QPushButton[primary="true"]:disabled { background: $surface1; border-color: tran
 QToolButton { background: transparent; border: none; border-radius: 6px; color: $text2;
     padding: 4px 8px; font-weight: 500; }
 QToolButton:hover { background: $surface3; color: $text; }
-QToolButton[role="section"] { color: $text2; font-weight: 600; padding: 6px 4px; }
+QToolButton[role="section"] { color: $text2; font-weight: 600; padding: 2px 4px; }
 QToolButton[role="section"]:hover { background: transparent; color: $text; }
 
 QSpinBox, QDoubleSpinBox, QLineEdit { background: $surface2;
     border: 1px solid $line_strong; border-radius: 6px; color: $text; font-family: $mono;
-    font-size: 13px; min-height: 30px; max-height: 30px; padding: 0 24px 0 10px;
+    font-size: 12px; min-height: 24px; max-height: 24px; padding: 0 20px 0 6px;
     selection-background-color: $accent_dim; selection-color: $text; }
-QLineEdit { padding: 0 10px; }
+QLineEdit { padding: 0 6px; }
 QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus { border-color: $accent; }
 QSpinBox:disabled, QDoubleSpinBox:disabled, QLineEdit:disabled { background: $surface1;
     border-color: transparent; color: $text3; }
 QSpinBox::up-button, QSpinBox::down-button,
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
-    width: 18px; border: none; background: transparent; subcontrol-origin: border; }
+    width: 16px; border: none; background: transparent; subcontrol-origin: border; }
 QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-position: top right; }
 QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-position: bottom right; }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image: url($chev_u); width: 10px;
@@ -175,7 +175,7 @@ QPlainTextEdit, QTextEdit { background: $surface2; border: 1px solid $line_stron
     selection-background-color: $accent_dim; selection-color: $text; }
 QPlainTextEdit:focus, QTextEdit:focus { border-color: $accent; }
 
-QCheckBox, QRadioButton { spacing: 8px; color: $text; font-size: 13px;
+QCheckBox, QRadioButton { spacing: 6px; color: $text; font-size: 12px;
     background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border-radius: 5px;
     border: 1px solid $line_strong; background: $surface2; }
@@ -198,8 +198,8 @@ QSlider::groove:horizontal:disabled, QSlider::sub-page:horizontal:disabled {
     background: $surface2; }
 
 QComboBox { background: $surface2; border: 1px solid $line_strong; border-radius: 6px;
-    color: $text; font-size: 13px; font-weight: 500; min-height: 30px; max-height: 30px;
-    padding: 0 12px; }
+    color: $text; font-size: 12px; font-weight: 500; min-height: 24px; max-height: 24px;
+    padding: 0 8px; }
 QComboBox:hover { background: $surface3; }
 QComboBox:focus { border-color: $accent; }
 QComboBox:disabled { background: $surface1; border-color: transparent; color: $text3; }
