@@ -1,3 +1,5 @@
+import os
+
 from pymmcore_plus import CMMCorePlus
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
@@ -13,7 +15,11 @@ from .discovery import discover_crisp_devices
 from .piezo_ui import PiezoSpotWidget
 from .spot.store import get_settings_store
 from .spot_choice import choose_spot_index
+from .theme import THEMES, apply_theme
 from .ui import CrispControlPanel
+
+#: Environment override for the widget theme: ``dark`` (default), ``light`` or ``none``.
+THEME_ENV = "CRISPY_THEME"
 
 
 def _scrolled(widget: QWidget) -> QScrollArea:
@@ -24,7 +30,29 @@ def _scrolled(widget: QWidget) -> QScrollArea:
     return area
 
 
-def launch_crisp_plugin() -> QWidget:
+def launch_crisp_plugin(theme: str | None = "default") -> QWidget:
+    """Build the CRISPy panels, one per CRISP axis, in the Bench theme.
+
+    The theme's stylesheet is set on the returned widget only (it cascades to the
+    panels and the windows they own), never on the application, so the host keeps
+    its own look everywhere else.
+
+    Parameters
+    ----------
+    theme
+        ``"dark"`` or ``"light"``; ``None`` or ``"none"`` leaves the widget
+        unstyled (the host or demo themes it); ``"default"`` reads the
+        ``CRISPY_THEME`` environment variable, falling back to ``"dark"``.
+    """
+    widget = _build_panels()
+    if theme == "default":
+        theme = os.environ.get(THEME_ENV, "dark")
+    if theme in THEMES:
+        apply_theme(widget, THEMES[theme])
+    return widget
+
+
+def _build_panels() -> QWidget:
     """Build the CRISPy panels, one per CRISP axis.
 
     The one piezo that :func:`~CRISPy.spot_choice.choose_spot_index` picks gets a

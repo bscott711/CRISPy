@@ -712,7 +712,7 @@ def run_demo():
 
     # Patch the function in the `plugin` module's namespace
     with patch("CRISPy.plugin.discover_crisp_devices", mock_discover):
-        widget = launch_crisp_plugin()
+        widget = launch_crisp_plugin(theme=None)  # the demo themes the whole window
 
         window = QMainWindow()
         window.setCentralWidget(widget)

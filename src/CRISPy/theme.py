@@ -264,9 +264,9 @@ def build_qss(tokens: dict[str, str]) -> str:
     )
 
 
-def apply_theme(app: QApplication, tokens: dict[str, str] = DARK) -> None:
-    """Install the Bench stylesheet application-wide."""
-    app.setStyleSheet(build_qss(tokens))
+def apply_theme(target: QApplication | QWidget, tokens: dict[str, str] = DARK) -> None:
+    """Install the Bench stylesheet on ``target`` (the app, or one widget tree)."""
+    target.setStyleSheet(build_qss(tokens))
 
 
 def caret_icon(expanded: bool) -> QIcon:
