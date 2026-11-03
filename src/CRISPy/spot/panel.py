@@ -5,7 +5,7 @@ straight edge of the CRISP LED patch on a side camera in a worker
 process and holds piezo P by nudging it rarely. This panel
 
 - lets the user draw the edge box across the edge that moves with focus (in the
-  live view; ONE edge; Calibration section, **1. Draw Edge**),
+  live view; ONE edge; **1. Draw Edge**, in the always-visible Calibration box),
   calibrates it (**2. Calibrate**: a piezo sweep around the present P, on a
   background thread), makes the present edge position the zero (**Zero here**)
   and sets a focus **Offset**;
@@ -21,7 +21,8 @@ process and holds piezo P by nudging it rarely. This panel
 - lights the CRISP LED (LED button, live LED %; Preview turns it on) and edits the
   loop parameters.
 
-The panel is one plain column: control row, offset / tracking error, ONE message
+The panel is one plain column: the Calibration steps box (1. Draw Edge, 2. Calibrate),
+control row, offset / tracking error, ONE message
 line (:func:`CRISPy.piezo_status.message`), the live image, toolbar rows, the frame
 statistics and four section buttons (Camera, Calibration, Diagnostics, Advanced;
 one open at a time). A host puts the status words above it from
@@ -500,6 +501,9 @@ class SpotFocusPanel(QWidget):
     lock_active : bool
         ``True`` while the lock is starting, running, calibrating or zeroing (the
         host must not poll the Tiger then). :attr:`lockActiveChanged` fires when it changes.
+    calibration_steps_box : QGroupBox
+        The always-visible "Calibration" box at the top of the panel, holding
+        ``draw_edge_button`` (1. Draw Edge) and ``calibrate_button`` (2. Calibrate).
     control_extra_layout : QHBoxLayout
         An empty layout in its own row directly under the control row (Zero here
         ... Locked / Unlocked): the host adds the Joystick checkbox here.
@@ -787,8 +791,18 @@ class SpotFocusPanel(QWidget):
         self._view_index = 0  # where the view goes back to
         self._float_size = QSize(900, 700)  # the popped-out window's size
         self._float_hidden = False  # the floating view is hidden with the panel
+        # The two steps, in order (like the CRISP Z panel's Calibration box), always
+        # visible: the workflow reads top to bottom, 1. Draw Edge, 2. Calibrate, then
+        # Zero here / Lock. The saved edge box is reused: step 2 needs no redraw.
+        self.calibration_steps_box = QGroupBox("Calibration")
+        self.calibration_steps_box.setToolTip("In order: 1. Draw Edge -> 2. Calibrate.")
+        steps = QHBoxLayout(self.calibration_steps_box)
+        steps.setContentsMargins(4, 2, 4, 2)
+        steps.addWidget(self.draw_edge_button)
+        steps.addWidget(self.calibrate_button)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.calibration_steps_box)
         outer.addLayout(control_row)
         outer.addLayout(self.control_extra_layout)
         outer.addLayout(offset_row)
@@ -937,7 +951,11 @@ class SpotFocusPanel(QWidget):
         return page
 
     def _build_calibration_page(self) -> QWidget:
-        """The Calibration section: the two numbered steps, then the settings."""
+        """The Calibration section: the sweep, detector and edge-box settings.
+
+        The two numbered steps (Draw Edge, Calibrate) are not here: they sit in
+        :attr:`calibration_steps_box`, always visible above the control row.
+        """
         self.detector_combo = QComboBox()
         for name in EDGE_DETECTORS:
             self.detector_combo.addItem(EDGE_DETECTOR_LABELS[name], name)
@@ -978,18 +996,9 @@ class SpotFocusPanel(QWidget):
         box_row.addWidget(QLabel("Edge box (x, y, w, h)"))
         box_row.addWidget(self.edge_box_label, 1)
 
-        # The two steps, in order (like the CRISP Z panel's Calibration box). The
-        # saved edge box is reused: step 2 needs no redraw.
-        steps_box = QGroupBox("Calibration")
-        steps_box.setToolTip("In order: 1. Draw Edge -> 2. Calibrate.")
-        steps = QHBoxLayout(steps_box)
-        steps.addWidget(self.draw_edge_button)
-        steps.addWidget(self.calibrate_button)
-
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(steps_box)
         lay.addLayout(grid)
         lay.addLayout(box_row)
         lay.addWidget(self.calibration_label)

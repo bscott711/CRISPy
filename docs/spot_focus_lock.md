@@ -977,6 +977,9 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
 - **Spot panel** (`spot/panel.py`, `SpotFocusPanel`, embedded in
   `PiezoSpotWidget`). There is one edge box and no second one. The panel is one
   plain column. Top to bottom:
+  - The **Calibration** box (`calibration_steps_box`), always visible, one
+    row: **1. Draw Edge** and **2. Calibrate**, in that order. They are not in
+    a section, so no section needs opening to calibrate.
   - The control row: **Zero here** and one **Locked** / **Unlocked** toggle
     (`lock_button`). It reads Locked while the lock runs or has faulted (the
     fault is acknowledged by unlocking) and Unlocked otherwise; it is enabled
@@ -1009,8 +1012,8 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
       **LED %** spin (saved, default 50). The LED button and Preview go
       through the service's LED claims (see "Rules"); with no CRISP device the
       message line says so. Each setting applies live and is saved.
-    - **Calibration**: the two numbered steps, **1. Draw Edge** and
-      **2. Calibrate**, then the sweep span (um), steps and frames per step;
+    - **Calibration** (the settings; the two steps are in the always-visible
+      box above): the sweep span (um), steps and frames per step;
       the **Edge detector** (Gaussian derivative or Half-max) and **Detector
       width** (px, used by the Gaussian derivative), which apply live and are
       saved (changing the detector does not recalibrate: see "A calibration is

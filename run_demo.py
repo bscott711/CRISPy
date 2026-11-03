@@ -310,6 +310,11 @@ _AXES: dict[str, SimAxis] = {
 }
 _BY_STAGE = {ax.stage: ax for ax in _AXES.values()}
 
+# The Tiger hub that forwards the controller's raw LED commands (``LK F=90``); only
+# its two properties are modelled, the commands are printed, not simulated.
+_HUB_LABEL = "TigerCommHub"
+_HUB_PROPS = {"SerialCommand": "", "OnlySendSerialCommandOnChange": "Yes"}
+
 
 class SimCamera:
     """A camera on a sample of random dots that blur as either axis defocuses.
@@ -406,6 +411,10 @@ class MockCMMCorePlus:
     def getDeviceDescription(self, dev):
         return "Mock"
 
+    def getParentLabel(self, label):
+        # The controller sends the raw LED commands through the Tiger hub.
+        return _HUB_LABEL if label in _AXES or label in _BY_STAGE else ""
+
     def getLoadedDevices(self):
         return [*_AXES, *_BY_STAGE]
 
@@ -454,6 +463,8 @@ class MockCMMCorePlus:
     # --- property access ---------------------------------------------------
     def getProperty(self, label, prop):
         time.sleep(_SERIAL_LATENCY_S)  # one simulated serial round trip
+        if label == _HUB_LABEL:
+            return _HUB_PROPS[prop]  # KeyError -> caller suppresses
         if label in _BY_STAGE:
             lo, hi = _BY_STAGE[label].travel_um
             limits = {"LowerLim(mm)": lo / 1000, "UpperLim(mm)": hi / 1000}
@@ -463,7 +474,9 @@ class MockCMMCorePlus:
     def setProperty(self, label, prop, value):
         time.sleep(_SERIAL_LATENCY_S)
         print(f"[DEMO] {label} -> {prop}: {value}")
-        if label in _AXES:
+        if label == _HUB_LABEL:
+            _HUB_PROPS[prop] = str(value)
+        elif label in _AXES:
             if prop == "CRISP State":
                 _AXES[label].set_state(str(value))
             elif prop in _AXES[label].props:
