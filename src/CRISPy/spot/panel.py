@@ -146,11 +146,17 @@ class _FrameStats(QWidget):
         row.setSpacing(4)
         self._values: list[QLabel] = []
         for i, (name, unit) in enumerate(
-            (("Frame rate:", "fps"), ("Maximum:", ""), ("Saturated pixels:", "%"))
+            (("Frame rate:", "fps"), ("Max:", ""), ("Saturated:", "%"))
         ):
             if i:
-                row.addSpacing(12)  # 16 px between groups with the 4 px spacing
-            row.addWidget(QLabel(name))
+                row.addSpacing(8)  # 12 px between groups with the 4 px spacing
+            label = QLabel(name)
+            label.setToolTip(
+                {"Max:": "Maximum pixel value", "Saturated:": "Saturated pixels"}.get(
+                    name, ""
+                )
+            )
+            row.addWidget(label)
             val = QLabel("-")
             val.setProperty("role", "value")
             row.addWidget(val)
@@ -544,8 +550,8 @@ class SpotFocusPanel(QWidget):
         The always-visible "Calibration" box at the top of the panel, holding
         ``draw_edge_button`` (1. Draw Edge) and ``calibrate_button`` (2. Calibrate).
     control_extra_layout : QHBoxLayout
-        An empty layout in its own row directly under the control row (Zero here
-        ... Locked / Unlocked): the host adds the Joystick checkbox here.
+        An empty layout in the control row, between Zero here and Locked / Unlocked:
+        the host adds the Joystick checkbox here.
     lock_button : QPushButton
         The one Lock toggle: checked and "Locked" while the lock runs (or has
         faulted, until acknowledged), else "Unlocked".
@@ -625,11 +631,12 @@ class SpotFocusPanel(QWidget):
         self.lock_button = QPushButton("Unlocked")
         self.lock_button.setCheckable(True)
         self.lock_button.clicked.connect(self._on_lock_clicked)
-        #: An empty layout in its own row under the control row: the host puts the
-        #: Joystick checkbox in it.
+        #: An empty layout in the control row, between Zero here and the Lock
+        #: toggle: the host puts the Joystick checkbox in it.
         self.control_extra_layout = QHBoxLayout()
         control_row = QHBoxLayout()
         control_row.addWidget(self.zero_button)
+        control_row.addLayout(self.control_extra_layout)
         control_row.addStretch()
         control_row.addWidget(self.lock_button)
 
@@ -647,12 +654,17 @@ class SpotFocusPanel(QWidget):
         self.tracking_error_label = QLabel(piezo_status.NOT_AVAILABLE)
         self.tracking_error_label.setProperty("role", "hint")
         self.tracking_error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.offset_spin.setMaximumWidth(110)
+        # Two short rows: Offset with its spin box, then the tracking error. One row
+        # held them all and set the panel's minimum width.
         offset_row = QHBoxLayout()
         offset_row.addWidget(QLabel("Offset"))
         offset_row.addWidget(self.offset_spin)
         offset_row.addStretch()
-        offset_row.addWidget(QLabel("Tracking error:"))
-        offset_row.addWidget(self.tracking_error_label)
+        tracking_row = QHBoxLayout()
+        tracking_row.addWidget(QLabel("Tracking error:"))
+        tracking_row.addWidget(self.tracking_error_label)
+        tracking_row.addStretch()
 
         #: The ONE contextual line (:func:`piezo_status.message`), plain text.
         self.message_label = QLabel()
@@ -809,7 +821,7 @@ class SpotFocusPanel(QWidget):
         # A docked child, not the window it was created as. The flags are explicit:
         # setParent(parent) alone does nothing when the parent is unchanged.
         view.setParent(self, Qt.WindowType.Widget)
-        self.display_settings_button = QPushButton("Display settings")
+        self.display_settings_button = QPushButton("Display")
         self.display_settings_button.setProperty("hasmenu", True)
         self.display_settings_button.setToolTip(
             "Auto levels, Bayer to grey and the zoom of the image"
@@ -852,8 +864,8 @@ class SpotFocusPanel(QWidget):
         outer.setSpacing(4)
         outer.addWidget(self.calibration_steps_box)
         outer.addLayout(control_row)
-        outer.addLayout(self.control_extra_layout)
         outer.addLayout(offset_row)
+        outer.addLayout(tracking_row)
         outer.addWidget(self.message_label)
         outer.addWidget(view, 1)  # re-parents it: docked
         view.show()  # setParent hid it

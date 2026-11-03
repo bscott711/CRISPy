@@ -996,7 +996,7 @@ at full frame, 31 fps at a 640x480 ROI. Exposure runs 0.105 ms to 15 s, gain
     error, or "no CRISP device". `PiezoSpotWidget` shows the status words above
     the panel.
   - The live view (docked by default, minimum height 240 px) with two toolbar
-    rows: **Preview**, Fit, 1:1, **Pop out** / **Dock** and **Display settings**
+    rows: **Preview**, Fit, 1:1, **Pop out** / **Dock** and **Display**
     (Auto levels, on by default, Bayer to grey, zoom); **Draw ROI** and
     **Full frame**. In the docked widget (`PiezoSpotWidget`) Preview starts by
     itself, once, when the panel is first shown (`auto_preview`); turning it off
